@@ -52,7 +52,7 @@ async fn housekeeping(
 }
 
 async fn add(
-    idx: Arc<usearch::Index>,
+    idx: Arc<Index>,
     idx_lock: Arc<RwLock<()>>,
     key: Key,
     embeddings: Embeddings,
@@ -62,7 +62,7 @@ async fn add(
 }
 
 async fn ann(
-    idx: Arc<usearch::Index>,
+    idx: Arc<Index>,
     tx: oneshot::Sender<anyhow::Result<(Vec<Key>, Vec<Distance>)>>,
     embeddings: Embeddings,
     dimensions: Dimensions,
