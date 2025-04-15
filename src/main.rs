@@ -20,7 +20,8 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_target(false))
         .init();
 
-    let scylla_usearch_addr = dotenvy::var("SCYLLA_USEARCH_URI")
+    #[cfg(not(feature = "opensearch"))]
+    let search_tool_addr = dotenvy::var("SCYLLA_USEARCH_URI")
         .unwrap_or("127.0.0.1:6080".to_string())
         .to_socket_addrs()?
         .next()
@@ -28,6 +29,19 @@ async fn main() -> anyhow::Result<()> {
             "Unable to parse SCYLLA_USEARCH_URI env (host:port)"
         ))?
         .into();
+
+    #[cfg(feature = "opensearch")]
+    let search_tool_addr = {
+        let addr = dotenvy::var("OPENSEARCH_ADDRESS").unwrap_or("127.0.0.1".to_string());
+        let port = dotenvy::var("OPENSEARCH_PORT").unwrap_or("9200".to_string());
+        format!("{addr}:{port}")
+            .to_socket_addrs()?
+            .next()
+            .ok_or(anyhow!(
+                "Unable to parse opensearch URI"
+            ))?
+            .into()
+    };
 
     let scylladb_uri = dotenvy::var("SCYLLADB_URI")
         .unwrap_or("127.0.0.1:9042".to_string())
@@ -39,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db_actor = vector_store::new_db(scylladb_uri).await?;
     let (_server_actor, addr) =
-        vector_store::run(scylla_usearch_addr, background_threads, db_actor).await?;
+        vector_store::run(search_tool_addr, background_threads, db_actor).await?;
     tracing::info!("listening on {addr}");
     vector_store::wait_for_shutdown().await;
 
