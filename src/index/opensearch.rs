@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -177,18 +178,69 @@ async fn process(
     client: Arc<OpenSearch>,
 ) {
     match msg {
+        Index::Add {
+            primary_key,
+            embeddings,
+        } => {
+            add(id, keys, opensearch_key, primary_key, embeddings, client).await;
+        }
         _ => {}
     }
 }
 
 async fn add(
-    idx: Arc<Index>,
-    idx_lock: Arc<RwLock<()>>,
-    key: PrimaryKey,
+    id: Arc<IndexId>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
+    opensearch_key: Arc<AtomicU64>,
+    primary_key: PrimaryKey,
     embeddings: Embeddings,
-    items_count: Arc<AtomicU32>,
-    counter: Arc<AtomicUsize>,
+    client: Arc<OpenSearch>,
 ) {
+    let key = opensearch_key.fetch_add(1, Ordering::Relaxed).into();
+
+    if keys
+        .write()
+        .unwrap()
+        .insert_no_overwrite(primary_key.clone(), key)
+        .is_err()
+    {
+        debug!("add: primary_key already exists: {primary_key:?}");
+        return;
+    }
+
+    let (tx, rx) = oneshot::channel();
+
+    tokio::spawn({
+        async move {
+            let response = client
+                .index(IndexParts::IndexId(&id.0, &key.0.to_string()))
+                .body(json!({
+                    "vector": embeddings.0,
+                }))
+                .send()
+                .await
+                .map_or_else(
+                    |err| Err(err),
+                    opensearch::http::response::Response::error_for_status_code,
+                )
+                .map_err(|err| {
+                    error!(
+                        "add: unable to add embeddings for key {key} to index with id {id}: {err}"
+                    );
+                });
+
+            if response.is_err() {
+                _ = tx.send(false);
+                return;
+            }
+
+            _ = tx.send(true);
+        }
+    });
+
+    if let Ok(false) = rx.await {
+        keys.write().unwrap().remove_by_right(&key);
+    }
 }
 
 async fn ann(
