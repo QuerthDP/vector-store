@@ -13,6 +13,8 @@ use crate::index::Index;
 use crate::monitor_indexes;
 use crate::monitor_items;
 use std::collections::HashMap;
+#[cfg(feature = "opensearch")]
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::Instrument;
@@ -88,8 +90,12 @@ pub(crate) async fn new(db: mpsc::Sender<Db>) -> anyhow::Result<mpsc::Sender<Eng
     tokio::spawn(
         async move {
             debug!("starting");
-
             let mut indexes = HashMap::new();
+            #[cfg(feature = "opensearch")]
+            let client = Arc::new(index::create_opensearch_client().unwrap_or_else(|err| {
+                error!("engine::new: unable to create opensearch client: {err}");
+                panic!("unable to create opensearch client");
+            }));
             while let Some(msg) = rx.recv().await {
                 match msg {
                     Engine::GetIndexIds { tx } => {
@@ -105,9 +111,22 @@ pub(crate) async fn new(db: mpsc::Sender<Db>) -> anyhow::Result<mpsc::Sender<Eng
                             trace!("Engine::AddIndex: trying to replace index with id {id}");
                             continue;
                         }
-
                         info!("creating a new index {id}");
-
+                        #[cfg(feature = "opensearch")]
+                        let Ok(index_actor) = index::new(
+                            id.clone(),
+                            metadata.dimensions,
+                            metadata.connectivity,
+                            metadata.expansion_add,
+                            metadata.expansion_search,
+                            client.clone(),
+                        )
+                        .inspect_err(|err| {
+                            error!("unable to create an index {id}: {err}")
+                        }) else {
+                            continue;
+                        };
+                        #[cfg(not(feature = "opensearch"))]
                         let Ok(index_actor) = index::new(
                             id.clone(),
                             metadata.dimensions,
@@ -118,7 +137,6 @@ pub(crate) async fn new(db: mpsc::Sender<Db>) -> anyhow::Result<mpsc::Sender<Eng
                         .inspect_err(|err| error!("unable to create an index {id}: {err}")) else {
                             continue;
                         };
-
                         let Ok((db_index, embeddings_stream)) =
                             db.get_db_index(metadata.clone()).await.inspect_err(|err| {
                                 error!("unable to create a db monitoring task for an index {id}: {err}")

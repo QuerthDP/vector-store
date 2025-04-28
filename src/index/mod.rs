@@ -13,6 +13,8 @@ pub(crate) mod opensearch;
 pub(crate) mod usearch;
 
 #[cfg(feature = "opensearch")]
+pub(crate) use opensearch::create_opensearch_client;
+#[cfg(feature = "opensearch")]
 pub(crate) use opensearch::new;
 #[cfg(not(feature = "opensearch"))]
 pub(crate) use usearch::new;
