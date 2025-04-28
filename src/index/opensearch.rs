@@ -8,6 +8,7 @@
 
 use crate::Connectivity;
 use crate::Dimensions;
+use crate::Embedding;
 use crate::ExpansionAdd;
 use crate::ExpansionSearch;
 use crate::IndexFactory;
@@ -15,14 +16,17 @@ use crate::IndexId;
 use crate::PrimaryKey;
 use crate::index::actor::Index;
 use bimap::BiMap;
+use opensearch::IndexParts;
 use opensearch::OpenSearch;
 use opensearch::indices::IndicesCreateParts;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
@@ -195,10 +199,10 @@ pub fn new(
 async fn process(
     msg: Index,
     _dimensions: Dimensions,
-    _id: Arc<IndexId>,
-    _keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
-    _opensearch_key: Arc<AtomicU64>,
-    _client: Arc<OpenSearch>,
+    id: Arc<IndexId>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
+    opensearch_key: Arc<AtomicU64>,
+    client: Arc<OpenSearch>,
 ) {
     // TODO: Implement the logic for processing the messages
     match msg {
@@ -206,8 +210,7 @@ async fn process(
             primary_key,
             embedding,
         } => {
-            let _ = primary_key;
-            let _ = embedding;
+            add(id, keys, opensearch_key, primary_key, embedding, client).await;
         }
         Index::Remove { primary_key } => {
             let _ = primary_key;
@@ -224,5 +227,60 @@ async fn process(
         Index::Count { tx } => {
             let _ = tx;
         }
+    }
+}
+
+async fn add(
+    id: Arc<IndexId>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
+    opensearch_key: Arc<AtomicU64>,
+    primary_key: PrimaryKey,
+    embeddings: Embedding,
+    client: Arc<OpenSearch>,
+) {
+    let key = opensearch_key.fetch_add(1, Ordering::Relaxed).into();
+
+    if keys
+        .write()
+        .unwrap()
+        .insert_no_overwrite(primary_key.clone(), key)
+        .is_err()
+    {
+        debug!("add: primary_key already exists: {primary_key:?}");
+        return;
+    }
+
+    let (tx, rx) = oneshot::channel();
+
+    tokio::spawn({
+        async move {
+            let response = client
+                .index(IndexParts::IndexId(&id.0, &key.0.to_string()))
+                .body(json!({
+                    "vector": embeddings.0,
+                }))
+                .send()
+                .await
+                .map_or_else(
+                    |err| Err(err),
+                    opensearch::http::response::Response::error_for_status_code,
+                )
+                .map_err(|err| {
+                    error!(
+                        "add: unable to add embeddings for key {key} to index with id {id}: {err}"
+                    );
+                });
+
+            if response.is_err() {
+                _ = tx.send(false);
+                return;
+            }
+
+            _ = tx.send(true);
+        }
+    });
+
+    if let Ok(false) = rx.await {
+        keys.write().unwrap().remove_by_right(&key);
     }
 }
