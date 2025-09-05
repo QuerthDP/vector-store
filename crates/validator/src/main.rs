@@ -13,12 +13,14 @@ use clap::Parser;
 use dns::DnsExt;
 use scylla_cluster::ScyllaClusterExt;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tests::TestActors;
+use tests::TestCase;
 use tokio::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -44,6 +46,11 @@ struct Args {
     scylla: PathBuf,
 
     vector_store: PathBuf,
+
+    /// Test filters - can be test file names (like 'crud') or specific test names (like 'simple_create_drop_index').
+    /// Supports partial matching - 'create' will match tests containing 'create' in their name.
+    #[arg(value_name = "FILTER")]
+    filters: Vec<String>,
 }
 
 async fn file_exists(path: &Path) -> bool {
@@ -94,6 +101,63 @@ fn validate_different_subnet(dns_ip: Ipv4Addr, base_ip: Ipv4Addr) {
     );
 }
 
+/// Parse command line filters into the expected filter format for test execution.
+/// Returns a HashMap where:
+/// - Key: test file name (e.g., "crud", "full_scan")
+/// - Value: HashSet of specific test names within that file (empty means run all tests in file)
+fn parse_test_filters(
+    filters: &[String],
+    test_cases: &[(String, TestCase)],
+) -> HashMap<String, HashSet<String>> {
+    if filters.is_empty() {
+        return HashMap::new(); // Run all tests
+    }
+
+    let mut filter_map = HashMap::new();
+
+    for filter in filters {
+        let mut found_exact_file = false;
+
+        // First, check if the filter matches a test file name exactly
+        for (file_name, _) in test_cases {
+            if file_name == filter {
+                filter_map.insert(file_name.clone(), HashSet::new());
+                found_exact_file = true;
+                break;
+            }
+        }
+
+        if !found_exact_file {
+            // If no exact file match, search for specific tests containing the filter
+            for (file_name, test_case) in test_cases {
+                let mut matching_tests = HashSet::new();
+
+                // Check each test in the test case
+                for (test_name, _, _) in test_case.tests() {
+                    if test_name.contains(filter) {
+                        matching_tests.insert(test_name.clone());
+                    }
+                }
+
+                if !matching_tests.is_empty() {
+                    // If this file already has some tests selected, merge them
+                    if let Some(existing_tests) = filter_map.get_mut(file_name) {
+                        if existing_tests.is_empty() {
+                            // If existing is empty (run all), keep it empty
+                            continue;
+                        }
+                        existing_tests.extend(matching_tests);
+                    } else {
+                        filter_map.insert(file_name.clone(), matching_tests);
+                    }
+                }
+            }
+        }
+    }
+
+    filter_map
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::registry()
@@ -125,6 +189,9 @@ async fn main() {
 
     let test_cases = tests::register().await;
 
+    // Parse command line filters 
+    let filter_map = parse_test_filters(&args.filters, &test_cases);
+
     assert!(
         tests::run(
             TestActors {
@@ -134,7 +201,7 @@ async fn main() {
                 vs,
             },
             test_cases,
-            Arc::new(HashMap::new())
+            Arc::new(filter_map)
         )
         .await
     );
