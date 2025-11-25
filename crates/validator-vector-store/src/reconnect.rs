@@ -20,6 +20,16 @@ pub(crate) async fn new() -> TestCase {
             timeout,
             reconnect_doesnt_break_fullscan,
         )
+        .with_test(
+            "restarting_one_node_doesnt_break_fullscan",
+            timeout,
+            restarting_one_node_doesnt_break_fullscan,
+        )
+        .with_test(
+            "restarting_all_nodes_doesnt_break_fullscan",
+            timeout,
+            restarting_all_nodes_doesnt_break_fullscan,
+        )
 }
 
 async fn reconnect_doesnt_break_fullscan(actors: TestActors) {
@@ -95,6 +105,141 @@ async fn reconnect_doesnt_break_fullscan(actors: TestActors) {
         Duration::from_secs(20),
     )
     .await;
+
+    session
+        .query_unpaged(format!("DROP KEYSPACE {keyspace}"), ())
+        .await
+        .expect("failed to drop a keyspace");
+
+    info!("finished");
+}
+
+async fn restarting_one_node_doesnt_break_fullscan(actors: TestActors) {
+    info!("started");
+
+    let (session, client) = prepare_connection(&actors).await;
+
+    let keyspace = create_keyspace(&session).await;
+    let table = create_table(
+        &session,
+        "id INT PRIMARY KEY, embedding VECTOR<FLOAT, 3>",
+        None,
+    )
+    .await;
+
+    let stmt = session
+        .prepare(format!(
+            "INSERT INTO {table} (id, embedding) VALUES (?, [1.0, 2.0, 3.0])"
+        ))
+        .await
+        .expect("failed to prepare a statement");
+
+    for id in 0..1000 {
+        session
+            .execute_unpaged(&stmt, (id,))
+            .await
+            .expect("failed to insert a row");
+    }
+
+    let index = create_index(&session, &client, &table, "embedding").await;
+
+    let index_status = client
+        .index_status(&index.keyspace, &index.index)
+        .await
+        .expect("failed to get index status");
+    assert_eq!(index_status.status, IndexStatus::Bootstrapping);
+
+    let db_ip = get_default_db_ip(&actors);
+
+    info!("Restarting node {}", db_ip);
+    actors
+        .db
+        .restart(get_default_vs_url(&actors).await, db_ip)
+        .await;
+
+    let index_status = wait_for_index(&client, &index).await;
+
+    assert_eq!(
+        index_status.count, 1000,
+        "Expected 1000 vectors to be indexed"
+    );
+
+    session
+        .query_unpaged(
+            format!("SELECT * FROM {table} ORDER BY embedding ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
+            (),
+        )
+        .await
+        .expect("failed to query ANN search");
+
+    session
+        .query_unpaged(format!("DROP KEYSPACE {keyspace}"), ())
+        .await
+        .expect("failed to drop a keyspace");
+
+    info!("finished");
+}
+
+async fn restarting_all_nodes_doesnt_break_fullscan(actors: TestActors) {
+    info!("started");
+
+    let (session, client) = prepare_connection(&actors).await;
+
+    let keyspace = create_keyspace(&session).await;
+    let table = create_table(
+        &session,
+        "id INT PRIMARY KEY, embedding VECTOR<FLOAT, 3>",
+        None,
+    )
+    .await;
+
+    let stmt = session
+        .prepare(format!(
+            "INSERT INTO {table} (id, embedding) VALUES (?, [1.0, 2.0, 3.0])"
+        ))
+        .await
+        .expect("failed to prepare a statement");
+
+    for id in 0..1000 {
+        session
+            .execute_unpaged(&stmt, (id,))
+            .await
+            .expect("failed to insert a row");
+    }
+
+    let index = create_index(&session, &client, &table, "embedding").await;
+
+    let index_status = client
+        .index_status(&index.keyspace, &index.index)
+        .await
+        .expect("failed to get index status");
+    assert_eq!(index_status.status, IndexStatus::Bootstrapping);
+
+    let db_ips = get_default_db_ips(&actors);
+
+    // Restart each node one by one
+    for db_ip in db_ips {
+        info!("Restarting node {}", db_ip);
+        actors
+            .db
+            .restart(get_default_vs_url(&actors).await, db_ip)
+            .await;
+    }
+
+    let index_status = wait_for_index(&client, &index).await;
+
+    assert_eq!(
+        index_status.count, 1000,
+        "Expected 1000 vectors to be indexed"
+    );
+
+    session
+        .query_unpaged(
+            format!("SELECT * FROM {table} ORDER BY embedding ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
+            (),
+        )
+        .await
+        .expect("failed to query ANN search");
 
     session
         .query_unpaged(format!("DROP KEYSPACE {keyspace}"), ())
