@@ -465,6 +465,12 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         })?);
     }
 
+    config.use_gpu = env("VECTOR_STORE_USE_GPU")
+        .unwrap_or("false".into())
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("Unable to parse VECTOR_STORE_USE_GPU env (true/false)"))?;
+
     config.alter_index_simulator = env("VECTOR_STORE_ALTER_INDEX_SIMULATOR")
         .unwrap_or("false".into())
         .trim()
@@ -1009,6 +1015,36 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Unable to parse VECTOR_STORE_DISKANN_MAX_POINTS")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_config_use_gpu_default_false() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert!(!config.use_gpu);
+    }
+
+    #[tokio::test]
+    async fn load_config_use_gpu_override_true() {
+        let env = mock_env(HashMap::from([("VECTOR_STORE_USE_GPU", "true".into())]));
+        let config = load_config(env).await.unwrap();
+        assert!(config.use_gpu);
+    }
+
+    #[tokio::test]
+    async fn load_config_use_gpu_invalid_value_errors() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_USE_GPU",
+            "not-a-bool".into(),
+        )]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unable to parse VECTOR_STORE_USE_GPU")
         );
     }
 
