@@ -1162,6 +1162,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake-package"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13cd24990b85e3c97060e03e0034a4c03266247769e573e129425404a5601639"
+dependencies = [
+ "itertools 0.14.0",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "which",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1478,6 +1493,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
+]
+
+[[package]]
+name = "cuvs"
+version = "26.10.0"
+source = "git+https://github.com/NVIDIA/cuvs?rev=cd4bbab12464c297292e89f5f5fbcaf7c2fbc777#cd4bbab12464c297292e89f5f5fbcaf7c2fbc777"
+dependencies = [
+ "bon",
+ "cuvs-sys",
+ "thiserror 2.0.18",
+ "tinyvec",
+]
+
+[[package]]
+name = "cuvs-sys"
+version = "26.10.0"
+source = "git+https://github.com/NVIDIA/cuvs?rev=cd4bbab12464c297292e89f5f5fbcaf7c2fbc777#cd4bbab12464c297292e89f5f5fbcaf7c2fbc777"
+dependencies = [
+ "anyhow",
+ "cmake-package",
 ]
 
 [[package]]
@@ -6022,6 +6057,7 @@ dependencies = [
  "console-subscriber",
  "const-hex",
  "criterion",
+ "cuvs",
  "dashmap 6.1.0",
  "derive_more",
  "diskann",
@@ -6249,6 +6285,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "8.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
