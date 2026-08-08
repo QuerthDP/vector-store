@@ -226,6 +226,7 @@ pub struct Config {
     pub diskann_alpha: Option<DiskannAlpha>,
     pub diskann_max_points: Option<NonZeroUsize>,
     pub diskann_backend: Option<DiskannBackendKind>,
+    pub use_gpu: bool,
     pub alter_index_simulator: bool,
     pub fulltext_indexes: bool,
     pub cql_connection_timeout: Option<Duration>,
@@ -262,6 +263,7 @@ impl Default for Config {
             diskann_alpha: None,
             diskann_max_points: None,
             diskann_backend: None,
+            use_gpu: false,
             alter_index_simulator: false,
             fulltext_indexes: true,
             disable_colors: false,
@@ -943,6 +945,7 @@ pub async fn run(
     let config_rx = config_receivers.config.clone();
     let opensearch_addr = config_rx.borrow().opensearch_addr.clone();
     let diskann_backend = config_rx.borrow().diskann_backend;
+    let use_gpu = config_rx.borrow().use_gpu;
 
     let db_driver = db_driver::new_scylla();
     let internals = internals::new(db_driver.clone());
@@ -952,6 +955,9 @@ pub async fn run(
     let vs_index_factory = if let Some(addr) = opensearch_addr {
         tracing::info!("Using OpenSearch index factory at {addr}");
         vs_index::new_index_factory_opensearch(addr, config_rx.clone())?
+    } else if use_gpu {
+        tracing::info!("Using cuVS (GPU) index factory");
+        vs_index::new_index_factory_cuvs(config_rx.clone())?
     } else if let Some(backend) = diskann_backend {
         tracing::info!("Using DiskANN index factory with the {backend:?} backend");
         vs_index::new_index_factory_diskann(config_rx.clone(), worker.clone(), memory.clone())?
