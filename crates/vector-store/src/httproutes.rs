@@ -165,6 +165,7 @@ fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi)
                 .routes(routes!(get_index_status))
                 .routes(routes!(post_index_ann))
                 .routes(routes!(post_index_bm25))
+                .routes(routes!(post_index_highlight))
                 .routes(routes!(get_info))
                 .routes(routes!(get_status)),
         )
@@ -731,6 +732,32 @@ async fn post_index_ann(
     .await
 }
 
+fn check_fts_serving(
+    entry: &indexes::FtsIndexEntry,
+    keyspace: &crate::KeyspaceName,
+    index_name: &crate::IndexName,
+    route_name: &str,
+) -> Option<Response> {
+    if entry.status() == crate::node_state::IndexStatus::Serving {
+        return None;
+    }
+    let (status, msg) = match entry.progress() {
+        Progress::InProgress(percentage) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Index {keyspace}.{index_name} is not available yet as it is still being constructed, progress: {:.3}%",
+                percentage.get()
+            ),
+        ),
+        Progress::Done => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Index {keyspace}.{index_name} is not serving, but full scan did finish."),
+        ),
+    };
+    debug!("{route_name}: {msg}");
+    Some((status, msg).into_response())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/indexes/{keyspace}/{index}/bm25",
@@ -811,28 +838,9 @@ async fn post_index_bm25(
             debug!("post_index_bm25: {msg}");
             return (StatusCode::NOT_FOUND, msg).into_response();
         };
-        if entry.status() != crate::node_state::IndexStatus::Serving {
-            match entry.progress() {
-                Progress::InProgress(percentage) => {
-                    timer.observe_duration();
-
-                    let msg = format!(
-                        "Index {keyspace}.{index_name} is not available yet as it is still being constructed, progress: {:.3}%",
-                        percentage.get()
-                    );
-                    debug!("post_index_bm25: {msg}");
-                    return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
-                }
-                Progress::Done => {
-                    timer.observe_duration();
-
-                    let msg = format!(
-                        "Index {keyspace}.{index_name} is not serving, but full scan did finish."
-                    );
-                    debug!("post_index_bm25: {msg}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
-                }
-            }
+        if let Some(resp) = check_fts_serving(entry, &keyspace, &index_name, "post_index_bm25") {
+            timer.observe_duration();
+            return resp;
         }
         (entry.index().clone(), entry.primary_key_columns().clone())
     };
@@ -878,6 +886,145 @@ async fn post_index_bm25(
                 )
                     .into_response(),
             }
+        }
+    }
+}
+
+impl From<httpapi::HighlightOptions> for crate::fts_index::HighlightOptions {
+    fn from(options: httpapi::HighlightOptions) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_num_chars: options.max_num_chars.unwrap_or(defaults.max_num_chars),
+            pre_tag: options.pre_tag.unwrap_or(defaults.pre_tag),
+            post_tag: options.post_tag.unwrap_or(defaults.post_tag),
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/indexes/{keyspace}/{index}/highlight",
+    tag = "scylla-vector-store-index",
+    description = "Computes a highlighted excerpt (snippet) for each of the supplied document texts. \
+The texts are provided by the caller, so the index does not keep a copy of the original text; the index is used \
+only to analyze the query and to weight its terms by their document frequency, keeping highlights consistent \
+with the BM25 scoring of the same query. \
+Highlights are returned in the same order as the requested documents. A document that matches no query term \
+yields a plain leading excerpt with no markup. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the full-text index within the specified keyspace to highlight against.")
+    ),
+    request_body = httpapi::PostIndexHighlightRequest,
+    responses(
+        (
+            status = 200,
+            description = "Successful highlighting. Returns one highlight per requested document, in the requested order.",
+            body = httpapi::PostIndexHighlightResponse
+        ),
+        (
+            status = 400,
+            description = "Bad request. Possible causes: malformed input, unparsable query, or missing required fields.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while highlighting. Possible causes: internal error, or search engine issues.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 503,
+            description = "Service Unavailable. Indicates that a full scan of the index is in progress and highlighting cannot be performed at this time.",
+            content_type = "application/json",
+            body = ErrorMessage
+        )
+    )
+)]
+async fn post_index_highlight(
+    State(state): State<RoutesInnerState>,
+    extensions: Extensions,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexHighlightRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_highlight") {
+        return resp;
+    }
+
+    let timer = state
+        .metrics
+        .latency
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref()])
+        .start_timer();
+
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let fts_sender = {
+        let indexes = state.indexes.read().unwrap();
+        let Some(entry) = indexes.get_fts(&index_key) else {
+            timer.observe_duration();
+
+            let msg = format!("missing index: {keyspace}.{index_name}");
+            debug!("post_index_highlight: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        };
+        if let Some(resp) = check_fts_serving(entry, &keyspace, &index_name, "post_index_highlight")
+        {
+            timer.observe_duration();
+            return resp;
+        }
+        entry.index().clone()
+    };
+
+    let documents_len = request.documents.len();
+    let result = fts_sender
+        .highlight(
+            index_key,
+            request.query,
+            request.documents,
+            request.options.into(),
+        )
+        .await;
+
+    timer.observe_duration();
+
+    match result {
+        Err(err) => {
+            let msg = format!("index.highlight request error: {err}");
+            debug!("post_index_highlight: {msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        }
+        Ok(highlights) => {
+            if highlights.len() != documents_len {
+                let msg = format!(
+                    "wrong size of a highlight response: \
+                    number of documents = {documents_len}, number of highlights = {}",
+                    highlights.len()
+                );
+                debug!("post_index_highlight: {msg}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+            }
+            (
+                StatusCode::OK,
+                response::Json(httpapi::PostIndexHighlightResponse { highlights }),
+            )
+                .into_response()
         }
     }
 }

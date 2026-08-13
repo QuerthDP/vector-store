@@ -14,6 +14,31 @@ use tokio::sync::oneshot;
 
 pub(crate) type FtsSearchR = anyhow::Result<(Vec<PrimaryKey>, Vec<f32>)>;
 
+/// Tantivy's own default fragment length.
+pub(crate) const DEFAULT_MAX_NUM_CHARS: usize = 150;
+pub(crate) const DEFAULT_PRE_TAG: &str = "<b>";
+pub(crate) const DEFAULT_POST_TAG: &str = "</b>";
+
+#[derive(Debug, Clone)]
+pub(crate) struct HighlightOptions {
+    pub(crate) max_num_chars: usize,
+    pub(crate) pre_tag: String,
+    pub(crate) post_tag: String,
+}
+
+impl Default for HighlightOptions {
+    fn default() -> Self {
+        Self {
+            max_num_chars: DEFAULT_MAX_NUM_CHARS,
+            pre_tag: DEFAULT_PRE_TAG.to_string(),
+            post_tag: DEFAULT_POST_TAG.to_string(),
+        }
+    }
+}
+
+/// One marked-up excerpt per requested document.
+pub(crate) type FtsHighlightR = anyhow::Result<Vec<String>>;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FtsStats {
     pub(crate) num_docs: u64,
@@ -43,6 +68,13 @@ pub(crate) enum FtsIndex {
         limit: Limit,
         tx: oneshot::Sender<FtsSearchR>,
     },
+    Highlight {
+        index_key: IndexKey,
+        query: String,
+        documents: Vec<String>,
+        options: HighlightOptions,
+        tx: oneshot::Sender<FtsHighlightR>,
+    },
     Stats {
         index_key: IndexKey,
         tx: oneshot::Sender<FtsStatsR>,
@@ -59,6 +91,13 @@ pub(crate) trait FtsIndexExt {
     async fn remove_document(&self, primary_id: PrimaryId, in_progress: AsyncInProgress);
     async fn count(&self, index_key: IndexKey) -> CountR;
     async fn search(&self, index_key: IndexKey, query: String, limit: Limit) -> FtsSearchR;
+    async fn highlight(
+        &self,
+        index_key: IndexKey,
+        query: String,
+        documents: Vec<String>,
+        options: HighlightOptions,
+    ) -> FtsHighlightR;
     async fn stats(&self, index_key: IndexKey) -> FtsStatsR;
 }
 
@@ -99,6 +138,25 @@ impl FtsIndexExt for mpsc::Sender<FtsIndex> {
             index_key,
             query,
             limit,
+            tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    async fn highlight(
+        &self,
+        index_key: IndexKey,
+        query: String,
+        documents: Vec<String>,
+        options: HighlightOptions,
+    ) -> FtsHighlightR {
+        let (tx, rx) = oneshot::channel();
+        self.send(FtsIndex::Highlight {
+            index_key,
+            query,
+            documents,
+            options,
             tx,
         })
         .await?;

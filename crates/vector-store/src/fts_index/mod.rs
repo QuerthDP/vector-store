@@ -9,5 +9,6 @@ pub(crate) mod tantivy;
 
 pub(crate) use actor::FtsIndex;
 pub(crate) use actor::FtsIndexExt;
+pub(crate) use actor::HighlightOptions;
 pub(crate) use factory::FtsIndexFactory;
 pub(crate) use tantivy::TantivyIndexFactory;

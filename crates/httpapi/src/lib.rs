@@ -367,6 +367,28 @@ mod tests {
         assert_eq!(distances, vec![f32::MAX, -f32::MAX, 1.5]);
         assert_eq!(similarity_scores, vec![f32::MAX, -f32::MAX, 0.5]);
     }
+
+    #[test]
+    fn highlight_request_without_options_uses_defaults() {
+        // The shape ScyllaDB's coordinator sends.
+        let request: PostIndexHighlightRequest =
+            serde_json::from_str(r#"{"query":"fox","documents":["a fox","no match"]}"#).unwrap();
+
+        assert_eq!(request.query, "fox");
+        assert_eq!(request.documents, vec!["a fox", "no match"]);
+        assert_eq!(request.options, HighlightOptions::default());
+    }
+
+    #[test]
+    fn highlight_request_accepts_partial_options() {
+        let request: PostIndexHighlightRequest =
+            serde_json::from_str(r#"{"query":"fox","documents":[],"options":{"pre_tag":"<em>"}}"#)
+                .unwrap();
+
+        assert_eq!(request.options.pre_tag.as_deref(), Some("<em>"));
+        assert_eq!(request.options.post_tag, None);
+        assert_eq!(request.options.max_num_chars, None);
+    }
 }
 
 #[derive(
@@ -397,4 +419,39 @@ pub struct PostIndexBm25Request {
 pub struct PostIndexBm25Response {
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
     pub scores: Vec<f32>,
+}
+
+#[derive(Default, Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Tuning knobs for snippet generation.
+pub struct HighlightOptions {
+    /// Maximum length of a fragment, in characters. Defaults to 150.
+    #[serde(default)]
+    pub max_num_chars: Option<usize>,
+    /// Markup inserted before every matched term in `html`. Defaults to `<b>`.
+    #[serde(default)]
+    pub pre_tag: Option<String>,
+    /// Markup inserted after every matched term in `html`. Defaults to `</b>`.
+    #[serde(default)]
+    pub post_tag: Option<String>,
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for stateless highlighting. The document texts are supplied by the
+/// caller, so the index does not need to keep a copy of the original text.
+pub struct PostIndexHighlightRequest {
+    /// The text query whose terms should be marked in the documents.
+    pub query: String,
+    /// Document texts to excerpt.
+    pub documents: Vec<String>,
+    #[serde(default)]
+    pub options: HighlightOptions,
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for stateless highlighting, aligned by position with the requested documents.
+pub struct PostIndexHighlightResponse {
+    /// One excerpt per requested document: HTML-escaped text with `pre_tag`/`post_tag`
+    /// wrapped around every matched term. A document that matched no query term yields a
+    /// plain leading excerpt with no markup.
+    pub highlights: Vec<String>,
 }

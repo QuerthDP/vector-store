@@ -9,6 +9,7 @@ use crate::db_basic::DbBasic;
 use crate::db_basic::ScanFn;
 use crate::db_basic::Table;
 use crate::wait_for;
+use httpapi::HighlightOptions;
 use httpapi::IndexStatus;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
@@ -344,6 +345,254 @@ async fn fts_bm25_search_not_serving_returns_503() {
             &index_name,
             "hello".into(),
             NonZeroUsize::new(10).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn fts_highlight_marks_query_terms_in_supplied_text() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _hold) = setup_fts_and_wait(
+        [
+            (vec![CqlValue::Int(1)], "the quick brown fox", 10),
+            (vec![CqlValue::Int(2)], "lazy dog sleeps all day", 20),
+        ],
+        2,
+    )
+    .await;
+
+    let highlights = client
+        .highlight(
+            &keyspace_name,
+            &index_name,
+            "fox".into(),
+            vec!["the quick brown fox jumps".into()],
+            HighlightOptions::default(),
+        )
+        .await;
+
+    assert_eq!(highlights.len(), 1);
+    assert_eq!(highlights[0], "the quick brown <b>fox</b> jumps");
+}
+
+/// The flow a ScyllaDB coordinator performs: search, fetch the rows, then send
+/// the fetched text back for highlighting.
+#[tokio::test]
+async fn fts_highlight_follows_a_bm25_search() {
+    crate::enable_tracing();
+
+    let rows = [
+        (1, "the quick brown fox jumps over"),
+        (2, "a lazy dog sleeps all day long"),
+        (3, "another fox roams the meadow"),
+    ];
+    let (client, keyspace_name, index_name, _hold) = setup_fts_and_wait(
+        rows.map(|(pk, doc)| (vec![CqlValue::Int(pk)], doc, 10 * pk as u64)),
+        3,
+    )
+    .await;
+
+    let (primary_keys, scores) = client
+        .bm25(
+            &keyspace_name,
+            &index_name,
+            "fox".into(),
+            NonZeroUsize::new(10).unwrap().into(),
+        )
+        .await;
+    assert_eq!(scores.len(), 2);
+
+    // Stand in for the coordinator's base-table lookup of the matched rows.
+    let documents: Vec<String> = primary_keys
+        .get(&"pk".into())
+        .unwrap()
+        .iter()
+        .map(|pk| {
+            let pk = pk.as_i64().unwrap() as i32;
+            rows.iter().find(|(id, _)| *id == pk).unwrap().1.to_string()
+        })
+        .collect();
+
+    let highlights = client
+        .highlight(
+            &keyspace_name,
+            &index_name,
+            "fox".into(),
+            documents.clone(),
+            HighlightOptions::default(),
+        )
+        .await;
+
+    assert_eq!(highlights.len(), documents.len());
+    for highlight in &highlights {
+        assert!(highlight.contains("<b>fox</b>"));
+    }
+}
+
+#[tokio::test]
+async fn fts_highlight_returns_leading_excerpt_for_unmatched_document() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _hold) =
+        setup_fts_and_wait([(vec![CqlValue::Int(1)], "the quick brown fox", 10)], 1).await;
+
+    let highlights = client
+        .highlight(
+            &keyspace_name,
+            &index_name,
+            "fox".into(),
+            vec!["turtles all the way down".into()],
+            HighlightOptions {
+                max_num_chars: Some(8),
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+    assert_eq!(highlights[0], "turtles ");
+}
+
+#[tokio::test]
+async fn fts_highlight_honors_custom_tags() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _hold) =
+        setup_fts_and_wait([(vec![CqlValue::Int(1)], "the quick brown fox", 10)], 1).await;
+
+    let highlights = client
+        .highlight(
+            &keyspace_name,
+            &index_name,
+            "fox".into(),
+            vec!["quick fox jumps".into()],
+            HighlightOptions {
+                pre_tag: Some("<em>".into()),
+                post_tag: Some("</em>".into()),
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+    assert_eq!(highlights[0], "quick <em>fox</em> jumps");
+}
+
+#[tokio::test]
+async fn fts_highlight_preserves_document_order() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _hold) = setup_fts_and_wait(
+        [
+            (vec![CqlValue::Int(1)], "the quick brown fox", 10),
+            (vec![CqlValue::Int(2)], "lazy dog sleeps", 20),
+        ],
+        2,
+    )
+    .await;
+
+    let highlights = client
+        .highlight(
+            &keyspace_name,
+            &index_name,
+            "fox OR dog".into(),
+            vec![
+                "quick fox jumps".into(),
+                "turtles swim slowly".into(),
+                "lazy dog sleeps".into(),
+            ],
+            HighlightOptions::default(),
+        )
+        .await;
+
+    assert_eq!(highlights.len(), 3);
+    assert_eq!(highlights[0], "quick <b>fox</b> jumps");
+    assert_eq!(highlights[1], "turtles swim slowly");
+    assert_eq!(highlights[2], "lazy <b>dog</b> sleeps");
+}
+
+#[tokio::test]
+async fn fts_highlight_not_found_returns_404() {
+    crate::enable_tracing();
+
+    let (client, _keyspace_name, _index_name, _hold) =
+        setup_fts_and_wait([(vec![CqlValue::Int(1)], "hello world", 10)], 1).await;
+
+    let response = client
+        .post_highlight(
+            &"nonexistent_ks".into(),
+            &"nonexistent_idx".into(),
+            "hello".into(),
+            vec!["hello world".into()],
+            HighlightOptions::default(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn fts_highlight_unparsable_query_returns_500() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _hold) =
+        setup_fts_and_wait([(vec![CqlValue::Int(1)], "hello world", 10)], 1).await;
+
+    let response = client
+        .post_highlight(
+            &keyspace_name,
+            &index_name,
+            "hello AND".into(),
+            vec!["hello world".into()],
+            HighlightOptions::default(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn fts_highlight_not_serving_returns_503() {
+    crate::enable_tracing();
+
+    let fullscan_fn = |_| {
+        use futures::FutureExt;
+        async move {
+            std::future::pending::<()>().await;
+        }
+        .boxed()
+    };
+    let (run, index, _db, _node_state) = setup_fts_store(
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(Box::new(fullscan_fn)),
+        None,
+    )
+    .await;
+    let (client, _server, _config_tx) = run.await;
+    let keyspace_name: httpapi::KeyspaceName = index.keyspace_name.clone().into();
+    let index_name: httpapi::IndexName = index.index_name.clone().into();
+
+    wait_for(
+        || async {
+            client
+                .index_status(&keyspace_name, &index_name)
+                .await
+                .is_ok_and(|status| status.status == IndexStatus::Bootstrapping)
+        },
+        "Waiting for FTS index to be bootstrapping",
+    )
+    .await;
+
+    let response = client
+        .post_highlight(
+            &keyspace_name,
+            &index_name,
+            "hello".into(),
+            vec!["hello world".into()],
+            HighlightOptions::default(),
         )
         .await;
 

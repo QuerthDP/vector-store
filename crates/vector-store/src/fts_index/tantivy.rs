@@ -21,6 +21,7 @@ use tantivy::schema::Schema;
 use tantivy::schema::TextFieldIndexing;
 use tantivy::schema::TextOptions;
 use tantivy::schema::Value;
+use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::Language;
 use tantivy::tokenizer::LowerCaser;
 use tantivy::tokenizer::SimpleTokenizer;
@@ -46,10 +47,12 @@ use crate::worker;
 use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
+use super::actor::FtsHighlightR;
 use super::actor::FtsIndex;
 use super::actor::FtsSearchR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
+use super::actor::HighlightOptions;
 
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
@@ -244,6 +247,64 @@ fn handle_search(
     Ok((primary_keys, scores))
 }
 
+/// Same character set as tantivy's own html escaping, so fallback fragments and
+/// tantivy-generated ones are escaped identically.
+fn encode_minimal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Used for documents that matched no query term - e.g. a row retrieved by the
+/// semantic leg of a hybrid search. Returns a plain leading excerpt instead of
+/// an empty one.
+fn leading_excerpt(text: &str, max_num_chars: usize) -> String {
+    let end = text
+        .char_indices()
+        .nth(max_num_chars)
+        .map_or(text.len(), |(idx, _)| idx);
+    encode_minimal(&text[..end])
+}
+
+fn handle_highlight(
+    state: &IndexState,
+    query_str: &str,
+    documents: &[String],
+    options: &HighlightOptions,
+) -> FtsHighlightR {
+    let body_field = state.schema.get_field("body").unwrap();
+    let searcher = state.reader.searcher();
+    let query = make_query(&state.index, body_field, query_str)?;
+
+    // The generator weights terms by their document frequency in the live index,
+    // so highlighting stays consistent with what BM25 scored - even though the
+    // text itself comes from the caller.
+    let mut generator = SnippetGenerator::create(&searcher, query.as_ref(), body_field)
+        .map_err(|e| anyhow!("fts: failed to create snippet generator: {e}"))?;
+    generator.set_max_num_chars(options.max_num_chars);
+
+    Ok(documents
+        .iter()
+        .map(|text| {
+            let mut snippet = generator.snippet(text);
+            if snippet.is_empty() {
+                return leading_excerpt(text, options.max_num_chars);
+            }
+            snippet.set_snippet_prefix_postfix(&options.pre_tag, &options.post_tag);
+            snippet.to_html()
+        })
+        .collect())
+}
+
 fn handle_stats(state: &IndexState) -> FtsStatsR {
     let searcher = state.reader.searcher();
     let num_docs = searcher.num_docs();
@@ -379,6 +440,24 @@ pub(crate) fn new(
                         .spawn_blocking(move || {
                             let result =
                                 handle_search(&state, table.as_ref(), &index_key, &query, limit);
+                            _ = tx.send(result);
+                        })
+                        .await;
+                }
+                FtsIndex::Highlight {
+                    index_key,
+                    query,
+                    documents,
+                    options,
+                    tx,
+                } => {
+                    let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
+                        _ = tx.send(Err(anyhow!("fts: missing index {index_key}")));
+                        continue;
+                    };
+                    worker
+                        .spawn_blocking(move || {
+                            let result = handle_highlight(&state, &query, &documents, &options);
                             _ = tx.send(result);
                         })
                         .await;
@@ -663,6 +742,249 @@ mod tests {
         let key = make_index_key();
         let count = sender.count(key).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    async fn highlight(
+        sender: &mpsc::Sender<FtsIndex>,
+        query: &str,
+        documents: &[&str],
+        options: HighlightOptions,
+    ) -> Vec<String> {
+        sender
+            .highlight(
+                make_index_key(),
+                query.into(),
+                documents.iter().map(|doc| doc.to_string()).collect(),
+                options,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn highlight_marks_query_terms_in_caller_supplied_text() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "the quick brown fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["the quick brown fox jumps"],
+            HighlightOptions::default(),
+        )
+        .await;
+
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0], "the quick brown <b>fox</b> jumps");
+    }
+
+    #[tokio::test]
+    async fn highlight_uses_text_not_present_in_the_index() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        // The document body was never indexed - the index only supplies term weights.
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["a completely different fox story"],
+            HighlightOptions::default(),
+        )
+        .await;
+
+        assert_eq!(highlights[0], "a completely different <b>fox</b> story");
+    }
+
+    #[tokio::test]
+    async fn highlight_returns_one_entry_per_document_in_order() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+        add_doc(&sender, 2, "dog").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox OR dog",
+            &["quick fox jumps", "turtles swim slowly", "lazy dog sleeps"],
+            HighlightOptions::default(),
+        )
+        .await;
+
+        assert_eq!(highlights.len(), 3);
+        assert_eq!(highlights[0], "quick <b>fox</b> jumps");
+        assert_eq!(highlights[1], "turtles swim slowly");
+        assert_eq!(highlights[2], "lazy <b>dog</b> sleeps");
+    }
+
+    #[tokio::test]
+    async fn highlight_falls_back_to_leading_excerpt_without_matches() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["turtles all the way down"],
+            HighlightOptions {
+                max_num_chars: 8,
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(highlights[0], "turtles ");
+    }
+
+    #[tokio::test]
+    async fn highlight_leading_excerpt_respects_char_boundaries() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["zażółć gęślą jaźń"],
+            HighlightOptions {
+                max_num_chars: 6,
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(highlights[0], "zażółć");
+    }
+
+    #[tokio::test]
+    async fn highlight_honors_custom_tags() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["a fox"],
+            HighlightOptions {
+                pre_tag: "[[".into(),
+                post_tag: "]]".into(),
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(highlights[0], "a [[fox]]");
+    }
+
+    #[tokio::test]
+    async fn highlight_escapes_html_in_fragment_but_not_in_tags() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["<script>fox & \"friends\"</script> end"],
+            HighlightOptions::default(),
+        )
+        .await;
+
+        assert_eq!(
+            highlights[0],
+            "&lt;script&gt;<b>fox</b> &amp; &quot;friends&quot;&lt;/script&gt; end"
+        );
+    }
+
+    #[tokio::test]
+    async fn highlight_escapes_html_in_leading_excerpt() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let highlights = highlight(
+            &sender,
+            "fox",
+            &["<b>not a match</b>"],
+            HighlightOptions::default(),
+        )
+        .await;
+
+        assert_eq!(highlights[0], "&lt;b&gt;not a match&lt;/b&gt;");
+    }
+
+    #[tokio::test]
+    async fn highlight_truncates_to_max_num_chars() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "needle").await;
+
+        let padding = "padding ".repeat(40);
+        let text = format!("{padding}needle {padding}");
+        let highlights = highlight(
+            &sender,
+            "needle",
+            &[text.as_str()],
+            HighlightOptions {
+                max_num_chars: 40,
+                ..HighlightOptions::default()
+            },
+        )
+        .await;
+
+        assert!(highlights[0].len() < text.len());
+        assert!(highlights[0].contains("<b>needle</b>"));
+    }
+
+    #[tokio::test]
+    async fn highlight_empty_documents_returns_no_highlights() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        assert!(
+            highlight(&sender, "fox", &[], HighlightOptions::default())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn highlight_fails_on_unparsable_query() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "fox").await;
+
+        let result = sender
+            .highlight(
+                make_index_key(),
+                "fox AND".into(),
+                vec!["a fox".into()],
+                HighlightOptions::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn highlight_fails_for_unknown_index() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+
+        let result = sender
+            .highlight(
+                make_index_key(),
+                "fox".into(),
+                vec!["a fox".into()],
+                HighlightOptions::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[test]
