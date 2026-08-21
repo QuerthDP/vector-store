@@ -13,7 +13,7 @@
 //! CAGRA has no incremental insert -- `cuvsCagraExtend` exists in the C API but
 //! is not exposed by the Rust bindings -- so every change requires rebuilding
 //! the whole graph. That makes the host-side row set, not the GPU index, the
-//! source of truth: adds go into it, and a build snapshots it.
+//! source of truth: adds and removes edit it freely, and a build snapshots it.
 
 use crate::AsyncInProgress;
 use crate::Dimensions;
@@ -67,6 +67,27 @@ impl Rows {
         self.positions.insert(primary_id, self.ids.len());
         self.ids.push(primary_id);
         self.values.extend_from_slice(values);
+    }
+
+    /// Removes the row for `primary_id`, if present.
+    ///
+    /// Uses swap-remove, so row order is not stable across removals. That is
+    /// fine: rows only need to line up with `ids` within a single build, and the
+    /// graph is rebuilt from scratch afterwards.
+    fn remove(&mut self, primary_id: PrimaryId) -> bool {
+        let Some(row) = self.positions.remove(&primary_id) else {
+            return false;
+        };
+        let last = self.ids.len() - 1;
+        if row != last {
+            let (dst, src) = (row * self.dimensions, last * self.dimensions);
+            self.values.copy_within(src..src + self.dimensions, dst);
+            self.ids[row] = self.ids[last];
+            self.positions.insert(self.ids[row], row);
+        }
+        self.values.truncate(last * self.dimensions);
+        self.ids.truncate(last);
+        true
     }
 }
 
@@ -167,6 +188,12 @@ impl CuvsIndex {
         self.pending.push(in_progress);
     }
 
+    pub(super) fn remove(&mut self, primary_id: PrimaryId, in_progress: AsyncInProgress) {
+        if self.rows.remove(primary_id) {
+            self.pending.push(in_progress);
+        }
+    }
+
     /// Writes staged since the last successful build.
     pub(super) fn pending(&self) -> usize {
         self.pending.len()
@@ -188,6 +215,14 @@ impl CuvsIndex {
     /// the guards are held, so the next trigger retries and the index keeps
     /// reporting that it is behind.
     pub(super) fn build(&mut self) -> anyhow::Result<()> {
+        if self.rows.len() == 0 {
+            // CAGRA cannot build an empty graph; an emptied index simply has
+            // nothing resident.
+            self.built = None;
+            self.pending.clear();
+            return Ok(());
+        }
+
         let built = BuiltIndex::build(&self.resources, &self.index_params, &self.rows)?;
         debug!(
             rows = built.rows,
@@ -248,6 +283,44 @@ mod tests {
         assert_eq!(rows.values, vec![9.0, 9.0, 3.0, 4.0]);
     }
 
+    #[test]
+    fn remove_swaps_the_last_row_into_the_gap() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 1.0]));
+        rows.upsert(2.into(), &vector(&[2.0, 2.0]));
+        rows.upsert(3.into(), &vector(&[3.0, 3.0]));
+
+        assert!(rows.remove(1.into()));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.values, vec![3.0, 3.0, 2.0, 2.0]);
+        assert_eq!(rows.ids, vec![3.into(), 2.into()]);
+        // The moved row must still be reachable by its id.
+        assert_eq!(rows.positions[&PrimaryId::from(3)], 0);
+        assert_eq!(rows.positions[&PrimaryId::from(2)], 1);
+    }
+
+    #[test]
+    fn remove_of_the_last_row_leaves_the_rest_intact() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 1.0]));
+        rows.upsert(2.into(), &vector(&[2.0, 2.0]));
+
+        assert!(rows.remove(2.into()));
+
+        assert_eq!(rows.values, vec![1.0, 1.0]);
+        assert_eq!(rows.ids, vec![1.into()]);
+    }
+
+    #[test]
+    fn remove_of_an_unknown_id_is_a_no_op() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 1.0]));
+
+        assert!(!rows.remove(7.into()));
+        assert_eq!(rows.len(), 1);
+    }
+
     /// CAGRA needs a non-trivial dataset to build a graph, so these tests use a
     /// few hundred rows rather than a handful.
     fn many_vectors(count: usize, dims: usize) -> Vec<Vector> {
@@ -276,6 +349,25 @@ mod tests {
 
         assert_eq!(index.count(), 256);
         assert_eq!(index.pending(), 0);
+    }
+
+    #[test]
+    fn rebuild_reflects_removals() {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(256, 4).iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+        }
+        index.build().unwrap();
+        assert_eq!(index.count(), 256);
+
+        for row in 0..56u64 {
+            index.remove(row.into(), AsyncInProgress::None);
+        }
+        // The built graph is untouched until the next build.
+        assert_eq!(index.count(), 256);
+
+        index.build().unwrap();
+        assert_eq!(index.count(), 200);
     }
 
     #[test]

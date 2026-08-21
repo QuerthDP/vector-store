@@ -209,10 +209,15 @@ fn handle(
         })) => {
             index.add(primary_id, &embedding, in_progress);
         }
-        Request::Message(Message::Modify(
-            VsIndexModify::RemoveVector { .. } | VsIndexModify::RemovePartition { .. },
-        )) => {
-            warn!("removing vectors is not implemented yet");
+        Request::Message(Message::Modify(VsIndexModify::RemoveVector {
+            primary_id,
+            in_progress,
+            ..
+        })) => {
+            index.remove(primary_id, in_progress);
+        }
+        Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
+            warn!("removing a partition is not implemented yet");
         }
         Request::Message(Message::Search(VsIndexSearch::Count { index_key, tx })) => {
             let result = match table.read().unwrap().index_id(&index_key) {
@@ -344,6 +349,23 @@ mod tests {
         while rx.recv().await.is_some() {}
     }
 
+    async fn remove_rows(harness: &Harness, rows: std::ops::Range<u64>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        for row in rows {
+            harness
+                .modify
+                .remove_vector(
+                    harness.partition_id,
+                    PrimaryId::from(row),
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
     #[rstest]
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
@@ -358,6 +380,22 @@ mod tests {
             harness.search.count(index_key()).await.unwrap(),
             TEST_ROWS,
             "in-progress guards must be held until the build that includes the writes"
+        );
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn removed_vectors_leave_the_index_on_rebuild() {
+        let harness = harness();
+        add_rows(&harness, TEST_ROWS).await;
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), TEST_ROWS);
+
+        remove_rows(&harness, 0..56).await;
+
+        assert_eq!(
+            harness.search.count(index_key()).await.unwrap(),
+            TEST_ROWS - 56
         );
     }
 
