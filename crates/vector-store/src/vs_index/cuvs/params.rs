@@ -13,6 +13,7 @@
 //! into the real thing on the GPU thread.
 
 use crate::Connectivity;
+use crate::Dimensions;
 use crate::ExpansionAdd;
 use crate::Quantization;
 use crate::SpaceType;
@@ -25,6 +26,7 @@ use cuvs::neighbors::cagra::IndexParams;
 /// CAGRA build parameters, in a form that can be sent to the GPU thread.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CagraParams {
+    pub(super) dimensions: Dimensions,
     pub(super) metric: DistanceType,
     pub(super) graph_degree: usize,
     pub(super) intermediate_graph_degree: usize,
@@ -62,6 +64,7 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
         }
 
         Ok(Self {
+            dimensions: config.dimensions,
             metric,
             graph_degree,
             intermediate_graph_degree,
@@ -112,7 +115,6 @@ fn intermediate_graph_degree(expansion_add: ExpansionAdd) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Dimensions;
     use crate::ExpansionSearch;
     use crate::IndexKey;
     use std::num::NonZeroUsize;
@@ -133,6 +135,10 @@ mod tests {
     fn defaults_map_to_valid_cagra_params() {
         let params = CagraParams::try_from(&configuration()).unwrap();
 
+        assert_eq!(
+            params.dimensions,
+            Dimensions::from(NonZeroUsize::new(3).unwrap())
+        );
         // The service defaults to cosine.
         assert_eq!(params.metric, DistanceType::CosineExpanded);
         assert_eq!(params.graph_degree, *Connectivity::default().as_ref());
