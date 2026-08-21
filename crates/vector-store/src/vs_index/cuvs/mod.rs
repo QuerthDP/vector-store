@@ -39,6 +39,7 @@ use crate::Config;
 use crate::IndexKey;
 use crate::VsIndexFactory;
 use crate::perf;
+use crate::table::PartitionId;
 use crate::table::Table;
 use crate::table::TableSearch;
 use crate::vs_index;
@@ -46,6 +47,7 @@ use crate::vs_index::Message;
 use crate::vs_index::VsIndexModify;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::factory::VsIndexConfiguration;
+use crate::vs_index::validator;
 use anyhow::anyhow;
 use index::CuvsIndex;
 use params::CagraParams;
@@ -59,6 +61,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
 use tracing::error;
+use tracing::warn;
 
 /// Rebuild this often while changes are staged.
 const BUILD_INTERVAL: Duration = Duration::from_secs(3);
@@ -201,21 +204,37 @@ fn handle(
             build_if_pending(index, index_key);
         }
         Request::Message(Message::Modify(VsIndexModify::AddVector {
+            partition_id,
             primary_id,
             embedding,
             in_progress,
-            ..
         })) => {
+            if !is_global(partition_id, index_key) {
+                return;
+            }
+            // Unlike the CPU backends, which only validate on the query path, a
+            // wrong-length vector here would corrupt the row-major matrix every
+            // row is copied into.
+            if let Err(err) = validator::embedding_dimensions(&embedding, index.dimensions()) {
+                warn!("Unable to add vector to index {index_key}: {err}");
+                return;
+            }
             index.add(primary_id, &embedding, in_progress);
         }
         Request::Message(Message::Modify(VsIndexModify::RemoveVector {
+            partition_id,
             primary_id,
             in_progress,
-            ..
         })) => {
+            if !is_global(partition_id, index_key) {
+                return;
+            }
             index.remove(primary_id, in_progress);
         }
-        Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
+        Request::Message(Message::Modify(VsIndexModify::RemovePartition { partition_id })) => {
+            if !is_global(partition_id, index_key) {
+                return;
+            }
             index.clear();
             build_if_pending(index, index_key);
         }
@@ -226,10 +245,14 @@ fn handle(
             };
             _ = tx.send(result);
         }
-        Request::Message(Message::Search(
-            VsIndexSearch::Ann { tx, .. } | VsIndexSearch::FilteredAnn { tx, .. },
-        )) => {
+        Request::Message(Message::Search(VsIndexSearch::Ann { tx, .. })) => {
             _ = tx.send(Err(anyhow!("cuVS index search is not implemented yet")));
+        }
+        Request::Message(Message::Search(VsIndexSearch::FilteredAnn { tx, .. })) => {
+            _ = tx.send(Err(anyhow!(
+                "cuVS index does not support filtered search: the GPU backend serves unfiltered \
+                 ANN queries only"
+            )));
         }
     }
 }
@@ -245,6 +268,23 @@ fn build_if_pending(index: &mut CuvsIndex, index_key: &IndexKey) {
     }
 }
 
+/// The GPU backend serves global indexes only.
+///
+/// A local index would create one small graph per partition, which wastes VRAM
+/// on per-index overhead and gives the GPU batches too small to be worth the
+/// transfer. `VsIndexConfiguration` carries no partitioning field, so this is
+/// checked per message rather than at index creation.
+fn is_global(partition_id: PartitionId, index_key: &IndexKey) -> bool {
+    if partition_id.index_id().is_global() {
+        return true;
+    }
+    warn!(
+        "Ignoring modification for non-global index {index_key}: the cuVS backend supports \
+         global indexes only"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +298,6 @@ mod tests {
     use crate::Vector;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
-    use crate::table::PartitionId;
     use crate::table::PrimaryId;
     use crate::vs_index::VsIndexModifyExt;
     use crate::vs_index::VsIndexSearchExt;
@@ -299,8 +338,8 @@ mod tests {
         partition_id: PartitionId,
     }
 
-    fn harness() -> Harness {
-        let index_id = IndexIdGenerator::new().next(true).unwrap();
+    fn harness(global: bool) -> Harness {
+        let index_id = IndexIdGenerator::new().next(global).unwrap();
         let partition_id = PartitionId::global(index_id);
         let (modify, search) = new(
             index_key(),
@@ -370,7 +409,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn count_reflects_the_built_index() {
-        let harness = harness();
+        let harness = harness(true);
         add_rows(&harness, TEST_ROWS).await;
 
         // No polling: the in-progress guards `add_rows` waited on are released
@@ -387,7 +426,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn removed_vectors_leave_the_index_on_rebuild() {
-        let harness = harness();
+        let harness = harness(true);
         add_rows(&harness, TEST_ROWS).await;
         assert_eq!(harness.search.count(index_key()).await.unwrap(), TEST_ROWS);
 
@@ -403,9 +442,75 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn count_is_zero_before_the_first_build() {
-        let harness = harness();
+        let harness = harness(true);
 
         assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn non_global_indexes_are_not_served() {
+        let harness = harness(false);
+        for row in 0..TEST_ROWS {
+            harness
+                .modify
+                .add_vector(
+                    harness.partition_id,
+                    PrimaryId::from(row as u64),
+                    embedding(row),
+                    AsyncInProgress::None,
+                )
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(TEST_BUILD_INTERVAL * 3).await;
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn wrong_dimension_vectors_are_rejected() {
+        let harness = harness(true);
+        harness
+            .modify
+            .add_vector(
+                harness.partition_id,
+                PrimaryId::from(0),
+                Vector::from(vec![1.0, 2.0]),
+                AsyncInProgress::None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(TEST_BUILD_INTERVAL * 3).await;
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn filtered_search_reports_that_it_is_unsupported() {
+        let harness = harness(true);
+
+        let err = harness
+            .search
+            .filtered_ann(
+                index_key(),
+                embedding(0),
+                crate::Filter {
+                    restrictions: Vec::new(),
+                    allow_filtering: false,
+                },
+                NonZeroUsize::new(1).unwrap().into(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("filtered search"), "got: {err}");
     }
 
     #[test]
