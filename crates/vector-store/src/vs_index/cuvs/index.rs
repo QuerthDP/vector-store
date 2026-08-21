@@ -89,6 +89,12 @@ impl Rows {
         self.ids.truncate(last);
         true
     }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.ids.clear();
+        self.positions.clear();
+    }
 }
 
 /// A CAGRA index and the device memory it reads.
@@ -192,6 +198,17 @@ impl CuvsIndex {
         if self.rows.remove(primary_id) {
             self.pending.push(in_progress);
         }
+    }
+
+    /// Drops every row. Global indexes have a single partition, so removing it
+    /// empties the index.
+    pub(super) fn clear(&mut self) {
+        if self.rows.len() == 0 {
+            return;
+        }
+        self.rows.clear();
+        // No guard to hold: `RemovePartition` carries none.
+        self.pending.push(AsyncInProgress::None);
     }
 
     /// Writes staged since the last successful build.
@@ -381,5 +398,20 @@ mod tests {
 
         index.build().unwrap();
         assert_eq!(index.count(), 256);
+    }
+
+    #[test]
+    fn clearing_all_rows_empties_the_index() {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(256, 4).iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+        }
+        index.build().unwrap();
+        assert_eq!(index.count(), 256);
+
+        index.clear();
+        index.build().unwrap();
+
+        assert_eq!(index.count(), 0);
     }
 }

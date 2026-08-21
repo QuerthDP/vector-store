@@ -59,7 +59,6 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
 use tracing::error;
-use tracing::warn;
 
 /// Rebuild this often while changes are staged.
 const BUILD_INTERVAL: Duration = Duration::from_secs(3);
@@ -217,7 +216,8 @@ fn handle(
             index.remove(primary_id, in_progress);
         }
         Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
-            warn!("removing a partition is not implemented yet");
+            index.clear();
+            build_if_pending(index, index_key);
         }
         Request::Message(Message::Search(VsIndexSearch::Count { index_key, tx })) => {
             let result = match table.read().unwrap().index_id(&index_key) {
