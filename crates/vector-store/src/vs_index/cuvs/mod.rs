@@ -39,6 +39,9 @@ mod params;
 use crate::Config;
 use crate::IndexKey;
 use crate::VsIndexFactory;
+use crate::memory::Allocate;
+use crate::memory::Memory;
+use crate::memory::MemoryExt;
 use crate::perf;
 use crate::table::PartitionId;
 use crate::table::Table;
@@ -69,7 +72,9 @@ const BUILD_THRESHOLD: usize = 10_000;
 /// Rebuild at least this often while changes are staged.
 const BUILD_INTERVAL: Duration = Duration::from_secs(3);
 
-pub struct CuvsIndexFactory;
+pub struct CuvsIndexFactory {
+    memory: mpsc::Sender<Memory>,
+}
 
 impl VsIndexFactory for CuvsIndexFactory {
     fn create_index(
@@ -80,7 +85,14 @@ impl VsIndexFactory for CuvsIndexFactory {
         // Validated here rather than on the cuVS thread so a bad index option is
         // reported when the index is created, not silently much later.
         let params = CagraParams::try_from(&index)?;
-        new(index.key, params, table, BUILD_INTERVAL, BUILD_THRESHOLD)
+        new(
+            index.key,
+            params,
+            table,
+            self.memory.clone(),
+            BUILD_INTERVAL,
+            BUILD_THRESHOLD,
+        )
     }
 
     fn index_engine_version(&self) -> String {
@@ -91,12 +103,15 @@ impl VsIndexFactory for CuvsIndexFactory {
     }
 }
 
-pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<CuvsIndexFactory> {
+pub fn new_cuvs(
+    _config_rx: watch::Receiver<Arc<Config>>,
+    memory: mpsc::Sender<Memory>,
+) -> anyhow::Result<CuvsIndexFactory> {
     // Fail at startup rather than at the first index creation if there is no
     // usable GPU.
     cuvs::Resources::new()
         .map_err(|err| anyhow!("failed to initialize cuVS/CUDA resources: {err}"))?;
-    Ok(CuvsIndexFactory)
+    Ok(CuvsIndexFactory { memory })
 }
 
 /// What the async actor sends to the cuVS thread.
@@ -110,6 +125,7 @@ fn new(
     index_key: IndexKey,
     params: CagraParams,
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
+    memory: mpsc::Sender<Memory>,
     build_interval: Duration,
     build_threshold: usize,
 ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
@@ -158,6 +174,9 @@ fn new(
         async move {
             debug!("starting");
 
+            let mut allocate_prev = Allocate::Can;
+            let allocate_rx = memory.subscribe_allocate().await;
+
             let mut interval = tokio::time::interval(build_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -170,6 +189,14 @@ fn new(
                         let Some(msg) = msg else {
                             break;
                         };
+                        if !check_memory_allocation(
+                            &msg,
+                            &allocate_rx,
+                            &mut allocate_prev,
+                            &index_key,
+                        ) {
+                            continue;
+                        }
                         if tx_gpu.send(Request::Message(msg)).await.is_err() {
                             break;
                         }
@@ -201,6 +228,32 @@ fn reject(msg: Message, err: impl Fn() -> anyhow::Error) {
         }
         Message::Modify(_) => {}
     }
+}
+
+/// Drops writes while the host is out of memory.
+///
+/// The staged rows a rebuild reads from live in host RAM, so the existing
+/// host-memory gate is the right one; a VRAM budget is a separate concern.
+/// Logged only on the transition, to avoid a flood.
+fn check_memory_allocation(
+    msg: &Message,
+    rx_allocate: &watch::Receiver<Allocate>,
+    allocate_prev: &mut Allocate,
+    index_key: &IndexKey,
+) -> bool {
+    if !matches!(msg, Message::Modify(VsIndexModify::AddVector { .. })) {
+        return true;
+    }
+    let allocate = *rx_allocate.borrow();
+    if allocate == Allocate::Cannot {
+        if *allocate_prev == Allocate::Can {
+            error!("Unable to add vector for index {index_key}: not enough memory");
+        }
+        *allocate_prev = allocate;
+        return false;
+    }
+    *allocate_prev = allocate;
+    true
 }
 
 fn handle(
@@ -317,6 +370,7 @@ mod tests {
     use crate::Quantization;
     use crate::SpaceType;
     use crate::Vector;
+    use crate::memory::Memory;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
     use crate::table::PrimaryId;
@@ -354,19 +408,31 @@ mod tests {
         Arc::new(RwLock::new(mock))
     }
 
+    fn memory_actor(allocate: Allocate) -> mpsc::Sender<Memory> {
+        let (tx, mut rx) = mpsc::channel::<Memory>(1);
+        tokio::spawn(async move {
+            let (watch_tx, _) = watch::channel(allocate);
+            while let Some(Memory::SubscribeAllocate { tx }) = rx.recv().await {
+                let _ = tx.send(watch_tx.subscribe());
+            }
+        });
+        tx
+    }
+
     struct Harness {
         modify: mpsc::Sender<VsIndexModify>,
         search: mpsc::Sender<VsIndexSearch>,
         partition_id: PartitionId,
     }
 
-    fn harness(global: bool, build_threshold: usize) -> Harness {
+    fn harness(global: bool, allocate: Allocate, build_threshold: usize) -> Harness {
         let index_id = IndexIdGenerator::new().next(global).unwrap();
         let partition_id = PartitionId::global(index_id);
         let (modify, search) = new(
             index_key(),
             CagraParams::try_from(&configuration()).unwrap(),
             table_with(index_id),
+            memory_actor(allocate),
             TEST_BUILD_INTERVAL,
             build_threshold,
         )
@@ -448,7 +514,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn count_reflects_the_built_index() {
-        let harness = harness(true, TEST_BUILD_THRESHOLD);
+        let harness = harness(true, Allocate::Can, TEST_BUILD_THRESHOLD);
         add_rows(&harness, TEST_ROWS).await;
 
         // No polling: the in-progress guards `add_rows` waited on are released
@@ -466,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn threshold_triggers_a_build_before_the_interval() {
         // A threshold below the row count must build without waiting for a tick.
-        let harness = harness(true, TEST_ROWS);
+        let harness = harness(true, Allocate::Can, TEST_ROWS);
         add_rows(&harness, TEST_ROWS).await;
 
         wait_for_count(&harness, TEST_ROWS).await;
@@ -476,7 +542,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn removed_vectors_leave_the_index_on_rebuild() {
-        let harness = harness(true, TEST_BUILD_THRESHOLD);
+        let harness = harness(true, Allocate::Can, TEST_BUILD_THRESHOLD);
         add_rows(&harness, TEST_ROWS).await;
         assert_eq!(harness.search.count(index_key()).await.unwrap(), TEST_ROWS);
 
@@ -492,7 +558,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn count_is_zero_before_the_first_build() {
-        let harness = harness(true, TEST_BUILD_THRESHOLD);
+        let harness = harness(true, Allocate::Can, TEST_BUILD_THRESHOLD);
 
         assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
     }
@@ -500,8 +566,31 @@ mod tests {
     #[rstest]
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
+    async fn vectors_are_dropped_when_memory_is_exhausted() {
+        let harness = harness(true, Allocate::Cannot, TEST_BUILD_THRESHOLD);
+        for row in 0..TEST_ROWS {
+            harness
+                .modify
+                .add_vector(
+                    harness.partition_id,
+                    PrimaryId::from(row as u64),
+                    embedding(row),
+                    AsyncInProgress::None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Give the interval trigger a chance to fire; nothing should be indexed.
+        tokio::time::sleep(TEST_BUILD_INTERVAL * 3).await;
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
     async fn non_global_indexes_are_not_served() {
-        let harness = harness(false, TEST_BUILD_THRESHOLD);
+        let harness = harness(false, Allocate::Can, TEST_BUILD_THRESHOLD);
         for row in 0..TEST_ROWS {
             harness
                 .modify
@@ -523,7 +612,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn wrong_dimension_vectors_are_rejected() {
-        let harness = harness(true, TEST_BUILD_THRESHOLD);
+        let harness = harness(true, Allocate::Can, TEST_BUILD_THRESHOLD);
         harness
             .modify
             .add_vector(
@@ -543,7 +632,7 @@ mod tests {
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn filtered_search_reports_that_it_is_unsupported() {
-        let harness = harness(true, TEST_BUILD_THRESHOLD);
+        let harness = harness(true, Allocate::Can, TEST_BUILD_THRESHOLD);
 
         let err = harness
             .search
@@ -565,7 +654,9 @@ mod tests {
 
     #[test]
     fn index_engine_version_reports_cuvs_library_version() {
-        let factory = CuvsIndexFactory;
+        let factory = CuvsIndexFactory {
+            memory: mpsc::channel(1).0,
+        };
         let (major, minor, patch) = cuvs::version::version().unwrap();
         assert_eq!(
             factory.index_engine_version(),
