@@ -27,7 +27,8 @@
 //! # Rebuilds
 //!
 //! CAGRA is batch-built and the Rust bindings expose no incremental insert, so
-//! writes accumulate host-side and the graph is rebuilt from them on a timer.
+//! writes accumulate host-side and the graph is rebuilt from them. A rebuild is
+//! triggered by whichever comes first: a number of staged changes, or a timer.
 //! Until a rebuild lands, the writes are not in the index -- so the in-progress
 //! guards that report indexing lag are held until it does.
 
@@ -61,6 +62,8 @@ use tracing::debug_span;
 use tracing::error;
 use tracing::warn;
 
+/// Rebuild after this many staged changes.
+const BUILD_THRESHOLD: usize = 10_000;
 /// Rebuild at least this often while changes are staged.
 const BUILD_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -75,7 +78,7 @@ impl VsIndexFactory for CuvsIndexFactory {
         // Validated here rather than on the cuVS thread so a bad index option is
         // reported when the index is created, not silently much later.
         let params = CagraParams::try_from(&index)?;
-        new(index.key, params, table, BUILD_INTERVAL)
+        new(index.key, params, table, BUILD_INTERVAL, BUILD_THRESHOLD)
     }
 
     fn index_engine_version(&self) -> String {
@@ -106,6 +109,7 @@ fn new(
     params: CagraParams,
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
     build_interval: Duration,
+    build_threshold: usize,
 ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
     let channel_size = perf::channel_size().into();
     let (tx_modify, mut rx_modify) = mpsc::channel(channel_size);
@@ -135,7 +139,13 @@ fn new(
 
             debug!("cuVS thread starting for {thread_key}");
             while let Some(request) = rx_gpu.blocking_recv() {
-                handle(&mut index, table.as_ref(), &thread_key, request);
+                handle(
+                    &mut index,
+                    table.as_ref(),
+                    &thread_key,
+                    build_threshold,
+                    request,
+                );
             }
             debug!("cuVS thread finished for {thread_key}");
         })
@@ -195,6 +205,7 @@ fn handle(
     index: &mut CuvsIndex,
     table: &RwLock<impl TableSearch>,
     index_key: &IndexKey,
+    build_threshold: usize,
     request: Request,
 ) {
     match request {
@@ -208,6 +219,7 @@ fn handle(
             ..
         })) => {
             index.add(primary_id, &embedding, in_progress);
+            build_if_full(index, index_key, build_threshold);
         }
         Request::Message(Message::Modify(
             VsIndexModify::RemoveVector { .. } | VsIndexModify::RemovePartition { .. },
@@ -226,6 +238,14 @@ fn handle(
         )) => {
             _ = tx.send(Err(anyhow!("cuVS index search is not implemented yet")));
         }
+    }
+}
+
+/// Rebuilds once enough writes have accumulated, so a busy index does not wait
+/// for the timer.
+fn build_if_full(index: &mut CuvsIndex, index_key: &IndexKey, build_threshold: usize) {
+    if index.pending() >= build_threshold {
+        build_if_pending(index, index_key);
     }
 }
 
@@ -261,6 +281,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     const TEST_BUILD_INTERVAL: Duration = Duration::from_millis(50);
+    const TEST_BUILD_THRESHOLD: usize = 10_000;
 
     /// CAGRA needs a non-trivial dataset before it will build a graph.
     const TEST_ROWS: usize = 256;
@@ -294,7 +315,7 @@ mod tests {
         partition_id: PartitionId,
     }
 
-    fn harness() -> Harness {
+    fn harness(build_threshold: usize) -> Harness {
         let index_id = IndexIdGenerator::new().next(true).unwrap();
         let partition_id = PartitionId::global(index_id);
         let (modify, search) = new(
@@ -302,6 +323,7 @@ mod tests {
             CagraParams::try_from(&configuration()).unwrap(),
             table_with(index_id),
             TEST_BUILD_INTERVAL,
+            build_threshold,
         )
         .unwrap();
         Harness {
@@ -344,11 +366,27 @@ mod tests {
         while rx.recv().await.is_some() {}
     }
 
+    /// The interval trigger makes the build asynchronous, so counts are polled.
+    async fn wait_for_count(harness: &Harness, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if harness.search.count(index_key()).await.unwrap() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("timed out waiting for count to reach {expected}");
+        });
+    }
+
     #[rstest]
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
     async fn count_reflects_the_built_index() {
-        let harness = harness();
+        let harness = harness(TEST_BUILD_THRESHOLD);
         add_rows(&harness, TEST_ROWS).await;
 
         // No polling: the in-progress guards `add_rows` waited on are released
@@ -364,8 +402,19 @@ mod tests {
     #[rstest]
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
+    async fn threshold_triggers_a_build_before_the_interval() {
+        // A threshold below the row count must build without waiting for a tick.
+        let harness = harness(TEST_ROWS);
+        add_rows(&harness, TEST_ROWS).await;
+
+        wait_for_count(&harness, TEST_ROWS).await;
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
     async fn count_is_zero_before_the_first_build() {
-        let harness = harness();
+        let harness = harness(TEST_BUILD_THRESHOLD);
 
         assert_eq!(harness.search.count(index_key()).await.unwrap(), 0);
     }
