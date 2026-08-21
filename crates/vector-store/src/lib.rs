@@ -771,7 +771,7 @@ pub async fn run(
         vs_index::new_index_factory_opensearch(addr, config_rx.clone())?
     } else if use_gpu {
         tracing::info!("Using cuVS (GPU) index factory");
-        vs_index::new_index_factory_cuvs(config_rx.clone())?
+        vs_index::new_index_factory_cuvs(config_rx.clone(), memory.clone())?
     } else if use_diskann {
         tracing::info!("Using DiskANN index factory");
         vs_index::new_index_factory_diskann(config_rx.clone(), worker.clone(), memory.clone())?
