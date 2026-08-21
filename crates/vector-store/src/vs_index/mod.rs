@@ -72,13 +72,15 @@ pub(crate) fn new_index_factory_diskann(
 #[cfg(feature = "gpu")]
 pub(crate) fn new_index_factory_cuvs(
     config_rx: watch::Receiver<Arc<Config>>,
+    memory: mpsc::Sender<Memory>,
 ) -> anyhow::Result<Box<dyn VsIndexFactory + Send + Sync>> {
-    Ok(Box::new(cuvs::new_cuvs(config_rx)?))
+    Ok(Box::new(cuvs::new_cuvs(config_rx, memory)?))
 }
 
 #[cfg(not(feature = "gpu"))]
 pub(crate) fn new_index_factory_cuvs(
     _config_rx: watch::Receiver<Arc<Config>>,
+    _memory: mpsc::Sender<Memory>,
 ) -> anyhow::Result<Box<dyn VsIndexFactory + Send + Sync>> {
     Err(anyhow::anyhow!(
         "VECTOR_STORE_USE_GPU is set but this vector-store binary was built without GPU support \
@@ -95,7 +97,8 @@ mod tests {
     #[test]
     fn new_index_factory_cuvs_fails_without_gpu_feature() {
         let (_, config_rx) = watch::channel(Arc::new(Config::default()));
-        let err = match new_index_factory_cuvs(config_rx) {
+        let (memory, _rx) = mpsc::channel(1);
+        let err = match new_index_factory_cuvs(config_rx, memory) {
             Ok(_) => panic!("expected an error when the `gpu` feature is disabled"),
             Err(err) => err.to_string(),
         };
