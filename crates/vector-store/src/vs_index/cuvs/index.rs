@@ -159,6 +159,7 @@ impl BuiltIndex {
 pub(super) struct CuvsIndex {
     resources: Resources,
     index_params: IndexParams,
+    dimensions: Dimensions,
     rows: Rows,
     built: Option<BuiltIndex>,
     /// In-progress guards for writes that are staged but not yet in a built
@@ -178,10 +179,15 @@ impl CuvsIndex {
         Ok(Self {
             resources,
             index_params,
+            dimensions: params.dimensions,
             rows: Rows::new(params.dimensions),
             built: None,
             pending: Vec::new(),
         })
+    }
+
+    pub(super) fn dimensions(&self) -> Dimensions {
+        self.dimensions
     }
 
     pub(super) fn add(
