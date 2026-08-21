@@ -60,7 +60,6 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
 use tracing::error;
-use tracing::warn;
 
 /// Rebuild after this many staged changes.
 const BUILD_THRESHOLD: usize = 10_000;
@@ -230,7 +229,8 @@ fn handle(
             build_if_full(index, index_key, build_threshold);
         }
         Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
-            warn!("removing a partition is not implemented yet");
+            index.clear();
+            build_if_pending(index, index_key);
         }
         Request::Message(Message::Search(VsIndexSearch::Count { index_key, tx })) => {
             let result = match table.read().unwrap().index_id(&index_key) {
