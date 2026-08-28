@@ -6,8 +6,10 @@
 use crate::Quantization;
 use crate::SpaceType;
 use crate::vs_index::VsIndexConfiguration;
+use anyhow::anyhow;
 use anyhow::bail;
 use cuvs::distance::DistanceType;
+use cuvs::neighbors::cagra::IndexParams;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CagraParams {
@@ -47,6 +49,17 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
             graph_degree,
             intermediate_graph_degree,
         })
+    }
+}
+
+impl CagraParams {
+    pub(super) fn to_index_params(self) -> anyhow::Result<IndexParams> {
+        IndexParams::builder()
+            .metric(self.metric)
+            .graph_degree(self.graph_degree)
+            .intermediate_graph_degree(self.intermediate_graph_degree)
+            .build()
+            .map_err(|err| anyhow!("failed to build cuVS CAGRA index params: {err}"))
     }
 }
 

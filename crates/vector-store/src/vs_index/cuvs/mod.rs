@@ -6,6 +6,7 @@
 mod params;
 
 use crate::Config;
+use crate::IndexKey;
 use crate::VsIndexFactory;
 use crate::perf;
 use crate::table::Table;
@@ -18,11 +19,13 @@ use anyhow::anyhow;
 use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::thread;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
+use tracing::error;
 use tracing::warn;
 
 pub struct CuvsIndexFactory;
@@ -33,8 +36,8 @@ impl VsIndexFactory for CuvsIndexFactory {
         index: VsIndexConfiguration,
         _table: Arc<RwLock<Table>>,
     ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
-        CagraParams::try_from(&index)?;
-        new(index.key)
+        let params = CagraParams::try_from(&index)?;
+        new(index.key, params)
     }
 
     fn index_engine_version(&self) -> String {
@@ -52,45 +55,80 @@ pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<Cuvs
 }
 
 fn new(
-    index_key: crate::IndexKey,
+    index_key: IndexKey,
+    params: CagraParams,
 ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
-    let (tx_modify, mut rx_modify) = mpsc::channel(perf::channel_size().into());
-    let (tx_search, mut rx_search) = mpsc::channel(perf::channel_size().into());
+    let channel_size = perf::channel_size().into();
+    let (tx_modify, mut rx_modify) = mpsc::channel(channel_size);
+    let (tx_search, mut rx_search) = mpsc::channel(channel_size);
+    let (tx_gpu, mut rx_gpu) = mpsc::channel(channel_size);
+
+    let thread_key = index_key.clone();
+    thread::Builder::new()
+        .name(format!("cuvs-{index_key}"))
+        .spawn(move || {
+            if let Err(err) = params.to_index_params() {
+                error!("unable to create cuVS index for {thread_key}: {err}");
+                // Draining keeps senders from blocking, so every search gets
+                // an error rather than hanging.
+                while let Some(msg) = rx_gpu.blocking_recv() {
+                    reject(msg, anyhow!("cuVS index is unavailable: {err}"));
+                }
+                return;
+            }
+
+            debug!("cuVS thread starting for {thread_key}");
+            while let Some(msg) = rx_gpu.blocking_recv() {
+                handle(msg);
+            }
+            debug!("cuVS thread finished for {thread_key}");
+        })
+        .map_err(|err| anyhow!("unable to spawn cuVS thread for {index_key}: {err}"))?;
 
     let span_key = index_key.clone();
-
     tokio::spawn(perf::hotpath_async(
-        {
-            async move {
-                debug!("starting");
+        async move {
+            debug!("starting");
 
-                while let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await {
-                    match msg {
-                        Message::Modify(
-                            VsIndexModify::AddVector { .. }
-                            | VsIndexModify::RemoveVector { .. }
-                            | VsIndexModify::RemovePartition { .. },
-                        ) => {
-                            warn!("not implemented yet");
-                        }
-                        Message::Search(
-                            VsIndexSearch::Ann { tx, .. } | VsIndexSearch::FilteredAnn { tx, .. },
-                        ) => {
-                            _ = tx.send(Err(anyhow!("GPU index is not implemented yet")));
-                        }
-                        Message::Search(VsIndexSearch::Count { tx, .. }) => {
-                            _ = tx.send(Err(anyhow!("GPU index is not implemented yet")));
-                        }
-                    }
+            while let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await {
+                if tx_gpu.send(msg).await.is_err() {
+                    break;
                 }
-
-                debug!("finished");
             }
+
+            debug!("finished");
         }
         .instrument(debug_span!("cuvs", "{span_key}")),
     ));
 
     Ok((tx_modify, tx_search))
+}
+
+fn reject(msg: Message, err: anyhow::Error) {
+    match msg {
+        Message::Search(VsIndexSearch::Ann { tx, .. } | VsIndexSearch::FilteredAnn { tx, .. }) => {
+            _ = tx.send(Err(err));
+        }
+        Message::Search(VsIndexSearch::Count { tx, .. }) => {
+            _ = tx.send(Err(err));
+        }
+        Message::Modify(_) => {}
+    }
+}
+
+fn handle(msg: Message) {
+    match msg {
+        Message::Modify(
+            VsIndexModify::AddVector { .. }
+            | VsIndexModify::RemoveVector { .. }
+            | VsIndexModify::RemovePartition { .. },
+        ) => {
+            warn!("not implemented yet");
+        }
+        Message::Search(_) => {
+            reject(msg, anyhow!("GPU index is not implemented yet"));
+        }
+    }
 }
 
 #[cfg(test)]
