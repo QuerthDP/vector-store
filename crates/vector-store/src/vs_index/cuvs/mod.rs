@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+mod params;
+
 use crate::Config;
 use crate::VsIndexFactory;
 use crate::perf;
@@ -13,6 +15,7 @@ use crate::vs_index::VsIndexModify;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::factory::VsIndexConfiguration;
 use anyhow::anyhow;
+use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::mpsc;
@@ -30,6 +33,7 @@ impl VsIndexFactory for CuvsIndexFactory {
         index: VsIndexConfiguration,
         _table: Arc<RwLock<Table>>,
     ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
+        CagraParams::try_from(&index)?;
         new(index.key)
     }
 
