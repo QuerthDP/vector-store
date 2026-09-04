@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use crate::Dimensions;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::vs_index::VsIndexConfiguration;
@@ -13,6 +14,7 @@ use cuvs::neighbors::cagra::IndexParams;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CagraParams {
+    pub(super) dimensions: Dimensions,
     pub(super) metric: DistanceType,
     pub(super) graph_degree: usize,
     pub(super) intermediate_graph_degree: usize,
@@ -45,6 +47,7 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
         }
 
         Ok(Self {
+            dimensions: config.dimensions,
             metric,
             graph_degree,
             intermediate_graph_degree,
@@ -76,7 +79,6 @@ fn distance_type(space_type: SpaceType) -> anyhow::Result<DistanceType> {
 mod tests {
     use super::*;
     use crate::Connectivity;
-    use crate::Dimensions;
     use crate::ExpansionAdd;
     use crate::ExpansionSearch;
     use crate::IndexKey;
@@ -98,6 +100,10 @@ mod tests {
     fn defaults_map_to_valid_cagra_params() {
         let params = CagraParams::try_from(&configuration()).unwrap();
 
+        assert_eq!(
+            params.dimensions,
+            Dimensions::from(NonZeroUsize::new(3).unwrap())
+        );
         // The service defaults to cosine.
         assert_eq!(params.metric, DistanceType::CosineExpanded);
         assert_eq!(params.graph_degree, *Connectivity::default().as_ref());
