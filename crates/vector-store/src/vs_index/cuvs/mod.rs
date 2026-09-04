@@ -192,10 +192,17 @@ fn handle(
         })) => {
             index.add(primary_id, &embedding, in_progress);
         }
-        Request::Message(Message::Modify(
-            VsIndexModify::RemoveVector { .. } | VsIndexModify::RemovePartition { .. },
-        )) => {
-            warn!("removing vectors is not implemented yet");
+        Request::Message(Message::Modify(VsIndexModify::RemoveVector {
+            primary_id,
+            in_progress,
+            ..
+        })) => {
+            index.remove(primary_id, in_progress);
+        }
+        Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
+            // Only reached once a partition is already empty, so for the
+            // global-only indexes this backend builds there is nothing to drop.
+            warn!("removing a partition is not implemented yet");
         }
         Request::Message(Message::Search(VsIndexSearch::Count { index_key, tx })) => {
             let result = match table.read().unwrap().index_id(&index_key) {
@@ -322,6 +329,48 @@ mod tests {
         while rx.recv().await.is_some() {}
     }
 
+    /// An update reaches a backend as a removal of the superseded id followed by
+    /// an add under a fresh one, since the engine bumps the row's epoch.
+    async fn update_row(harness: &Harness, superseded: usize, fresh: usize) {
+        let (tx, mut rx) = mpsc::channel(1);
+        harness
+            .modify
+            .remove_vector(
+                harness.partition_id,
+                PrimaryId::from(superseded as u64),
+                AsyncInProgress::Fullscan(tx.clone()),
+            )
+            .await
+            .unwrap();
+        harness
+            .modify
+            .add_vector(
+                harness.partition_id,
+                PrimaryId::from(fresh as u64),
+                embedding(fresh),
+                AsyncInProgress::Fullscan(tx.clone()),
+            )
+            .await
+            .unwrap();
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
+    async fn remove_row(harness: &Harness, row: usize) {
+        let (tx, mut rx) = mpsc::channel(1);
+        harness
+            .modify
+            .remove_vector(
+                harness.partition_id,
+                PrimaryId::from(row as u64),
+                AsyncInProgress::Fullscan(tx.clone()),
+            )
+            .await
+            .unwrap();
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
     #[rstest]
     #[timeout(Duration::from_secs(60))]
     #[tokio::test]
@@ -351,6 +400,37 @@ mod tests {
         assert_eq!(
             harness.search.count(index_key()).await.unwrap(),
             TEST_ROWS + 8
+        );
+    }
+
+    /// Dropping removals used to leak a row per update, so a table whose rows
+    /// were each written twice reported double the vectors it held.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn updating_every_row_leaves_the_count_alone() {
+        let harness = harness();
+        add_rows(&harness, 0..TEST_ROWS).await;
+
+        for row in 0..TEST_ROWS {
+            update_row(&harness, row, row + TEST_ROWS).await;
+        }
+
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), TEST_ROWS);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn removing_a_row_lowers_the_count() {
+        let harness = harness();
+        add_rows(&harness, 0..TEST_ROWS).await;
+
+        remove_row(&harness, 0).await;
+
+        assert_eq!(
+            harness.search.count(index_key()).await.unwrap(),
+            TEST_ROWS - 1
         );
     }
 

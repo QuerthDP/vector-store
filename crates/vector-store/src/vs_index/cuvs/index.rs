@@ -60,6 +60,25 @@ impl Rows {
         self.ids.push(primary_id);
         self.values.extend_from_slice(values);
     }
+
+    /// Swap-removes, so row order is not preserved. Nothing depends on it: a
+    /// build reads the whole set and search maps back through `ids`.
+    fn remove(&mut self, primary_id: PrimaryId) -> bool {
+        let Some(row) = self.positions.remove(&primary_id) else {
+            return false;
+        };
+        let last = self.ids.len() - 1;
+        if row != last {
+            let (start, last_start) = (row * self.dimensions, last * self.dimensions);
+            self.values
+                .copy_within(last_start..last_start + self.dimensions, start);
+            self.ids[row] = self.ids[last];
+            self.positions.insert(self.ids[row], row);
+        }
+        self.ids.pop();
+        self.values.truncate(last * self.dimensions);
+        true
+    }
 }
 
 /// A contiguous row-major matrix in host memory. The `cuvs` crate ships no
@@ -191,6 +210,14 @@ impl CuvsIndex {
         self.pending.push(in_progress);
     }
 
+    /// An update arrives as a removal of the old epoch's id followed by an add
+    /// of the new one, so dropping removals would leak a row per update.
+    pub(super) fn remove(&mut self, primary_id: PrimaryId, in_progress: AsyncInProgress) {
+        if self.rows.remove(primary_id) {
+            self.pending.push(in_progress);
+        }
+    }
+
     pub(super) fn pending(&self) -> usize {
         self.pending.len()
     }
@@ -203,6 +230,14 @@ impl CuvsIndex {
     /// Rebuilds from the staged rows, releasing their guards. A failure keeps
     /// the previous graph and the guards, leaving the next trigger to retry.
     pub(super) fn build(&mut self) -> anyhow::Result<()> {
+        if self.rows.len() == 0 {
+            // CAGRA rejects an empty dataset, and a retry loop would hold the
+            // guards forever. Dropping the graph is what an empty set means.
+            self.built = None;
+            self.pending.clear();
+            return Ok(());
+        }
+
         let built = BuiltIndex::build(&self.resources, &self.index_params, &self.rows)?;
         debug!(
             rows = built.rows,
@@ -262,6 +297,46 @@ mod tests {
         assert_eq!(rows.values, vec![9.0, 9.0, 3.0, 4.0]);
     }
 
+    #[test]
+    fn remove_swaps_the_last_row_into_the_hole() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 2.0]));
+        rows.upsert(2.into(), &vector(&[3.0, 4.0]));
+        rows.upsert(3.into(), &vector(&[5.0, 6.0]));
+
+        assert!(rows.remove(1.into()));
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.values, vec![5.0, 6.0, 3.0, 4.0]);
+        assert_eq!(rows.ids, vec![3.into(), 2.into()]);
+
+        // The moved row has to stay findable, or a later write appends beside it.
+        rows.upsert(3.into(), &vector(&[7.0, 7.0]));
+
+        assert_eq!(rows.len(), 2, "the swapped row lost its position");
+        assert_eq!(rows.values, vec![7.0, 7.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn remove_empties_the_row_set() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 2.0]));
+
+        assert!(rows.remove(1.into()));
+
+        assert_eq!(rows.len(), 0);
+        assert!(rows.values.is_empty());
+    }
+
+    #[test]
+    fn remove_reports_an_id_it_never_held() {
+        let mut rows = Rows::new(dimensions(2));
+        rows.upsert(1.into(), &vector(&[1.0, 2.0]));
+
+        assert!(!rows.remove(9.into()));
+        assert_eq!(rows.len(), 1);
+    }
+
     /// CAGRA needs a non-trivial dataset before it will build a graph.
     fn many_vectors(count: usize, dims: usize) -> Vec<Vector> {
         (0..count)
@@ -289,6 +364,27 @@ mod tests {
 
         assert_eq!(index.count(), 256);
         assert_eq!(index.pending(), 0);
+    }
+
+    #[test]
+    fn emptying_the_row_set_drops_the_graph() {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(256, 4).iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+        }
+        index.build().unwrap();
+
+        for row in 0..256u64 {
+            index.remove(row.into(), AsyncInProgress::None);
+        }
+        index.build().unwrap();
+
+        assert_eq!(index.count(), 0, "the emptied graph must not be reported");
+        assert_eq!(
+            index.pending(),
+            0,
+            "the guards must not be held for a retry"
+        );
     }
 
     #[test]
