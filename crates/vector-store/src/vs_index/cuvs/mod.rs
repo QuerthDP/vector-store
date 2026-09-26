@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+mod index;
 mod params;
 
 use crate::Config;
@@ -18,6 +19,7 @@ use crate::vs_index::VsIndexSearch;
 use crate::vs_index::factory::VsIndexConfiguration;
 use anyhow::anyhow;
 use anyhow::bail;
+use index::CuvsIndex;
 use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -92,9 +94,11 @@ fn new(
                 return;
             }
 
+            let mut index = CuvsIndex::new(params.dimensions);
+
             debug!("cuVS thread starting for {thread_key}");
             while let Some(msg) = rx_gpu.blocking_recv() {
-                handle(msg);
+                handle(&mut index, msg);
             }
             debug!("cuVS thread finished for {thread_key}");
         })
@@ -131,12 +135,17 @@ fn reject(msg: Message, err: anyhow::Error) {
     }
 }
 
-fn handle(msg: Message) {
+fn handle(index: &mut CuvsIndex, msg: Message) {
     match msg {
+        Message::Modify(VsIndexModify::AddVector {
+            primary_id,
+            embedding,
+            ..
+        }) => {
+            index.add(primary_id, &embedding);
+        }
         Message::Modify(
-            VsIndexModify::AddVector { .. }
-            | VsIndexModify::RemoveVector { .. }
-            | VsIndexModify::RemovePartition { .. },
+            VsIndexModify::RemoveVector { .. } | VsIndexModify::RemovePartition { .. },
         ) => {
             warn!("not implemented yet");
         }
