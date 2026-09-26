@@ -146,9 +146,10 @@ fn handle(index: &mut CuvsIndex, msg: Message) {
         }) => {
             index.add(primary_id, &embedding);
         }
-        Message::Modify(
-            VsIndexModify::RemoveVector { .. } | VsIndexModify::RemovePartition { .. },
-        ) => {
+        Message::Modify(VsIndexModify::RemoveVector { primary_id, .. }) => {
+            index.remove(primary_id);
+        }
+        Message::Modify(VsIndexModify::RemovePartition { .. }) => {
             warn!("not implemented yet");
         }
         Message::Search(_) => {
