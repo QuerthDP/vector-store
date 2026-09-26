@@ -23,6 +23,8 @@ use index::CuvsIndex;
 use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -89,8 +91,10 @@ fn new(
     let (tx_modify, mut rx_modify) = mpsc::channel(channel_size);
     let (tx_search, mut rx_search) = mpsc::channel(channel_size);
     let (tx_gpu, mut rx_gpu) = mpsc::channel(channel_size);
+    let flush_queued = Arc::new(AtomicBool::new(false));
 
     let thread_key = index_key.clone();
+    let thread_flush = Arc::clone(&flush_queued);
     thread::Builder::new()
         .name(format!("cuvs-{index_key}"))
         .spawn(move || {
@@ -111,7 +115,13 @@ fn new(
 
             debug!("cuVS thread starting for {thread_key}");
             while let Some(request) = rx_gpu.blocking_recv() {
-                handle(&mut index, table.as_ref(), &thread_key, request);
+                handle(
+                    &mut index,
+                    &thread_flush,
+                    table.as_ref(),
+                    &thread_key,
+                    request,
+                );
             }
             debug!("cuVS thread finished for {thread_key}");
         })
@@ -139,7 +149,9 @@ fn new(
                         }
                     }
                     _ = interval.tick() => {
-                        if tx_gpu.send(Request::Flush).await.is_err() {
+                        if !flush_queued.swap(true, Ordering::Relaxed)
+                            && tx_gpu.send(Request::Flush).await.is_err()
+                        {
                             break;
                         }
                     }
@@ -168,6 +180,7 @@ fn reject(msg: Message, err: anyhow::Error) {
 
 fn handle(
     index: &mut CuvsIndex,
+    flush_queued: &AtomicBool,
     table: &RwLock<impl TableSearch>,
     index_key: &IndexKey,
     request: Request,
@@ -175,6 +188,7 @@ fn handle(
     match request {
         Request::Flush => {
             build_if_pending(index, index_key);
+            flush_queued.store(false, Ordering::Relaxed);
         }
         Request::Message(Message::Modify(VsIndexModify::AddVector {
             primary_id,
