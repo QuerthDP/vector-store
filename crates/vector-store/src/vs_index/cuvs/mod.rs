@@ -49,8 +49,13 @@ impl VsIndexFactory for CuvsIndexFactory {
 }
 
 pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<CuvsIndexFactory> {
-    cuvs::Resources::new()
-        .map_err(|err| anyhow!("failed to initialize cuVS/CUDA resources: {err}"))?;
+    cuvs::Resources::new().map_err(|err| {
+        anyhow!(
+            "failed to initialize cuVS/CUDA resources: {err}. \
+             Check that the machine has a GPU with a working NVIDIA driver, \
+             or unset VECTOR_STORE_USE_GPU to fall back to the default USearch backend."
+        )
+    })?;
     Ok(CuvsIndexFactory)
 }
 
