@@ -24,6 +24,7 @@ use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -31,6 +32,8 @@ use tracing::debug;
 use tracing::debug_span;
 use tracing::error;
 use tracing::warn;
+
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct CuvsIndexFactory;
 
@@ -49,7 +52,7 @@ impl VsIndexFactory for CuvsIndexFactory {
             bail!("cuVS does not support local indexes yet: {}", index.key);
         }
         let params = CagraParams::try_from(&index)?;
-        new(index.key, params)
+        new(index.key, params, table, FLUSH_INTERVAL)
     }
 
     fn index_engine_version(&self) -> String {
@@ -71,9 +74,16 @@ pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<Cuvs
     Ok(CuvsIndexFactory)
 }
 
+enum Request {
+    Message(Message),
+    Flush,
+}
+
 fn new(
     index_key: IndexKey,
     params: CagraParams,
+    table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
+    flush_interval: Duration,
 ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
     let channel_size = perf::channel_size().into();
     let (tx_modify, mut rx_modify) = mpsc::channel(channel_size);
@@ -84,21 +94,24 @@ fn new(
     thread::Builder::new()
         .name(format!("cuvs-{index_key}"))
         .spawn(move || {
-            if let Err(err) = params.to_index_params() {
-                error!("unable to create cuVS index for {thread_key}: {err}");
-                // Draining keeps senders from blocking, so every search gets
-                // an error rather than hanging.
-                while let Some(msg) = rx_gpu.blocking_recv() {
-                    reject(msg, anyhow!("cuVS index is unavailable: {err}"));
+            let mut index = match CuvsIndex::new(params) {
+                Ok(index) => index,
+                Err(err) => {
+                    error!("unable to create cuVS index for {thread_key}: {err}");
+                    // Draining keeps senders from blocking, so every search gets
+                    // an error rather than hanging.
+                    while let Some(request) = rx_gpu.blocking_recv() {
+                        if let Request::Message(msg) = request {
+                            reject(msg, anyhow!("cuVS index is unavailable: {err}"));
+                        }
+                    }
+                    return;
                 }
-                return;
-            }
-
-            let mut index = CuvsIndex::new(params.dimensions);
+            };
 
             debug!("cuVS thread starting for {thread_key}");
-            while let Some(msg) = rx_gpu.blocking_recv() {
-                handle(&mut index, msg);
+            while let Some(request) = rx_gpu.blocking_recv() {
+                handle(&mut index, table.as_ref(), &thread_key, request);
             }
             debug!("cuVS thread finished for {thread_key}");
         })
@@ -109,9 +122,27 @@ fn new(
         async move {
             debug!("starting");
 
-            while let Some(msg) = vs_index::recv(&mut rx_search, &mut rx_modify).await {
-                if tx_gpu.send(msg).await.is_err() {
-                    break;
+            let mut interval = tokio::time::interval(flush_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    // Prefer real work over firing the rebuild timer.
+                    biased;
+
+                    msg = vs_index::recv(&mut rx_search, &mut rx_modify) => {
+                        let Some(msg) = msg else {
+                            break;
+                        };
+                        if tx_gpu.send(Request::Message(msg)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if tx_gpu.send(Request::Flush).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -135,42 +166,216 @@ fn reject(msg: Message, err: anyhow::Error) {
     }
 }
 
-fn handle(index: &mut CuvsIndex, msg: Message) {
-    match msg {
-        Message::Modify(VsIndexModify::AddVector {
+fn handle(
+    index: &mut CuvsIndex,
+    table: &RwLock<impl TableSearch>,
+    index_key: &IndexKey,
+    request: Request,
+) {
+    match request {
+        Request::Flush => {
+            build_if_pending(index, index_key);
+        }
+        Request::Message(Message::Modify(VsIndexModify::AddVector {
             primary_id,
             embedding,
+            in_progress,
             ..
-        }) => {
-            index.add(primary_id, &embedding);
+        })) => {
+            index.add(primary_id, &embedding, in_progress);
         }
-        Message::Modify(VsIndexModify::RemoveVector { primary_id, .. }) => {
-            index.remove(primary_id);
+        Request::Message(Message::Modify(VsIndexModify::RemoveVector {
+            primary_id,
+            in_progress,
+            ..
+        })) => {
+            index.remove(primary_id, in_progress);
         }
-        Message::Modify(VsIndexModify::RemovePartition { .. }) => {
+        Request::Message(Message::Modify(VsIndexModify::RemovePartition { .. })) => {
             warn!("not implemented yet");
         }
-        Message::Search(_) => {
-            reject(msg, anyhow!("GPU index is not implemented yet"));
+        Request::Message(Message::Search(VsIndexSearch::Count { index_key, tx })) => {
+            let result = match table.read().unwrap().index_id(&index_key) {
+                Some(_) => Ok(index.count()),
+                None => Err(anyhow!("index id not found for index key {index_key}")),
+            };
+            _ = tx.send(result);
         }
+        Request::Message(Message::Search(
+            VsIndexSearch::Ann { tx, .. } | VsIndexSearch::FilteredAnn { tx, .. },
+        )) => {
+            _ = tx.send(Err(anyhow!("cuVS index search is not implemented yet")));
+        }
+    }
+}
+
+fn build_if_pending(index: &mut CuvsIndex, index_key: &IndexKey) {
+    if index.pending() == 0 {
+        return;
+    }
+    if let Err(err) = index.build() {
+        error!("Unable to build cuVS index {index_key}: {err}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AsyncInProgress;
     use crate::Connectivity;
     use crate::Dimensions;
     use crate::ExpansionAdd;
     use crate::ExpansionSearch;
-    use crate::IndexKey;
     use crate::NonemptyArc;
     use crate::Quantization;
     use crate::SpaceType;
+    use crate::Vector;
+    use crate::table::IndexId;
+    use crate::table::IndexIdGenerator;
+    use crate::table::MockTableSearch;
+    use crate::table::PartitionId;
+    use crate::table::PrimaryId;
+    use crate::vs_index::VsIndexModifyExt;
     use crate::vs_index::VsIndexSearchExt;
+    use rstest::rstest;
     use scylla::cluster::metadata::NativeType;
     use std::collections::HashMap;
     use std::num::NonZeroUsize;
+    use std::ops::Range;
+
+    const TEST_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+    const TEST_ROWS: usize = 256;
+    const TEST_DIMENSIONS: usize = 4;
+
+    fn index_key() -> IndexKey {
+        IndexKey::new(&"vector".into(), &"store".into())
+    }
+
+    fn configuration() -> VsIndexConfiguration {
+        VsIndexConfiguration {
+            key: index_key(),
+            dimensions: Dimensions::from(NonZeroUsize::new(TEST_DIMENSIONS).unwrap()),
+            connectivity: Connectivity::default(),
+            expansion_add: ExpansionAdd::default(),
+            expansion_search: ExpansionSearch::default(),
+            space_type: SpaceType::default(),
+            quantization: Quantization::default(),
+        }
+    }
+
+    fn table_with(index_id: IndexId) -> Arc<RwLock<MockTableSearch>> {
+        let mut mock = MockTableSearch::new();
+        mock.expect_index_id().returning(move |_| Some(index_id));
+        Arc::new(RwLock::new(mock))
+    }
+
+    struct Harness {
+        modify: mpsc::Sender<VsIndexModify>,
+        search: mpsc::Sender<VsIndexSearch>,
+        partition_id: PartitionId,
+    }
+
+    fn harness() -> Harness {
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        let (modify, search) = new(
+            index_key(),
+            CagraParams::try_from(&configuration()).unwrap(),
+            table_with(index_id),
+            TEST_FLUSH_INTERVAL,
+        )
+        .unwrap();
+        Harness {
+            modify,
+            search,
+            partition_id,
+        }
+    }
+
+    fn embedding(row: usize) -> Vector {
+        Vector::from(
+            (0..TEST_DIMENSIONS)
+                .map(|col| (row * TEST_DIMENSIONS + col) as f32 * 0.001)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Adds `rows` vectors and waits for a successful build that includes them.
+    async fn add_rows(harness: &Harness, rows: Range<usize>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        for row in rows {
+            harness
+                .modify
+                .add_vector(
+                    harness.partition_id,
+                    PrimaryId::from(row as u64),
+                    embedding(row),
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
+    /// Removes `rows` and waits for a successful build without them.
+    async fn remove_rows(harness: &Harness, rows: Range<usize>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        for row in rows {
+            harness
+                .modify
+                .remove_vector(
+                    harness.partition_id,
+                    PrimaryId::from(row as u64),
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn count_reflects_the_built_index() {
+        let harness = harness();
+        add_rows(&harness, 0..TEST_ROWS).await;
+
+        assert_eq!(harness.search.count(index_key()).await.unwrap(), TEST_ROWS);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn a_later_write_reaches_a_later_build() {
+        let harness = harness();
+        add_rows(&harness, 0..TEST_ROWS).await;
+        add_rows(&harness, TEST_ROWS..TEST_ROWS + 8).await;
+
+        assert_eq!(
+            harness.search.count(index_key()).await.unwrap(),
+            TEST_ROWS + 8
+        );
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn removing_a_row_lowers_the_count() {
+        let harness = harness();
+        add_rows(&harness, 0..TEST_ROWS).await;
+
+        remove_rows(&harness, 0..1).await;
+
+        assert_eq!(
+            harness.search.count(index_key()).await.unwrap(),
+            TEST_ROWS - 1
+        );
+    }
 
     #[test]
     fn index_engine_version_reports_cuvs_library_version() {
@@ -183,48 +388,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_index_returns_actor_that_reports_not_yet_implemented() {
-        let factory = CuvsIndexFactory;
-
-        let index_key = IndexKey::new(&"vector".into(), &"store".into());
-        let table = Arc::new(RwLock::new(
-            Table::new(
-                index_key.clone(),
-                NonemptyArc::new(["pk"]).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
-                None,
-                NonZeroUsize::new(1).unwrap(),
-                Arc::new([]),
-                Arc::new(HashMap::from([("pk".into(), NativeType::Int)])),
-            )
-            .unwrap(),
-        ));
-
-        let (_modify, search) = factory
-            .create_index(
-                VsIndexConfiguration {
-                    key: index_key.clone(),
-                    dimensions: Dimensions::from(NonZeroUsize::new(3).unwrap()),
-                    connectivity: Connectivity::default(),
-                    expansion_add: ExpansionAdd::default(),
-                    expansion_search: ExpansionSearch::default(),
-                    space_type: SpaceType::default(),
-                    quantization: Quantization::default(),
-                },
-                table,
-            )
-            .expect("index creation itself should succeed");
-
-        let err = search.count(index_key).await.unwrap_err().to_string();
-        assert!(err.contains("not implemented yet"));
-    }
-
-    #[tokio::test]
     async fn create_index_rejects_a_local_index() {
-        let index_key = IndexKey::new(&"vector".into(), &"store".into());
         let table = Arc::new(RwLock::new(
             Table::new(
-                index_key.clone(),
+                index_key(),
                 NonemptyArc::new(["pk"]).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 Some(NonemptyArc::new(["pk"]).unwrap()),
@@ -236,18 +403,7 @@ mod tests {
         ));
 
         let err = CuvsIndexFactory
-            .create_index(
-                VsIndexConfiguration {
-                    key: index_key,
-                    dimensions: Dimensions::from(NonZeroUsize::new(3).unwrap()),
-                    connectivity: Connectivity::default(),
-                    expansion_add: ExpansionAdd::default(),
-                    expansion_search: ExpansionSearch::default(),
-                    space_type: SpaceType::default(),
-                    quantization: Quantization::default(),
-                },
-                table,
-            )
+            .create_index(configuration(), table)
             .unwrap_err();
         assert!(err.to_string().contains("local indexes"));
     }
