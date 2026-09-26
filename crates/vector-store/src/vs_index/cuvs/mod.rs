@@ -10,12 +10,14 @@ use crate::IndexKey;
 use crate::VsIndexFactory;
 use crate::perf;
 use crate::table::Table;
+use crate::table::TableSearch;
 use crate::vs_index;
 use crate::vs_index::Message;
 use crate::vs_index::VsIndexModify;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::factory::VsIndexConfiguration;
 use anyhow::anyhow;
+use anyhow::bail;
 use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -34,8 +36,16 @@ impl VsIndexFactory for CuvsIndexFactory {
     fn create_index(
         &self,
         index: VsIndexConfiguration,
-        _table: Arc<RwLock<Table>>,
+        table: Arc<RwLock<Table>>,
     ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
+        let is_global = table
+            .read()
+            .unwrap()
+            .index_id(&index.key)
+            .is_some_and(|id| id.is_global());
+        if !is_global {
+            bail!("cuVS does not support local indexes yet: {}", index.key);
+        }
         let params = CagraParams::try_from(&index)?;
         new(index.key, params)
     }
@@ -197,5 +207,38 @@ mod tests {
 
         let err = search.count(index_key).await.unwrap_err().to_string();
         assert!(err.contains("not implemented yet"));
+    }
+
+    #[tokio::test]
+    async fn create_index_rejects_a_local_index() {
+        let index_key = IndexKey::new(&"vector".into(), &"store".into());
+        let table = Arc::new(RwLock::new(
+            Table::new(
+                index_key.clone(),
+                NonemptyArc::new(["pk"]).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                Some(NonemptyArc::new(["pk"]).unwrap()),
+                NonZeroUsize::new(1).unwrap(),
+                Arc::new([]),
+                Arc::new(HashMap::from([("pk".into(), NativeType::Int)])),
+            )
+            .unwrap(),
+        ));
+
+        let err = CuvsIndexFactory
+            .create_index(
+                VsIndexConfiguration {
+                    key: index_key,
+                    dimensions: Dimensions::from(NonZeroUsize::new(3).unwrap()),
+                    connectivity: Connectivity::default(),
+                    expansion_add: ExpansionAdd::default(),
+                    expansion_search: ExpansionSearch::default(),
+                    space_type: SpaceType::default(),
+                    quantization: Quantization::default(),
+                },
+                table,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("local indexes"));
     }
 }
