@@ -54,6 +54,16 @@ pub(crate) fn usearch_test_config() -> Config {
     }
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn cuvs_test_config() -> Config {
+    Config {
+        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        use_gpu: true,
+        cuvs_build_interval: Some(Duration::from_millis(500)),
+        ..Default::default()
+    }
+}
+
 fn diskann_test_config() -> Config {
     Config {
         vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1948,4 +1958,92 @@ async fn empty_index_returns_empty_ann_results(#[case] config: Config) {
     assert!(primary_keys.get(&"pk".into()).unwrap().is_empty());
     assert!(distances.is_empty());
     assert!(similarity_scores.is_empty());
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[tokio::test]
+async fn cdc_insert_is_indexed(#[case] config: Config) {
+    crate::enable_tracing();
+
+    setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., -2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(3)].into(),
+                Some(vec![3., 3., 3.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Int(4)].into(),
+            Some(vec![4., 4., 4.].into()),
+            [].into(),
+            Timestamp::from_millis(20),
+        )])),
+        Some(4),
+    )
+    .await;
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[tokio::test]
+async fn cdc_delete_is_removed_from_the_index(#[case] config: Config) {
+    crate::enable_tracing();
+
+    setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., -2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(3)].into(),
+                Some(vec![3., 3., 3.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
+        Some(db_basic::scan_fn_deletes([(
+            [CqlValue::Int(1)].into(),
+            Timestamp::from_millis(20),
+        )])),
+        Some(2),
+    )
+    .await;
 }

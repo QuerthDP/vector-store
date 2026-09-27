@@ -107,6 +107,21 @@ where
     )
 }
 
+pub(crate) fn scan_fn_deletes<I>(items: I) -> ScanFn
+where
+    I: IntoIterator<Item = (PrimaryKey, Timestamp)>,
+    I::IntoIter: Send + Sync + 'static,
+{
+    make_scan_fn(
+        items
+            .into_iter()
+            .map(|(primary_key, timestamp)| DbIndexedRow {
+                primary_key,
+                operation: DbIndexedOperation::Delete(timestamp),
+            }),
+    )
+}
+
 pub(crate) fn scan_fn_documents<I>(items: I) -> ScanFn
 where
     I: IntoIterator<Item = (PrimaryKey, Option<String>, Timestamp)>,
