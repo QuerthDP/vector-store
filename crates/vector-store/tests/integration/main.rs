@@ -4,6 +4,8 @@
  */
 
 mod common;
+#[cfg(feature = "gpu")]
+mod cuvs;
 mod db_basic;
 mod fts;
 mod https;
