@@ -232,13 +232,15 @@ impl CuvsIndex {
             return Ok(());
         }
         let _released = std::mem::take(&mut self.pending);
-        if self.rows.ids.is_empty() {
+        let Some(params) = self.params.fit(self.rows.ids.len()) else {
+            // CAGRA rejects fewer than two rows. Dropping the graph is what such
+            // a set means.
             self.built = None;
             self.stale = false;
             return Ok(());
-        }
+        };
 
-        let index_params = self.params.to_index_params()?;
+        let index_params = params.to_index_params()?;
         self.built = Some(BuiltIndex::build(
             &self.resources,
             &index_params,
@@ -378,6 +380,38 @@ mod tests {
         index.build().unwrap();
 
         assert_eq!(index.count(), 0, "the emptied graph must not be reported");
+        assert_eq!(index.pending.len(), 0, "the guards must not be held");
+    }
+
+    #[rstest]
+    fn a_set_too_small_for_the_degrees_still_gets_a_graph(
+        #[values(2, 3, 17, 128, 129)] rows: usize,
+    ) {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(rows, 4).iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+        }
+
+        index.build().unwrap();
+
+        assert_eq!(index.count(), rows);
+        assert_eq!(index.pending.len(), 0);
+    }
+
+    #[test]
+    fn a_single_row_gets_no_graph() {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(256, 4).iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+        }
+        index.build().unwrap();
+
+        for row in 1..256u64 {
+            index.remove(row.into(), AsyncInProgress::None);
+        }
+        index.build().unwrap();
+
+        assert_eq!(index.count(), 0, "a single row has no graph to count");
         assert_eq!(index.pending.len(), 0, "the guards must not be held");
     }
 
