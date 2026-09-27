@@ -56,6 +56,20 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
 }
 
 impl CagraParams {
+    /// CAGRA needs more rows than the intermediate degree, so shrink both
+    /// degrees for a smaller set. A single row cannot form a graph.
+    pub(super) fn fit(self, rows: usize) -> Option<Self> {
+        let intermediate_graph_degree = self.intermediate_graph_degree.min(rows.checked_sub(1)?);
+        if intermediate_graph_degree == 0 {
+            return None;
+        }
+        Some(Self {
+            graph_degree: self.graph_degree.min(intermediate_graph_degree),
+            intermediate_graph_degree,
+            ..self
+        })
+    }
+
     pub(super) fn to_index_params(self) -> anyhow::Result<IndexParams> {
         IndexParams::builder()
             .metric(self.metric)
@@ -164,6 +178,21 @@ mod tests {
         };
         let err = CagraParams::try_from(&config).unwrap_err().to_string();
         assert!(err.contains("maximum_node_connections"), "got: {err}");
+    }
+
+    #[test]
+    fn fit_shrinks_the_degrees_below_the_row_count() {
+        let params = CagraParams::try_from(&configuration()).unwrap();
+        // 128 by default, so 129 rows is the smallest set built as configured.
+        let degree = params.intermediate_graph_degree;
+
+        assert_eq!(params.fit(0), None);
+        assert_eq!(params.fit(1), None);
+        assert_eq!(params.fit(degree + 1), Some(params));
+
+        let fitted = params.fit(8).unwrap();
+        assert_eq!(fitted.intermediate_graph_degree, 7);
+        assert_eq!(fitted.graph_degree, 7);
     }
 
     #[test]
