@@ -60,6 +60,8 @@ pub(crate) fn cuvs_test_config() -> Config {
         vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         use_gpu: true,
         cuvs_build_interval: Some(Duration::from_millis(500)),
+        // Faster than a build, so Serving shows before the next one.
+        engine_status_update_interval: Some(Duration::from_millis(100)),
         ..Default::default()
     }
 }
