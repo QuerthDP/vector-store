@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use crate::Dimensions;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::vs_index::VsIndexConfiguration;
@@ -13,6 +14,7 @@ use cuvs::neighbors::cagra::IndexParams;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CagraParams {
+    pub(super) dimensions: Dimensions,
     pub(super) metric: DistanceType,
     pub(super) graph_degree: usize,
     pub(super) intermediate_graph_degree: usize,
@@ -45,6 +47,7 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
         }
 
         Ok(Self {
+            dimensions: config.dimensions,
             metric,
             graph_degree,
             intermediate_graph_degree,
@@ -53,6 +56,20 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
 }
 
 impl CagraParams {
+    /// CAGRA needs more rows than the intermediate degree, so shrink both
+    /// degrees for a smaller set. A single row cannot form a graph.
+    pub(super) fn fit(self, rows: usize) -> Option<Self> {
+        let intermediate_graph_degree = self.intermediate_graph_degree.min(rows.checked_sub(1)?);
+        if intermediate_graph_degree == 0 {
+            return None;
+        }
+        Some(Self {
+            graph_degree: self.graph_degree.min(intermediate_graph_degree),
+            intermediate_graph_degree,
+            ..self
+        })
+    }
+
     pub(super) fn to_index_params(self) -> anyhow::Result<IndexParams> {
         IndexParams::builder()
             .metric(self.metric)
@@ -76,7 +93,6 @@ fn distance_type(space_type: SpaceType) -> anyhow::Result<DistanceType> {
 mod tests {
     use super::*;
     use crate::Connectivity;
-    use crate::Dimensions;
     use crate::ExpansionAdd;
     use crate::ExpansionSearch;
     use crate::IndexKey;
@@ -98,6 +114,10 @@ mod tests {
     fn defaults_map_to_valid_cagra_params() {
         let params = CagraParams::try_from(&configuration()).unwrap();
 
+        assert_eq!(
+            params.dimensions,
+            Dimensions::from(NonZeroUsize::new(3).unwrap())
+        );
         // The service defaults to cosine.
         assert_eq!(params.metric, DistanceType::CosineExpanded);
         assert_eq!(params.graph_degree, *Connectivity::default().as_ref());
@@ -158,6 +178,21 @@ mod tests {
         };
         let err = CagraParams::try_from(&config).unwrap_err().to_string();
         assert!(err.contains("maximum_node_connections"), "got: {err}");
+    }
+
+    #[test]
+    fn fit_shrinks_the_degrees_below_the_row_count() {
+        let params = CagraParams::try_from(&configuration()).unwrap();
+        // 128 by default, so 129 rows is the smallest set built as configured.
+        let degree = params.intermediate_graph_degree;
+
+        assert_eq!(params.fit(0), None);
+        assert_eq!(params.fit(1), None);
+        assert_eq!(params.fit(degree + 1), Some(params));
+
+        let fitted = params.fit(8).unwrap();
+        assert_eq!(fitted.intermediate_graph_degree, 7);
+        assert_eq!(fitted.graph_degree, 7);
     }
 
     #[test]
