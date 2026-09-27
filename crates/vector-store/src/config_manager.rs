@@ -460,6 +460,12 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         .parse()
         .map_err(|_| anyhow!("Unable to parse VECTOR_STORE_USE_GPU env (true/false)"))?;
 
+    config.cuvs_build_interval = env("VECTOR_STORE_CUVS_BUILD_INTERVAL")
+        .ok()
+        .map(|v| v.parse::<humantime::Duration>())
+        .transpose()?
+        .map(|v| v.into());
+
     config.alter_index_simulator = env("VECTOR_STORE_ALTER_INDEX_SIMULATOR")
         .unwrap_or("false".into())
         .trim()
@@ -996,6 +1002,20 @@ mod tests {
                 .to_string()
                 .contains("Unable to parse VECTOR_STORE_USE_GPU")
         );
+    }
+
+    #[tokio::test]
+    async fn load_config_cuvs_build_interval() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.cuvs_build_interval, None);
+
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_CUVS_BUILD_INTERVAL",
+            "100ms".into(),
+        )]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.cuvs_build_interval, Some(Duration::from_millis(100)));
     }
 
     #[test]
