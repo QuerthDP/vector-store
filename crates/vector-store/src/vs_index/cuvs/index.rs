@@ -7,19 +7,13 @@ use crate::AsyncInProgress;
 use crate::Dimensions;
 use crate::Vector;
 use crate::table::PrimaryId;
+use crate::vs_index::cuvs::device::DeviceMatrix;
 use crate::vs_index::cuvs::params::CagraParams;
 use anyhow::anyhow;
 use cuvs::Resources;
-use cuvs::dlpack::AsDlTensor;
-use cuvs::dlpack::DLDevice;
-use cuvs::dlpack::DLDeviceType;
-use cuvs::dlpack::DLPackError;
-use cuvs::dlpack::DLTensorView;
-use cuvs::dlpack::DType;
 use cuvs::neighbors::cagra::Index;
 use cuvs::neighbors::cagra::IndexParams;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -72,54 +66,12 @@ impl Rows {
     }
 }
 
-struct HostMatrix {
-    values: Vec<f32>,
-    shape: [i64; 2],
-}
-
-impl HostMatrix {
-    fn new(values: Vec<f32>, rows: usize, columns: usize) -> Self {
-        Self {
-            values,
-            shape: [rows as i64, columns as i64],
-        }
-    }
-}
-
-impl std::fmt::Debug for HostMatrix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostMatrix")
-            .field("rows", &self.shape[0])
-            .field("columns", &self.shape[1])
-            .finish()
-    }
-}
-
-impl AsDlTensor for HostMatrix {
-    fn as_dl_tensor(&self) -> Result<DLTensorView<'_>, DLPackError> {
-        // SAFETY: `values` is exactly the contiguous row-major matrix `shape`
-        // declares, and outlives the view, whose lifetime is the `&self` borrow.
-        unsafe {
-            DLTensorView::from_raw_parts(
-                self.values.as_ptr().cast_mut() as *mut c_void,
-                DLDevice {
-                    device_type: DLDeviceType::kDLCPU,
-                    device_id: 0,
-                },
-                &self.shape,
-                None,
-                f32::dl_dtype(),
-            )
-        }
-    }
-}
-
-/// A CAGRA index and the matrix it reads, which `Index<'d>` only borrows.
+/// A CAGRA index and the device memory it reads, which `Index<'d>` only borrows.
 #[derive(Debug)]
 struct BuiltIndex {
     // DO NOT REORDER: `_index` borrows `_dataset` and must drop first.
     _index: Index<'static>,
-    _dataset: HostMatrix,
+    _dataset: DeviceMatrix,
     rows: usize,
 }
 
@@ -130,12 +82,17 @@ impl BuiltIndex {
         rows: &Rows,
     ) -> anyhow::Result<Self> {
         let row_count = rows.ids.len();
-        let dataset = HostMatrix::new(rows.values.clone(), row_count, rows.dimensions);
+        let dataset = DeviceMatrix::from_host(resources, &rows.values, row_count, rows.dimensions)?;
 
         let index = Index::build(resources, index_params, &dataset)
             .map_err(|err| anyhow!("failed to build cuVS CAGRA index: {err}"))?;
 
-        // SAFETY: the index keeps a pointer to the rows in `dataset.values`
+        // The build returns before its kernels finish, so wait for them here.
+        resources
+            .sync_stream()
+            .map_err(|err| anyhow!("failed to build cuVS CAGRA index: {err}"))?;
+
+        // SAFETY: the index keeps a pointer to the device rows of `dataset`
         // rather than a copy. Moving `dataset` into the struct below doesn't
         // move those rows, and `_index` is dropped before `_dataset`.
         let index: Index<'static> = unsafe { std::mem::transmute(index) };
