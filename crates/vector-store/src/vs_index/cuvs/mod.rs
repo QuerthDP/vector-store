@@ -38,7 +38,9 @@ use tracing::warn;
 
 const BUILD_INTERVAL: Duration = Duration::from_secs(5);
 
-pub struct CuvsIndexFactory;
+pub struct CuvsIndexFactory {
+    build_interval: Duration,
+}
 
 impl VsIndexFactory for CuvsIndexFactory {
     fn create_index(
@@ -56,7 +58,7 @@ impl VsIndexFactory for CuvsIndexFactory {
             bail!("cuVS does not support local indexes yet: {}", index.key);
         }
         let params = CagraParams::try_from(&index)?;
-        new(index.key, params, table)
+        new(index.key, params, self.build_interval, table)
     }
 
     fn index_engine_version(&self) -> String {
@@ -67,7 +69,7 @@ impl VsIndexFactory for CuvsIndexFactory {
     }
 }
 
-pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<CuvsIndexFactory> {
+pub fn new_cuvs(config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<CuvsIndexFactory> {
     cuvs::Resources::new().map_err(|err| {
         anyhow!(
             "failed to initialize cuVS/CUDA resources: {err}. \
@@ -75,7 +77,11 @@ pub fn new_cuvs(_config_rx: watch::Receiver<Arc<Config>>) -> anyhow::Result<Cuvs
              or unset VECTOR_STORE_USE_GPU to fall back to the default USearch backend."
         )
     })?;
-    Ok(CuvsIndexFactory)
+    let build_interval = config_rx
+        .borrow()
+        .cuvs_build_interval
+        .unwrap_or(BUILD_INTERVAL);
+    Ok(CuvsIndexFactory { build_interval })
 }
 
 enum Request {
@@ -86,6 +92,7 @@ enum Request {
 fn new(
     index_key: IndexKey,
     params: CagraParams,
+    build_interval: Duration,
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
 ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
     let channel_size = perf::channel_size().into();
@@ -133,7 +140,7 @@ fn new(
         async move {
             debug!("starting");
 
-            let mut interval = tokio::time::interval(BUILD_INTERVAL);
+            let mut interval = tokio::time::interval(build_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -243,7 +250,9 @@ mod tests {
 
     #[test]
     fn index_engine_version_reports_cuvs_library_version() {
-        let factory = CuvsIndexFactory;
+        let factory = CuvsIndexFactory {
+            build_interval: BUILD_INTERVAL,
+        };
         let (major, minor, patch) = cuvs::version::version().unwrap();
         assert_eq!(
             factory.index_engine_version(),
@@ -267,7 +276,10 @@ mod tests {
             .unwrap(),
         ));
 
-        let err = CuvsIndexFactory
+        let factory = CuvsIndexFactory {
+            build_interval: BUILD_INTERVAL,
+        };
+        let err = factory
             .create_index(
                 VsIndexConfiguration {
                     key: index_key,
