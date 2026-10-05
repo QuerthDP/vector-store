@@ -214,6 +214,7 @@ mod tests {
     use super::*;
     use crate::Connectivity;
     use crate::ExpansionAdd;
+    use crate::ExpansionSearch;
     use cuvs::distance::DistanceType;
     use rstest::rstest;
     use std::num::NonZeroUsize;
@@ -228,6 +229,7 @@ mod tests {
             metric: DistanceType::L2Expanded,
             graph_degree: *Connectivity::default().as_ref(),
             intermediate_graph_degree: *ExpansionAdd::default().as_ref(),
+            expansion_search: *ExpansionSearch::default().as_ref(),
         }
     }
 
