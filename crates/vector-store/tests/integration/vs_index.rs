@@ -326,6 +326,7 @@ async fn simple_create_search_delete_index(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn failed_db_index_create(#[case] config: Config) {
     crate::enable_tracing();
@@ -454,6 +455,7 @@ async fn failed_db_index_create(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions(
     #[case] config: Config,
@@ -468,14 +470,22 @@ async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimen
             ("pk".to_string().into(), NativeType::Int),
             ("ck".to_string().into(), NativeType::Text),
         ],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -542,6 +552,7 @@ async fn ann_returns_bad_request_when_filtering_required_but_not_allowed() {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Config) {
     crate::enable_tracing();
@@ -595,6 +606,7 @@ async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Conf
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
     crate::enable_tracing();
@@ -605,14 +617,22 @@ async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
         ["pk".into()],
         1,
         [("pk".to_string().into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1)].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -681,6 +701,7 @@ async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
     crate::enable_tracing();
@@ -690,14 +711,22 @@ async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
         vec!["pk".into()],
         1,
         [("pk".into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -1702,6 +1731,7 @@ async fn http_server_is_responsive_when_index_add_hangs() {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 async fn null_vector_is_not_indexed(#[case] config: Config) {
@@ -1726,6 +1756,12 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
                 [].into(),
                 Timestamp::from_millis(20),
             ),
+            (
+                [CqlValue::Int(3)].into(),
+                Some(vec![3., 3., 3.].into()),
+                [].into(),
+                Timestamp::from_millis(30),
+            ),
         ])),
         None,
     )
@@ -1740,10 +1776,10 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
                 .index_status(&keyspace_name, &index_name)
                 .await
                 .is_ok_and(|status| {
-                    status.status == httpapi::IndexStatus::Serving && status.count == 1
+                    status.status == httpapi::IndexStatus::Serving && status.count == 2
                 })
         },
-        "Waiting for exactly 1 vector to be indexed (null vector must be skipped)",
+        "Waiting for exactly 2 vectors to be indexed (null vector must be skipped)",
     )
     .await;
 }
@@ -1903,6 +1939,7 @@ async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn empty_index_has_zero_count(#[case] config: Config) {
     crate::enable_tracing();
