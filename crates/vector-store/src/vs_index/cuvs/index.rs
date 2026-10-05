@@ -11,6 +11,7 @@ use crate::Vector;
 use crate::table::PrimaryId;
 use crate::vs_index::cuvs::device::DeviceMatrix;
 use crate::vs_index::cuvs::params::CagraParams;
+use crate::vs_index::validator;
 use anyhow::anyhow;
 use cuvs::Resources;
 use cuvs::neighbors::cagra::Index;
@@ -215,6 +216,7 @@ impl CuvsIndex {
         query: &Vector,
         limit: Limit,
     ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+        validator::embedding_dimensions(query, self.params.dimensions)?;
         let Some(built) = &self.built else {
             return Ok(Vec::new());
         };
@@ -521,5 +523,23 @@ mod tests {
         let found = index.search(&vector(&[0.5; 4]), limit(value)).unwrap();
 
         assert_eq!(found.len(), value.min(1024));
+    }
+
+    #[test]
+    fn search_rejects_a_query_of_the_wrong_dimensions() {
+        let index = built_index(256);
+
+        let err = index.search(&vector(&[1.0; 3]), limit(1)).unwrap_err();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<validator::Error>(),
+                Some(validator::Error::WrongEmbeddingDimension {
+                    expected: 4,
+                    actual: 3
+                })
+            ),
+            "got: {err}"
+        );
     }
 }
