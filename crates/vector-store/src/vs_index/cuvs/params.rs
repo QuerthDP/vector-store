@@ -18,6 +18,7 @@ pub(super) struct CagraParams {
     pub(super) metric: DistanceType,
     pub(super) graph_degree: usize,
     pub(super) intermediate_graph_degree: usize,
+    pub(super) expansion_search: usize,
 }
 
 impl TryFrom<&VsIndexConfiguration> for CagraParams {
@@ -34,6 +35,7 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
         let metric = distance_type(config.space_type)?;
         let graph_degree = *config.connectivity.as_ref();
         let intermediate_graph_degree = *config.expansion_add.as_ref();
+        let expansion_search = *config.expansion_search.as_ref();
 
         if graph_degree == 0 {
             bail!("cuVS index requires `maximum_node_connections` to be greater than 0");
@@ -51,6 +53,7 @@ impl TryFrom<&VsIndexConfiguration> for CagraParams {
             metric,
             graph_degree,
             intermediate_graph_degree,
+            expansion_search,
         })
     }
 }
@@ -124,6 +127,10 @@ mod tests {
         assert_eq!(
             params.intermediate_graph_degree,
             *ExpansionAdd::default().as_ref()
+        );
+        assert_eq!(
+            params.expansion_search,
+            *ExpansionSearch::default().as_ref()
         );
         assert!(params.intermediate_graph_degree >= params.graph_degree);
     }
