@@ -72,7 +72,8 @@ struct BuiltIndex {
     // DO NOT REORDER: `_index` borrows `_dataset` and must drop first.
     _index: Index<'static>,
     _dataset: DeviceMatrix<f32>,
-    rows: usize,
+    /// The id of each graph row at build time.
+    ids: Vec<PrimaryId>,
 }
 
 impl BuiltIndex {
@@ -100,7 +101,7 @@ impl BuiltIndex {
         Ok(Self {
             _index: index,
             _dataset: dataset,
-            rows: row_count,
+            ids: rows.ids.clone(),
         })
     }
 }
@@ -177,7 +178,7 @@ impl CuvsIndex {
 
     /// Vectors in the last built graph, deliberately not the staged row count.
     pub(super) fn count(&self) -> usize {
-        self.built.as_ref().map_or(0, |built| built.rows)
+        self.built.as_ref().map_or(0, |built| built.ids.len())
     }
 
     /// Rebuilds from the staged rows if they changed, releasing their guards
