@@ -92,11 +92,14 @@ impl CagraParams {
             .map_err(|err| anyhow!("failed to build cuVS CAGRA search params: {err}"))
     }
 
+    /// Maps a CAGRA distance onto the scale USearch reports.
     pub(super) fn distance(self, value: f32) -> anyhow::Result<Distance> {
         match self.metric {
-            DistanceType::L2Expanded => Distance::new_euclidean(value),
-            DistanceType::CosineExpanded => Distance::new_cosine(value),
-            DistanceType::InnerProduct => Distance::new_dot_product(value),
+            // The expanded forms can round just past their bounds.
+            DistanceType::L2Expanded => Distance::new_euclidean(value.max(0.0)),
+            DistanceType::CosineExpanded => Distance::new_cosine(value.clamp(0.0, 2.0)),
+            // CAGRA returns the product itself, so larger is closer.
+            DistanceType::InnerProduct => Distance::new_dot_product(1.0 - value),
             metric => bail!("cuVS index does not support the {metric:?} metric"),
         }
     }

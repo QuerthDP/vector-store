@@ -266,6 +266,9 @@ mod tests {
     use cuvs::distance::DistanceType;
     use rstest::rstest;
     use std::num::NonZeroUsize;
+    use usearch::IndexOptions;
+    use usearch::MetricKind;
+    use usearch::ScalarKind;
 
     fn dimensions(value: usize) -> Dimensions {
         Dimensions::from(NonZeroUsize::new(value).unwrap())
@@ -503,6 +506,53 @@ mod tests {
         }
         index.build().unwrap();
         index
+    }
+
+    #[rstest]
+    #[case::euclidean(DistanceType::L2Expanded, MetricKind::L2sq)]
+    #[case::cosine(DistanceType::CosineExpanded, MetricKind::Cos)]
+    #[case::dot_product(DistanceType::InnerProduct, MetricKind::IP)]
+    fn search_reports_the_distances_usearch_does(
+        #[case] metric: DistanceType,
+        #[case] usearch_metric: MetricKind,
+    ) {
+        let rows: Vec<_> = (0..256)
+            .map(|row| {
+                vector(&[0, 1, 2, 3].map(|col: usize| ((row * 4 + col) as f32 * 0.37).sin()))
+            })
+            .collect();
+        let mut index = CuvsIndex::new(CagraParams {
+            metric,
+            ..params(4)
+        })
+        .unwrap();
+        let usearch = usearch::Index::new(&IndexOptions {
+            dimensions: 4,
+            metric: usearch_metric,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        })
+        .unwrap();
+        usearch.reserve(rows.len()).unwrap();
+        for (row, embedding) in rows.iter().enumerate() {
+            index.add((row as u64).into(), embedding, AsyncInProgress::None);
+            usearch.add(row as u64, embedding.as_slice()).unwrap();
+        }
+        index.build().unwrap();
+        let query = vector(&[0.5, -0.25, 1.0, 0.75]);
+
+        let found = index.search(&query, limit(16)).unwrap();
+        let exact = usearch.exact_search(query.as_slice(), rows.len()).unwrap();
+
+        let expected: HashMap<_, _> = exact.keys.into_iter().zip(exact.distances).collect();
+        for (primary_id, distance) in found {
+            let distance: f32 = distance.into();
+            let expected = expected[&u64::from(primary_id)];
+            assert!(
+                (distance - expected).abs() < 1e-4,
+                "{primary_id:?}: {distance} vs {expected}"
+            );
+        }
     }
 
     #[test]
