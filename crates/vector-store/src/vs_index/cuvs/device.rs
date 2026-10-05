@@ -16,6 +16,7 @@ use std::ffi::CStr;
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use tracing::error;
 
 const CUDA_SUCCESS: c_int = 0;
@@ -49,16 +50,17 @@ fn check_cuda(status: c_int, context: &str) -> anyhow::Result<()> {
 }
 
 #[derive(Debug)]
-pub(super) struct DeviceMatrix {
+pub(super) struct DeviceMatrix<T> {
     data: *mut c_void,
     shape: [i64; 2],
     device_id: c_int,
+    _values: PhantomData<T>,
 }
 
-impl DeviceMatrix {
+impl<T: DType> DeviceMatrix<T> {
     pub(super) fn from_host(
         resources: &Resources,
-        host: &[f32],
+        host: &[T],
         rows: usize,
         columns: usize,
     ) -> anyhow::Result<Self> {
@@ -80,6 +82,7 @@ impl DeviceMatrix {
             data,
             shape: [rows as i64, columns as i64],
             device_id,
+            _values: PhantomData,
         };
 
         let stream = resources
@@ -106,7 +109,7 @@ impl DeviceMatrix {
     }
 }
 
-impl Drop for DeviceMatrix {
+impl<T> Drop for DeviceMatrix<T> {
     fn drop(&mut self) {
         // SAFETY: `data` came from `cudaMalloc` and is freed exactly once.
         if let Err(err) = check_cuda(unsafe { cudaFree(self.data) }, "cudaFree") {
@@ -115,7 +118,7 @@ impl Drop for DeviceMatrix {
     }
 }
 
-impl AsDlTensor for DeviceMatrix {
+impl<T: DType> AsDlTensor for DeviceMatrix<T> {
     fn as_dl_tensor(&self) -> Result<DLTensorView<'_>, DLPackError> {
         // SAFETY: `data` is exactly the contiguous row-major matrix `shape`
         // declares, on `device_id`, and outlives the view, whose lifetime is the
@@ -129,7 +132,7 @@ impl AsDlTensor for DeviceMatrix {
                 },
                 &self.shape,
                 None,
-                f32::dl_dtype(),
+                T::dl_dtype(),
             )
         }
     }
