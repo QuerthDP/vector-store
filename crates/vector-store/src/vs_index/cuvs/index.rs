@@ -87,7 +87,8 @@ impl BuiltIndex {
         rows: &Rows,
     ) -> anyhow::Result<Self> {
         let row_count = rows.ids.len();
-        let dataset = DeviceMatrix::from_host(resources, &rows.values, row_count, rows.dimensions)?;
+        let dataset =
+            DeviceMatrix::padded_from_host(resources, &rows.values, row_count, rows.dimensions)?;
 
         let index = Index::build(resources, index_params, &dataset)
             .map_err(|err| anyhow!("failed to build cuVS CAGRA index: {err}"))?;
@@ -484,8 +485,7 @@ mod tests {
 
     #[test]
     fn build_with_unaligned_dimensions_succeeds() {
-        // Not a multiple of 4, so cuVS sees a standard rather than a padded
-        // layout. CAGRA builds from either.
+        // Not a multiple of 4, so the rows are padded.
         let mut index = CuvsIndex::new(params(3)).unwrap();
         for (row, embedding) in many_vectors(256, 3).iter().enumerate() {
             index.add((row as u64).into(), embedding, AsyncInProgress::None);
