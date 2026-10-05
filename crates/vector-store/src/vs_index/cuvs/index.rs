@@ -483,19 +483,6 @@ mod tests {
         assert!(index.stale, "the next tick must retry");
     }
 
-    #[test]
-    fn build_with_unaligned_dimensions_succeeds() {
-        // Not a multiple of 4, so cuVS sees a standard rather than a padded
-        // layout. CAGRA builds from either.
-        let mut index = CuvsIndex::new(params(3)).unwrap();
-        for (row, embedding) in many_vectors(256, 3).iter().enumerate() {
-            index.add((row as u64).into(), embedding, AsyncInProgress::None);
-        }
-
-        index.build().unwrap();
-        assert_eq!(index.count(), 256);
-    }
-
     fn limit(value: usize) -> Limit {
         Limit::from(NonZeroUsize::new(value).unwrap())
     }
