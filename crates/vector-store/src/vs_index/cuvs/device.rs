@@ -56,6 +56,28 @@ pub(super) struct DeviceMatrix<T> {
 }
 
 impl<T: DType> DeviceMatrix<T> {
+    /// Allocates a matrix whose values are left for the device to write.
+    fn new(rows: usize, columns: usize) -> anyhow::Result<Self> {
+        let bytes = rows
+            .checked_mul(columns)
+            .and_then(|values| values.checked_mul(size_of::<T>()))
+            .ok_or_else(|| anyhow!("a {rows}x{columns} device matrix overflows"))?;
+
+        let mut device_id = 0;
+        // SAFETY: `device_id` is a valid out-pointer.
+        check_cuda(unsafe { cudaGetDevice(&mut device_id) }, "cudaGetDevice")?;
+
+        let mut data = std::ptr::null_mut();
+        // SAFETY: `data` is a valid out-pointer.
+        check_cuda(unsafe { cudaMalloc(&mut data, bytes) }, "cudaMalloc")?;
+
+        Ok(Self {
+            data: data.cast(),
+            shape: [rows as i64, columns as i64],
+            device_id,
+        })
+    }
+
     pub(super) fn from_host(
         resources: &Resources,
         host: &[T],
@@ -68,42 +90,50 @@ impl<T: DType> DeviceMatrix<T> {
                 host.len()
             );
         }
-        let bytes = size_of_val(host);
 
-        let mut device_id = 0;
-        // SAFETY: `device_id` is a valid out-pointer.
-        check_cuda(unsafe { cudaGetDevice(&mut device_id) }, "cudaGetDevice")?;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: `data` is a valid out-pointer.
-        check_cuda(unsafe { cudaMalloc(&mut data, bytes) }, "cudaMalloc")?;
-        let matrix = Self {
-            data: data.cast(),
-            shape: [rows as i64, columns as i64],
-            device_id,
-        };
+        let matrix = Self::new(rows, columns)?;
 
-        let stream = resources
-            .stream()
-            .map_err(|err| anyhow!("failed to get the cuVS stream: {err}"))?;
-        // SAFETY: `data` was just allocated with as many bytes as `host` holds.
-        check_cuda(
-            unsafe {
-                cudaMemcpyAsync(
-                    matrix.data.cast(),
-                    host.as_ptr().cast(),
-                    bytes,
-                    CUDA_MEMCPY_HOST_TO_DEVICE,
-                    stream,
-                )
-            },
-            "cudaMemcpyAsync",
-        )?;
-        resources
-            .sync_stream()
-            .map_err(|err| anyhow!("failed to sync the cuVS stream: {err}"))?;
+        // SAFETY: `matrix` was just allocated with as many bytes as `host` holds.
+        unsafe {
+            copy(
+                resources,
+                matrix.data.cast(),
+                host.as_ptr().cast(),
+                size_of_val(host),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        }?;
 
         Ok(matrix)
     }
+}
+
+/// Copies `count` bytes into `dst`, after the kernels queued on the cuVS
+/// stream, and waits for it.
+///
+/// # Safety
+///
+/// Both buffers must hold `count` bytes, in the memory `kind` names.
+unsafe fn copy(
+    resources: &Resources,
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    kind: c_int,
+) -> anyhow::Result<()> {
+    let stream = resources
+        .stream()
+        .map_err(|err| anyhow!("failed to get the cuVS stream: {err}"))?;
+
+    // SAFETY: the caller guarantees the extents of both buffers.
+    check_cuda(
+        unsafe { cudaMemcpyAsync(dst, src, count, kind, stream) },
+        "cudaMemcpyAsync",
+    )?;
+
+    resources
+        .sync_stream()
+        .map_err(|err| anyhow!("failed to sync the cuVS stream: {err}"))
 }
 
 impl<T> Drop for DeviceMatrix<T> {
