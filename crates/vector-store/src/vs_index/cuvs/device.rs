@@ -29,10 +29,19 @@ unsafe extern "C" {
     fn cudaGetDevice(device: *mut c_int) -> c_int;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     fn cudaFree(ptr: *mut c_void) -> c_int;
-    fn cudaMemcpyAsync(
-        dst: *mut c_void,
-        src: *const c_void,
+    fn cudaMemsetAsync(
+        ptr: *mut c_void,
+        value: c_int,
         count: usize,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> c_int;
+    fn cudaMemcpy2DAsync(
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
         kind: c_int,
         stream: cuvs_sys::cudaStream_t,
     ) -> c_int;
@@ -50,6 +59,9 @@ fn check_cuda(status: c_int, context: &str) -> anyhow::Result<()> {
         message.to_string_lossy()
     ))
 }
+
+/// CAGRA searches a dataset only if its rows are padded to this many bytes.
+const CAGRA_ROW_ALIGNMENT: usize = 16;
 
 #[derive(Debug)]
 pub(super) struct DeviceMatrix<T> {
@@ -81,6 +93,8 @@ impl<T: DType + Copy + Default> DeviceMatrix<T> {
         })
     }
 
+    /// Uploads `rows` of `columns` values, zero-padded to `CAGRA_ROW_ALIGNMENT`
+    /// bytes per row; the zeros leave distances unchanged.
     pub(super) fn from_host(
         resources: &Resources,
         host: &[T],
@@ -94,15 +108,31 @@ impl<T: DType + Copy + Default> DeviceMatrix<T> {
             );
         }
 
-        let matrix = Self::new(rows, columns)?;
+        let row_bytes = columns * size_of::<T>();
+        let padded_row_bytes = row_bytes.next_multiple_of(CAGRA_ROW_ALIGNMENT);
+        let padded_columns = padded_row_bytes / size_of::<T>();
 
-        // SAFETY: `matrix` was just allocated with as many bytes as `host` holds.
+        let matrix = Self::new(rows, padded_columns)?;
+        if padded_columns != columns {
+            let stream = resources
+                .stream()
+                .map_err(|err| anyhow!("failed to get the cuVS stream: {err}"))?;
+            // SAFETY: `matrix` holds `rows` rows of `padded_columns` values.
+            check_cuda(
+                unsafe { cudaMemsetAsync(matrix.data.cast(), 0, rows * padded_row_bytes, stream) },
+                "cudaMemsetAsync",
+            )?;
+        }
+
+        // SAFETY: `matrix` was just allocated with as many rows as `host` holds, padded.
         unsafe {
             copy(
                 resources,
                 matrix.data.cast(),
+                padded_row_bytes,
                 host.as_ptr().cast(),
-                size_of_val(host),
+                row_bytes,
+                rows,
                 CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         }?;
@@ -113,14 +143,17 @@ impl<T: DType + Copy + Default> DeviceMatrix<T> {
     pub(super) fn to_host(&self, resources: &Resources) -> anyhow::Result<Vec<T>> {
         let [rows, columns] = self.shape.map(|extent| extent as usize);
         let mut host = vec![T::default(); rows * columns];
+        let row_bytes = columns * size_of::<T>();
 
         // SAFETY: `host` holds as many bytes as `self`.
         unsafe {
             copy(
                 resources,
                 host.as_mut_ptr().cast(),
+                row_bytes,
                 self.data.cast(),
-                size_of_val(host.as_slice()),
+                row_bytes,
+                rows,
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             )
         }?;
@@ -138,17 +171,19 @@ impl<T> DeviceMatrix<T> {
     }
 }
 
-/// Copies `count` bytes into `dst`, after the kernels queued on the cuVS
-/// stream, and waits for it.
+/// Copies packed rows into `dst` rows `padded_row_bytes` long, after the
+/// kernels queued on the cuVS stream, and waits for it.
 ///
 /// # Safety
 ///
-/// Both buffers must hold `count` bytes, in the memory `kind` names.
+/// Both buffers must hold `rows` such rows, in the memory `kind` names.
 unsafe fn copy(
     resources: &Resources,
     dst: *mut c_void,
+    padded_row_bytes: usize,
     src: *const c_void,
-    count: usize,
+    row_bytes: usize,
+    rows: usize,
     kind: c_int,
 ) -> anyhow::Result<()> {
     let stream = resources
@@ -157,8 +192,19 @@ unsafe fn copy(
 
     // SAFETY: the caller guarantees the extents of both buffers.
     check_cuda(
-        unsafe { cudaMemcpyAsync(dst, src, count, kind, stream) },
-        "cudaMemcpyAsync",
+        unsafe {
+            cudaMemcpy2DAsync(
+                dst,
+                padded_row_bytes,
+                src,
+                row_bytes,
+                row_bytes,
+                rows,
+                kind,
+                stream,
+            )
+        },
+        "cudaMemcpy2DAsync",
     )?;
 
     resources
@@ -177,9 +223,9 @@ impl<T> Drop for DeviceMatrix<T> {
 
 impl<T: DType> AsDlTensor for DeviceMatrix<T> {
     fn as_dl_tensor(&self) -> Result<DLTensorView<'_>, DLPackError> {
-        // SAFETY: `data` is exactly the contiguous row-major matrix `shape`
-        // declares, on `device_id`, and outlives the view, whose lifetime is the
-        // `&self` borrow.
+        // SAFETY: `data` is exactly the row-major matrix `shape` declares, on
+        // `device_id`, and outlives the view, whose lifetime is the `&self`
+        // borrow.
         unsafe {
             DLTensorView::from_raw_parts(
                 self.data.cast(),
@@ -213,12 +259,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_host_round_trips_the_values() {
+    fn from_host_keeps_aligned_rows() {
+        let resources = Resources::new().unwrap();
+        let host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let matrix = DeviceMatrix::from_host(&resources, &host, 2, 4).unwrap();
+        assert_eq!(matrix.to_host(&resources).unwrap(), host);
+    }
+
+    #[test]
+    fn from_host_appends_zero_columns() {
         let resources = Resources::new().unwrap();
         let host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let matrix = DeviceMatrix::from_host(&resources, &host, 2, 3).unwrap();
 
-        assert_eq!(matrix.to_host(&resources).unwrap(), host);
+        assert_eq!(
+            matrix.to_host(&resources).unwrap(),
+            [1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0]
+        );
     }
 
     #[test]
