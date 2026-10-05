@@ -223,7 +223,7 @@ impl CuvsIndex {
             return Ok(Vec::new());
         };
 
-        let limit = limit.0.get();
+        let limit = limit.0.get().min(built.ids.len());
         let search_params = self.params.to_search_params(limit)?;
 
         built
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[rstest]
-    fn search_returns_at_most_every_row(#[values(1, 64, 512, 513, 1024)] value: usize) {
+    fn search_returns_at_most_every_row(#[values(1, 64, 512, 513, 1024, 2048)] value: usize) {
         let index = built_index(1024);
 
         let found = index.search(&vector(&[0.5; 4]), limit(value)).unwrap();
