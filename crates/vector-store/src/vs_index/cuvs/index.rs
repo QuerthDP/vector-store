@@ -71,7 +71,7 @@ impl Rows {
 struct BuiltIndex {
     // DO NOT REORDER: `_index` borrows `_dataset` and must drop first.
     _index: Index<'static>,
-    _dataset: DeviceMatrix,
+    _dataset: DeviceMatrix<f32>,
     rows: usize,
 }
 

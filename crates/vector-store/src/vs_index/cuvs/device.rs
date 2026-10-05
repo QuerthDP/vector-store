@@ -49,16 +49,16 @@ fn check_cuda(status: c_int, context: &str) -> anyhow::Result<()> {
 }
 
 #[derive(Debug)]
-pub(super) struct DeviceMatrix {
-    data: *mut c_void,
+pub(super) struct DeviceMatrix<T> {
+    data: *mut T,
     shape: [i64; 2],
     device_id: c_int,
 }
 
-impl DeviceMatrix {
+impl<T: DType> DeviceMatrix<T> {
     pub(super) fn from_host(
         resources: &Resources,
-        host: &[f32],
+        host: &[T],
         rows: usize,
         columns: usize,
     ) -> anyhow::Result<Self> {
@@ -77,7 +77,7 @@ impl DeviceMatrix {
         // SAFETY: `data` is a valid out-pointer.
         check_cuda(unsafe { cudaMalloc(&mut data, bytes) }, "cudaMalloc")?;
         let matrix = Self {
-            data,
+            data: data.cast(),
             shape: [rows as i64, columns as i64],
             device_id,
         };
@@ -89,7 +89,7 @@ impl DeviceMatrix {
         check_cuda(
             unsafe {
                 cudaMemcpyAsync(
-                    matrix.data,
+                    matrix.data.cast(),
                     host.as_ptr().cast(),
                     bytes,
                     CUDA_MEMCPY_HOST_TO_DEVICE,
@@ -106,30 +106,30 @@ impl DeviceMatrix {
     }
 }
 
-impl Drop for DeviceMatrix {
+impl<T> Drop for DeviceMatrix<T> {
     fn drop(&mut self) {
         // SAFETY: `data` came from `cudaMalloc` and is freed exactly once.
-        if let Err(err) = check_cuda(unsafe { cudaFree(self.data) }, "cudaFree") {
+        if let Err(err) = check_cuda(unsafe { cudaFree(self.data.cast()) }, "cudaFree") {
             error!("failed to free a device matrix: {err}");
         }
     }
 }
 
-impl AsDlTensor for DeviceMatrix {
+impl<T: DType> AsDlTensor for DeviceMatrix<T> {
     fn as_dl_tensor(&self) -> Result<DLTensorView<'_>, DLPackError> {
         // SAFETY: `data` is exactly the contiguous row-major matrix `shape`
         // declares, on `device_id`, and outlives the view, whose lifetime is the
         // `&self` borrow.
         unsafe {
             DLTensorView::from_raw_parts(
-                self.data,
+                self.data.cast(),
                 DLDevice {
                     device_type: DLDeviceType::kDLCUDA,
                     device_id: self.device_id,
                 },
                 &self.shape,
                 None,
-                f32::dl_dtype(),
+                T::dl_dtype(),
             )
         }
     }
@@ -154,7 +154,7 @@ mod tests {
             unsafe {
                 cudaMemcpyAsync(
                     copy.as_mut_ptr().cast(),
-                    matrix.data,
+                    matrix.data.cast(),
                     size_of_val(copy.as_slice()),
                     CUDA_MEMCPY_DEVICE_TO_HOST,
                     stream,
