@@ -7,10 +7,12 @@ use anyhow::anyhow;
 use anyhow::bail;
 use cuvs::Resources;
 use cuvs::dlpack::AsDlTensor;
+use cuvs::dlpack::AsDlTensorMut;
 use cuvs::dlpack::DLDevice;
 use cuvs::dlpack::DLDeviceType;
 use cuvs::dlpack::DLPackError;
 use cuvs::dlpack::DLTensorView;
+use cuvs::dlpack::DLTensorViewMut;
 use cuvs::dlpack::DType;
 use std::ffi::CStr;
 use std::ffi::c_char;
@@ -21,6 +23,7 @@ use tracing::error;
 
 const CUDA_SUCCESS: c_int = 0;
 const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 
 #[link(name = "cudart")]
 unsafe extern "C" {
@@ -57,9 +60,9 @@ pub(super) struct DeviceMatrix<T> {
     _values: PhantomData<T>,
 }
 
-impl<T: DType> DeviceMatrix<T> {
+impl<T: DType + Copy + Default> DeviceMatrix<T> {
     /// Allocates a matrix whose values are left for the device to write.
-    fn new(rows: usize, columns: usize) -> anyhow::Result<Self> {
+    pub(super) fn new(rows: usize, columns: usize) -> anyhow::Result<Self> {
         let bytes = rows
             .checked_mul(columns)
             .and_then(|values| values.checked_mul(size_of::<T>()))
@@ -103,6 +106,31 @@ impl<T: DType> DeviceMatrix<T> {
             )
         }?;
         Ok(matrix)
+    }
+
+    pub(super) fn to_host(&self, resources: &Resources) -> anyhow::Result<Vec<T>> {
+        let [rows, columns] = self.shape.map(|extent| extent as usize);
+        let mut host = vec![T::default(); rows * columns];
+        // SAFETY: `host` holds as many bytes as `self`.
+        unsafe {
+            copy(
+                resources,
+                host.as_mut_ptr().cast(),
+                self.data,
+                size_of_val(host.as_slice()),
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        }?;
+        Ok(host)
+    }
+}
+
+impl<T> DeviceMatrix<T> {
+    fn device(&self) -> DLDevice {
+        DLDevice {
+            device_type: DLDeviceType::kDLCUDA,
+            device_id: self.device_id,
+        }
     }
 }
 
@@ -149,12 +177,19 @@ impl<T: DType> AsDlTensor for DeviceMatrix<T> {
         // declares, on `device_id`, and outlives the view, whose lifetime is the
         // `&self` borrow.
         unsafe {
-            DLTensorView::from_raw_parts(
+            DLTensorView::from_raw_parts(self.data, self.device(), &self.shape, None, T::dl_dtype())
+        }
+    }
+}
+
+impl<T: DType> AsDlTensorMut for DeviceMatrix<T> {
+    fn as_dl_tensor_mut(&mut self) -> Result<DLTensorViewMut<'_>, DLPackError> {
+        // SAFETY: as in `as_dl_tensor`, and the `&mut self` borrow makes the
+        // view the only access to `data`.
+        unsafe {
+            DLTensorViewMut::from_raw_parts(
                 self.data,
-                DLDevice {
-                    device_type: DLDeviceType::kDLCUDA,
-                    device_id: self.device_id,
-                },
+                self.device(),
                 &self.shape,
                 None,
                 T::dl_dtype(),
@@ -167,32 +202,13 @@ impl<T: DType> AsDlTensor for DeviceMatrix<T> {
 mod tests {
     use super::*;
 
-    const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
-
     #[test]
     fn from_host_round_trips_the_values() {
         let resources = Resources::new().unwrap();
         let host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let matrix = DeviceMatrix::from_host(&resources, &host, 2, 3).unwrap();
 
-        let mut copy = vec![0.0; host.len()];
-        let stream = resources.stream().unwrap();
-        // SAFETY: `copy` holds as many bytes as `matrix`.
-        check_cuda(
-            unsafe {
-                cudaMemcpyAsync(
-                    copy.as_mut_ptr().cast(),
-                    matrix.data,
-                    size_of_val(copy.as_slice()),
-                    CUDA_MEMCPY_DEVICE_TO_HOST,
-                    stream,
-                )
-            },
-            "cudaMemcpyAsync",
-        )
-        .unwrap();
-        resources.sync_stream().unwrap();
-        assert_eq!(copy, host);
+        assert_eq!(matrix.to_host(&resources).unwrap(), host);
     }
 
     #[test]

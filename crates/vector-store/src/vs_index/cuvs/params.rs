@@ -4,6 +4,7 @@
  */
 
 use crate::Dimensions;
+use crate::Distance;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::vs_index::VsIndexConfiguration;
@@ -11,6 +12,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use cuvs::distance::DistanceType;
 use cuvs::neighbors::cagra::IndexParams;
+use cuvs::neighbors::cagra::SearchParams;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct CagraParams {
@@ -80,6 +82,23 @@ impl CagraParams {
             .intermediate_graph_degree(self.intermediate_graph_degree)
             .build()
             .map_err(|err| anyhow!("failed to build cuVS CAGRA index params: {err}"))
+    }
+
+    /// CAGRA keeps `itopk_size` candidates, so it must hold all `limit` results.
+    pub(super) fn to_search_params(self, limit: usize) -> anyhow::Result<SearchParams> {
+        SearchParams::builder()
+            .itopk_size(self.expansion_search.max(limit))
+            .build()
+            .map_err(|err| anyhow!("failed to build cuVS CAGRA search params: {err}"))
+    }
+
+    pub(super) fn distance(self, value: f32) -> anyhow::Result<Distance> {
+        match self.metric {
+            DistanceType::L2Expanded => Distance::new_euclidean(value),
+            DistanceType::CosineExpanded => Distance::new_cosine(value),
+            DistanceType::InnerProduct => Distance::new_dot_product(value),
+            metric => bail!("cuVS index does not support the {metric:?} metric"),
+        }
     }
 }
 
