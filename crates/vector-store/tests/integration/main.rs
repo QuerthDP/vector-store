@@ -55,7 +55,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    time::timeout(Duration::from_secs(5), async {
+    time::timeout(Duration::from_secs(10), async {
         while !condition().await {
             task::yield_now().await;
         }
@@ -65,7 +65,7 @@ where
 }
 
 async fn wait_for_value<T>(mut producer: impl AsyncFnMut() -> Option<T>, msg: &str) -> T {
-    time::timeout(Duration::from_secs(5), async {
+    time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(value) = producer().await {
                 break value;

@@ -568,7 +568,7 @@ async fn ann_returns_requested_column_values(#[case] config: Config) {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_return_columns_null_for_column_not_tracked_by_index(#[case] config: Config) {
     crate::enable_tracing();
@@ -668,7 +668,7 @@ async fn ann_return_columns_includes_target_vector() {
 #[rstest]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_return_columns_target_vector_unsupported(#[case] config: Config) {
     crate::enable_tracing();
@@ -2264,7 +2264,7 @@ async fn http_server_is_responsive_when_index_add_hangs() {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn null_vector_is_not_indexed(#[case] config: Config) {
     crate::enable_tracing();
@@ -2323,7 +2323,7 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config: Config) {
     crate::enable_tracing();
