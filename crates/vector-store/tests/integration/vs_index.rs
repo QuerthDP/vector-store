@@ -119,6 +119,39 @@ pub(crate) async fn setup_store_with_quantization(
     DbBasic,
     Sender<NodeState>,
 ) {
+    setup_store_with_space_type(
+        config,
+        partitioning,
+        primary_keys,
+        partition_key_count,
+        columns,
+        fullscan_fn,
+        cdc_fn,
+        quantization,
+        dimension,
+        SpaceType::Euclidean,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn setup_store_with_space_type(
+    config: Config,
+    partitioning: DbIndexPartitioning,
+    primary_keys: impl IntoIterator<Item = ColumnName>,
+    partition_key_count: usize,
+    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
+    fullscan_fn: Option<ScanFn>,
+    cdc_fn: Option<ScanFn>,
+    quantization: Quantization,
+    dimension: Dimensions,
+    space_type: SpaceType,
+) -> (
+    impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
+    IndexMetadata,
+    DbBasic,
+    Sender<NodeState>,
+) {
     let node_state = vector_store::new_node_state().await;
 
     let (db_actor, db) = db_basic::new(node_state.clone());
@@ -145,7 +178,7 @@ pub(crate) async fn setup_store_with_quantization(
             connectivity: Connectivity::default(),
             expansion_add: ExpansionAdd::default(),
             expansion_search: ExpansionSearch::default(),
-            space_type: SpaceType::Euclidean,
+            space_type,
             quantization,
         }),
     };
@@ -321,6 +354,88 @@ async fn simple_create_search_delete_index(#[case] config: Config) {
         "Waiting for all indexes to be removed from the store",
     )
     .await;
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[tokio::test]
+async fn ann_reports_the_same_distances_on_every_backend(
+    #[case] config: Config,
+    #[values(SpaceType::Euclidean, SpaceType::Cosine, SpaceType::DotProduct)] space_type: SpaceType,
+    #[values(3, 4)] dimensions: usize,
+) {
+    crate::enable_tracing();
+
+    // The query itself, an orthogonal row and the opposite one.
+    let rows: [Vec<f32>; 3] = [[1., 2., 2., 0.], [2., 1., -2., 0.], [-1., -2., -2., 0.]]
+        .map(|row| row[..dimensions].to_vec());
+    // Squared L2, `1 - cos` and `1 - dot`, as USearch reports them.
+    let expected = match space_type {
+        SpaceType::Euclidean => [0., 18., 36.],
+        SpaceType::Cosine => [0., 1., 2.],
+        SpaceType::DotProduct => [-8., 1., 10.],
+        SpaceType::Hamming => unreachable!(),
+    };
+    let (run, index, _db, _node_state) = setup_store_with_space_type(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors(
+            rows.clone().into_iter().zip(1..).map(|(row, pk)| {
+                (
+                    [CqlValue::Int(pk)].into(),
+                    Some(row.into()),
+                    [].into(),
+                    Timestamp::from_millis(10),
+                )
+            }),
+        )),
+        None,
+        Quantization::F32,
+        NonZeroUsize::new(dimensions).unwrap().into(),
+        space_type,
+    )
+    .await;
+    let (client, _server, _config_tx) = run.await;
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+    wait_for(
+        || async {
+            client
+                .index_status(&keyspace_name, &index_name)
+                .await
+                .is_ok_and(|status| status.status == IndexStatus::Serving && status.count == 3)
+        },
+        "Waiting for 3 vectors to be indexed",
+    )
+    .await;
+
+    let (primary_keys, distances, _) = client
+        .ann(
+            &keyspace_name,
+            &index_name,
+            rows[0].clone().into(),
+            None,
+            NonZeroUsize::new(3).unwrap().into(),
+        )
+        .await;
+
+    let pks: Vec<_> = primary_keys[&"pk".into()]
+        .iter()
+        .map(|pk| pk.as_i64().unwrap() as usize)
+        .collect();
+    assert!(pks.contains(&1), "the query itself must be found: {pks:?}");
+    for (pk, distance) in pks.into_iter().zip(distances) {
+        let (distance, expected) = (f32::from(distance), expected[pk - 1]);
+        assert!(
+            (distance - expected).abs() < 1e-4,
+            "{pk}: {distance} vs {expected}"
+        );
+    }
 }
 
 #[rstest]
