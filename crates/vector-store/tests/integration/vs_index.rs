@@ -2170,7 +2170,7 @@ async fn cdc_insert_is_indexed(#[case] config: Config) {
 async fn cdc_delete_is_removed_from_the_index(#[case] config: Config) {
     crate::enable_tracing();
 
-    setup_store_and_wait_for_index(
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
         config,
         DbIndexPartitioning::Global,
         ["pk".into()],
@@ -2203,4 +2203,19 @@ async fn cdc_delete_is_removed_from_the_index(#[case] config: Config) {
         Some(2),
     )
     .await;
+
+    let (primary_keys, _, _) = client
+        .ann(
+            &index.keyspace_name.clone().into(),
+            &index.index_name.clone().into(),
+            vec![1., 1., 1.].into(),
+            None,
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+    let pks: Vec<_> = primary_keys[&"pk".into()]
+        .iter()
+        .map(|pk| pk.as_i64().unwrap())
+        .collect();
+    assert_eq!(pks, [2]);
 }
