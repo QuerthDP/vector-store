@@ -5,14 +5,18 @@
 
 use crate::AsyncInProgress;
 use crate::Dimensions;
+use crate::Distance;
+use crate::Limit;
 use crate::Vector;
 use crate::table::PrimaryId;
 use crate::vs_index::cuvs::device::DeviceMatrix;
 use crate::vs_index::cuvs::params::CagraParams;
+use crate::vs_index::validator;
 use anyhow::anyhow;
 use cuvs::Resources;
 use cuvs::neighbors::cagra::Index;
 use cuvs::neighbors::cagra::IndexParams;
+use cuvs::neighbors::cagra::SearchParams;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -69,10 +73,11 @@ impl Rows {
 /// A CAGRA index and the device memory it reads, which `Index<'d>` only borrows.
 #[derive(Debug)]
 struct BuiltIndex {
-    // DO NOT REORDER: `_index` borrows `_dataset` and must drop first.
-    _index: Index<'static>,
-    _dataset: DeviceMatrix,
-    rows: usize,
+    // DO NOT REORDER: `index` borrows `_dataset` and must drop first.
+    index: Index<'static>,
+    _dataset: DeviceMatrix<f32>,
+    /// The id of each graph row at build time.
+    ids: Vec<PrimaryId>,
 }
 
 impl BuiltIndex {
@@ -94,14 +99,40 @@ impl BuiltIndex {
 
         // SAFETY: the index keeps a pointer to the device rows of `dataset`
         // rather than a copy. Moving `dataset` into the struct below doesn't
-        // move those rows, and `_index` is dropped before `_dataset`.
+        // move those rows, and `index` is dropped before `_dataset`.
         let index: Index<'static> = unsafe { std::mem::transmute(index) };
 
         Ok(Self {
-            _index: index,
+            index,
             _dataset: dataset,
-            rows: row_count,
+            ids: rows.ids.clone(),
         })
+    }
+
+    fn search(
+        &self,
+        resources: &Resources,
+        params: &SearchParams,
+        query: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<(PrimaryId, f32)>> {
+        const NUM_QUERIES: usize = 1;
+        let query = DeviceMatrix::from_host(resources, query, NUM_QUERIES, query.len())?;
+
+        let mut neighbors = DeviceMatrix::<u32>::new(NUM_QUERIES, limit)?;
+        let mut distances = DeviceMatrix::<f32>::new(NUM_QUERIES, limit)?;
+        self.index
+            .search(resources, params, &query, &mut neighbors, &mut distances)
+            .map_err(|err| anyhow!("failed to search cuVS CAGRA index: {err}"))?;
+
+        let neighbors = neighbors.to_host(resources)?;
+        let distances = distances.to_host(resources)?;
+        Ok(neighbors
+            .into_iter()
+            .zip(distances)
+            // Skip the slots CAGRA found no row for.
+            .filter_map(|(row, distance)| Some((*self.ids.get(row as usize)?, distance)))
+            .collect())
     }
 }
 
@@ -177,7 +208,29 @@ impl CuvsIndex {
 
     /// Vectors in the last built graph, deliberately not the staged row count.
     pub(super) fn count(&self) -> usize {
-        self.built.as_ref().map_or(0, |built| built.rows)
+        self.built.as_ref().map_or(0, |built| built.ids.len())
+    }
+
+    /// Searches the last built graph, so rows staged since then are not found.
+    pub(super) fn search(
+        &self,
+        query: &Vector,
+        limit: Limit,
+    ) -> anyhow::Result<Vec<(PrimaryId, Distance)>> {
+        validator::embedding_dimensions(query, self.params.dimensions)?;
+
+        let Some(built) = &self.built else {
+            return Ok(Vec::new());
+        };
+
+        let limit = limit.0.get().min(built.ids.len());
+        let search_params = self.params.to_search_params(limit)?;
+
+        built
+            .search(&self.resources, &search_params, query.as_slice(), limit)?
+            .into_iter()
+            .map(|(primary_id, distance)| Ok((primary_id, self.params.distance(distance)?)))
+            .collect()
     }
 
     /// Rebuilds from the staged rows if they changed, releasing their guards
@@ -213,6 +266,7 @@ mod tests {
     use super::*;
     use crate::Connectivity;
     use crate::ExpansionAdd;
+    use crate::ExpansionSearch;
     use cuvs::distance::DistanceType;
     use rstest::rstest;
     use std::num::NonZeroUsize;
@@ -227,6 +281,7 @@ mod tests {
             metric: DistanceType::L2Expanded,
             graph_degree: *Connectivity::default().as_ref(),
             intermediate_graph_degree: *ExpansionAdd::default().as_ref(),
+            expansion_search: *ExpansionSearch::default().as_ref(),
         }
     }
 
@@ -428,16 +483,43 @@ mod tests {
         assert!(index.stale, "the next tick must retry");
     }
 
-    #[test]
-    fn build_with_unaligned_dimensions_succeeds() {
-        // Not a multiple of 4, so cuVS sees a standard rather than a padded
-        // layout. CAGRA builds from either.
-        let mut index = CuvsIndex::new(params(3)).unwrap();
-        for (row, embedding) in many_vectors(256, 3).iter().enumerate() {
+    fn limit(value: usize) -> Limit {
+        Limit::from(NonZeroUsize::new(value).unwrap())
+    }
+
+    fn built_index(rows: usize) -> CuvsIndex {
+        let mut index = CuvsIndex::new(params(4)).unwrap();
+        for (row, embedding) in many_vectors(rows, 4).iter().enumerate() {
             index.add((row as u64).into(), embedding, AsyncInProgress::None);
         }
-
         index.build().unwrap();
-        assert_eq!(index.count(), 256);
+        index
+    }
+
+    #[rstest]
+    fn search_returns_at_most_every_row(#[values(1, 64, 512, 513, 1024, 2048)] value: usize) {
+        let index = built_index(1024);
+
+        let found = index.search(&vector(&[0.5; 4]), limit(value)).unwrap();
+
+        assert!(found.len() <= value.min(1024));
+    }
+
+    #[test]
+    fn search_rejects_a_query_of_the_wrong_dimensions() {
+        let index = built_index(256);
+
+        let err = index.search(&vector(&[1.0; 3]), limit(1)).unwrap_err();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<validator::Error>(),
+                Some(validator::Error::WrongEmbeddingDimension {
+                    expected: 4,
+                    actual: 3
+                })
+            ),
+            "got: {err}"
+        );
     }
 }

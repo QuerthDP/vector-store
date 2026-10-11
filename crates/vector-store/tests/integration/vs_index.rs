@@ -238,6 +238,7 @@ pub(crate) async fn setup_store_and_wait_for_index(
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn simple_create_search_delete_index(#[case] config: Config) {
     crate::enable_tracing();
@@ -1758,6 +1759,7 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config: Config) {
@@ -1931,6 +1933,7 @@ async fn empty_index_has_zero_count(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn empty_index_returns_empty_ann_results(#[case] config: Config) {
     crate::enable_tracing();
