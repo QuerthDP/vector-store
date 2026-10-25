@@ -236,7 +236,7 @@ impl CuvsIndex {
     /// Rebuilds from the staged rows if they changed, releasing their guards
     /// once it returns, even on failure, since a failure that repeats would
     /// otherwise stall the pipeline. A failure keeps the previous graph and
-    /// leaves the index stale, so the next tick retries.
+    /// leaves the index stale, so the next build retries.
     pub(super) fn build(&mut self) -> anyhow::Result<()> {
         if !self.stale {
             return Ok(());
@@ -480,7 +480,7 @@ mod tests {
         assert!(index.build().is_err());
         assert_eq!(index.count(), 256, "the previous graph must be kept");
         assert_eq!(index.pending.len(), 0, "the guards must not be held");
-        assert!(index.stale, "the next tick must retry");
+        assert!(index.stale, "the next build must retry");
     }
 
     fn limit(value: usize) -> Limit {
