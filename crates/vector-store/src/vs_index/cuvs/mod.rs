@@ -30,10 +30,9 @@ use index::CuvsIndex;
 use params::CagraParams;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -105,10 +104,10 @@ fn new(
     let (tx_modify, mut rx_modify) = mpsc::channel(channel_size);
     let (tx_search, mut rx_search) = mpsc::channel(channel_size);
     let (tx_gpu, mut rx_gpu) = mpsc::channel(channel_size);
-    let flush_queued = Arc::new(AtomicBool::new(false));
+    let built = Arc::new(Notify::new());
 
     let thread_key = index_key.clone();
-    let thread_flush = Arc::clone(&flush_queued);
+    let thread_built = Arc::clone(&built);
     thread::Builder::new()
         .name(format!("cuvs-{index_key}"))
         .spawn(move || {
@@ -131,7 +130,7 @@ fn new(
             while let Some(request) = rx_gpu.blocking_recv() {
                 handle(
                     &mut index,
-                    &thread_flush,
+                    &thread_built,
                     table.as_ref(),
                     &thread_key,
                     request,
@@ -146,8 +145,10 @@ fn new(
         async move {
             debug!("starting");
 
-            let mut interval = tokio::time::interval(build_interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Restarts after each build, so a long build can't trigger the next one right away.
+            let next_build = tokio::time::sleep(Duration::ZERO);
+            tokio::pin!(next_build);
+            let mut build_queued = false;
 
             loop {
                 tokio::select! {
@@ -162,12 +163,17 @@ fn new(
                             break;
                         }
                     }
-                    _ = interval.tick() => {
-                        if !flush_queued.swap(true, Ordering::Relaxed)
-                            && tx_gpu.send(Request::Flush).await.is_err()
-                        {
+                    _ = &mut next_build, if !build_queued => {
+                        build_queued = true;
+                        if tx_gpu.send(Request::Flush).await.is_err() {
                             break;
                         }
+                    }
+                    _ = built.notified(), if build_queued => {
+                        build_queued = false;
+                        next_build
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + build_interval);
                     }
                 }
             }
@@ -194,7 +200,7 @@ fn reject(msg: Message, err: anyhow::Error) {
 
 fn handle(
     index: &mut CuvsIndex,
-    flush_queued: &AtomicBool,
+    built: &Notify,
     table: &RwLock<impl TableSearch>,
     index_key: &IndexKey,
     request: Request,
@@ -204,7 +210,7 @@ fn handle(
             if let Err(err) = index.build() {
                 error!("Unable to build cuVS index {index_key}: {err}");
             }
-            flush_queued.store(false, Ordering::Relaxed);
+            built.notify_one();
         }
         Request::Message(Message::Modify(VsIndexModify::AddVector {
             primary_id,
