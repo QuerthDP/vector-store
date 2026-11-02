@@ -1,7 +1,10 @@
 #!/bin/bash
 #
 # Sets up a local conda env with `libcuvs` for building vector-store with `--features gpu`.
-# Usage: [sudo] ./scripts/setup-gpu [--verify]
+# Usage: [sudo] ./scripts/setup-gpu [--verify | --github-env]
+#
+# `--github-env` exports the build environment to the following GitHub
+# Actions steps instead of pointing `.cargo/config.toml` at the prefix.
 #
 # `sudo` is only needed when the prefix (`VECTOR_STORE_CUVS_GPU_PREFIX`,
 # default `/opt/vector-store-cuvs-gpu`) is not writable by the current user.
@@ -14,6 +17,30 @@ err() { echo "error: $*" >&2; }
 filter_conda_noise() {
     sed -e '/^#/d' -e '/To enable CUDA support, UCX requires/,/have been installed for you\.$/d' -e '/^$/d'
 }
+
+verify=false
+github_env=false
+for arg in "$@"; do
+    case "$arg" in
+        --verify) verify=true ;;
+        --github-env) github_env=true ;;
+        *)
+            err "unknown argument: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+if $github_env; then
+    if $verify; then
+        err "--verify checks the build set up by the cargo config, which --github-env leaves alone."
+        exit 1
+    fi
+    if [[ -z "${GITHUB_ENV:-}" || -z "${GITHUB_PATH:-}" ]]; then
+        err "--github-env only works in GitHub Actions (GITHUB_ENV or GITHUB_PATH is unset)."
+        exit 1
+    fi
+fi
 
 repo=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
 PREFIX="${VECTOR_STORE_CUVS_GPU_PREFIX:-/opt/vector-store-cuvs-gpu}"
@@ -43,7 +70,7 @@ command -v python3 &>/dev/null || { err "python3 is required (used to resolve co
 # When a non-default prefix is requested, rewrite those two lines in place to match,
 # so the build actually looks in $ENV_PREFIX instead of silently keeping the checked-in default.
 cargo_config="$repo/.cargo/config.toml"
-if ! grep -qF "CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"" "$cargo_config"; then
+if ! $github_env && ! grep -qF "CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"" "$cargo_config"; then
     log "Pointing $cargo_config at $ENV_PREFIX"
     sed -i -E "s#^CMAKE_PREFIX_PATH = \".*\"#CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"#" "$cargo_config"
     sed -i -E "s#-rpath,[^\"]*/lib#-rpath,$ENV_PREFIX/lib#" "$cargo_config"
@@ -152,11 +179,22 @@ else
     [[ $EUID -ne 0 ]] || chmod -R a+rX "$PREFIX"
 fi
 
-if [[ "${1:-}" == "--verify" ]]; then
+if $github_env; then
+    log "Exporting the build environment to the following steps"
+    mkdir -p "$PREFIX/path"
+    ln -sf "$ENV_PREFIX/bin/cmake" "$PREFIX/path/cmake"
+    echo "$PREFIX/path" >>"$GITHUB_PATH"
+    echo "CMAKE_PREFIX_PATH=$ENV_PREFIX" >>"$GITHUB_ENV"
+    # `RUSTFLAGS` replaces the `rustflags` of `.cargo/config.toml`,
+    # so it needs the rpath to `libcuvs` as well.
+    echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$ENV_PREFIX/lib" >>"$GITHUB_ENV"
+fi
+
+if $verify; then
     log "Verifying: cargo check -p vector-store --features gpu"
-    verify=(bash -lc "cd '$repo' && cargo check -p vector-store --features gpu")
-    [[ -z "${SUDO_USER:-}" ]] || verify=(runuser -u "$SUDO_USER" -- "${verify[@]}")
-    "${verify[@]}" || { err "Verification failed"; exit 1; }
+    check=(bash -lc "cd '$repo' && cargo check -p vector-store --features gpu")
+    [[ -z "${SUDO_USER:-}" ]] || check=(runuser -u "$SUDO_USER" -- "${check[@]}")
+    "${check[@]}" || { err "Verification failed"; exit 1; }
     log "Verification succeeded"
 fi
 
