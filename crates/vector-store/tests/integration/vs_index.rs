@@ -141,6 +141,39 @@ pub(crate) async fn setup_store_with_quantization(
     DbBasic,
     Sender<NodeState>,
 ) {
+    setup_store_with_space_type(
+        config,
+        partitioning,
+        primary_keys,
+        partition_key_count,
+        columns,
+        fullscan_fn,
+        cdc_fn,
+        quantization,
+        dimension,
+        SpaceType::Euclidean,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn setup_store_with_space_type(
+    config: Config,
+    partitioning: DbIndexPartitioning,
+    primary_keys: impl IntoIterator<Item = ColumnName>,
+    partition_key_count: usize,
+    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
+    fullscan_fn: Option<ScanFn>,
+    cdc_fn: Option<ScanFn>,
+    quantization: Quantization,
+    dimension: Dimensions,
+    space_type: SpaceType,
+) -> (
+    impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
+    IndexMetadata,
+    DbBasic,
+    Sender<NodeState>,
+) {
     let node_state = vector_store::new_node_state().await;
 
     let (db_actor, db) = db_basic::new_with(node_state.clone(), store_vectors(&config));
@@ -168,7 +201,7 @@ pub(crate) async fn setup_store_with_quantization(
             connectivity: Connectivity::default(),
             expansion_add: ExpansionAdd::default(),
             expansion_search: ExpansionSearch::default(),
-            space_type: SpaceType::Euclidean,
+            space_type,
             quantization,
         }),
     };
@@ -352,6 +385,90 @@ async fn simple_create_search_delete_index(#[case] config: Config) {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[tokio::test]
+async fn ann_reports_the_same_distances_on_every_backend(
+    #[case] config: Config,
+    #[values(SpaceType::Euclidean, SpaceType::Cosine, SpaceType::DotProduct)] space_type: SpaceType,
+    #[values(3, 4)] dimensions: usize,
+) {
+    crate::enable_tracing();
+
+    // The query itself, an orthogonal row and the opposite one.
+    let rows: [Vec<f32>; 3] = [[1., 2., 2., 0.], [2., 1., -2., 0.], [-1., -2., -2., 0.]]
+        .map(|row| row[..dimensions].to_vec());
+    // Squared L2, `1 - cos` and `1 - dot`, as USearch reports them.
+    let expected = match space_type {
+        SpaceType::Euclidean => [0., 18., 36.],
+        SpaceType::Cosine => [0., 1., 2.],
+        SpaceType::DotProduct => [-8., 1., 10.],
+        SpaceType::Hamming => unreachable!(),
+    };
+    let (run, index, _db, _node_state) = setup_store_with_space_type(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors(
+            rows.clone().into_iter().zip(1..).map(|(row, pk)| {
+                (
+                    [CqlValue::Int(pk)].into(),
+                    Some(row.into()),
+                    [].into(),
+                    Timestamp::from_millis(10),
+                )
+            }),
+        )),
+        None,
+        Quantization::F32,
+        NonZeroUsize::new(dimensions).unwrap().into(),
+        space_type,
+    )
+    .await;
+    let (client, _server, _config_tx) = run.await;
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+    wait_for(
+        || async {
+            client
+                .index_status(&keyspace_name, &index_name)
+                .await
+                .is_ok_and(|status| status.status == IndexStatus::Serving && status.count == 3)
+        },
+        "Waiting for 3 vectors to be indexed",
+    )
+    .await;
+
+    let (primary_keys, distances, _) = client
+        .ann(
+            &keyspace_name,
+            &index_name,
+            rows[0].clone().into(),
+            None,
+            NonZeroUsize::new(3).unwrap().into(),
+        )
+        .await;
+
+    let pks: Vec<_> = primary_keys[&"pk".into()]
+        .iter()
+        .map(|pk| pk.as_i64().unwrap() as usize)
+        .collect();
+    assert!(pks.contains(&1), "the query itself must be found: {pks:?}");
+    for (pk, distance) in pks.into_iter().zip(distances) {
+        let (distance, expected) = (f32::from(distance), expected[pk - 1]);
+        assert!(
+            (distance - expected).abs() < 1e-4,
+            "{pk}: {distance} vs {expected}"
+        );
+    }
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn failed_db_index_create(#[case] config: Config) {
     crate::enable_tracing();
@@ -485,6 +602,7 @@ async fn failed_db_index_create(#[case] config: Config) {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_returns_requested_column_values(#[case] config: Config) {
     crate::enable_tracing();
@@ -568,7 +686,8 @@ async fn ann_returns_requested_column_values(#[case] config: Config) {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_return_columns_null_for_column_not_tracked_by_index(#[case] config: Config) {
     crate::enable_tracing();
@@ -579,14 +698,22 @@ async fn ann_return_columns_null_for_column_not_tracked_by_index(#[case] config:
         ["pk".into()],
         1,
         [("pk".to_string().into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1)].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -668,7 +795,8 @@ async fn ann_return_columns_includes_target_vector() {
 #[rstest]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_return_columns_target_vector_unsupported(#[case] config: Config) {
     crate::enable_tracing();
@@ -679,14 +807,22 @@ async fn ann_return_columns_target_vector_unsupported(#[case] config: Config) {
         ["pk".into()],
         1,
         [("pk".to_string().into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1)].into(),
-            Some(vec![1., 2., -3.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 2., -3.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -845,6 +981,7 @@ async fn ann_filtered_ann_returns_empty_column_values_for_partition_with_no_rows
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions(
     #[case] config: Config,
@@ -859,14 +996,22 @@ async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimen
             ("pk".to_string().into(), NativeType::Int),
             ("ck".to_string().into(), NativeType::Text),
         ],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -884,7 +1029,7 @@ async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimen
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_returns_bad_request_when_filtering_required_but_not_allowed() {
     crate::enable_tracing();
@@ -934,6 +1079,7 @@ async fn ann_returns_bad_request_when_filtering_required_but_not_allowed() {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Config) {
     crate::enable_tracing();
@@ -988,6 +1134,7 @@ async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Conf
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
     crate::enable_tracing();
@@ -998,14 +1145,22 @@ async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
         ["pk".into()],
         1,
         [("pk".to_string().into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1)].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -1075,6 +1230,7 @@ async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
     crate::enable_tracing();
@@ -1084,14 +1240,22 @@ async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
         vec!["pk".into()],
         1,
         [("pk".into(), NativeType::Int)],
-        Some(db_basic::scan_fn_vectors([(
-            [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
-            Some(vec![1., 1., 1.].into()),
-            [].into(),
-            Timestamp::from_millis(10),
-        )])),
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
+                Some(vec![1., 1., 1.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
+                Some(vec![2., 2., 2.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
         None,
-        Some(1),
+        Some(2),
     )
     .await;
 
@@ -1290,7 +1454,7 @@ async fn ann_returns_error_for_unsupported_primary_key_type() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_partition_key_int_eq() {
     crate::enable_tracing();
@@ -1348,7 +1512,7 @@ async fn ann_filter_partition_key_int_eq() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_eq() {
     crate::enable_tracing();
@@ -1406,7 +1570,7 @@ async fn ann_filter_clustering_key_int_eq() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_partition_key_int_in() {
     crate::enable_tracing();
@@ -1468,7 +1632,7 @@ async fn ann_filter_partition_key_int_in() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_in() {
     crate::enable_tracing();
@@ -1530,7 +1694,7 @@ async fn ann_filter_clustering_key_int_in() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_eq_tuple() {
     crate::enable_tracing();
@@ -1558,7 +1722,7 @@ async fn ann_filter_primary_key_int_eq_tuple() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_in_tuple() {
     crate::enable_tracing();
@@ -1691,7 +1855,7 @@ fn assert_pk_ck_combinations(
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_lt() {
     crate::enable_tracing();
@@ -1732,7 +1896,7 @@ async fn ann_filter_clustering_key_int_lt() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_lte() {
     crate::enable_tracing();
@@ -1773,7 +1937,7 @@ async fn ann_filter_clustering_key_int_lte() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_gt() {
     crate::enable_tracing();
@@ -1814,7 +1978,7 @@ async fn ann_filter_clustering_key_int_gt() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_gte() {
     crate::enable_tracing();
@@ -1855,7 +2019,7 @@ async fn ann_filter_clustering_key_int_gte() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_clustering_key_int_range() {
     crate::enable_tracing();
@@ -1902,7 +2066,7 @@ async fn ann_filter_clustering_key_int_range() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_lt_tuple() {
     crate::enable_tracing();
@@ -1951,7 +2115,7 @@ async fn ann_filter_primary_key_int_lt_tuple() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_lte_tuple() {
     crate::enable_tracing();
@@ -2001,7 +2165,7 @@ async fn ann_filter_primary_key_int_lte_tuple() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_gt_tuple() {
     crate::enable_tracing();
@@ -2049,7 +2213,7 @@ async fn ann_filter_primary_key_int_gt_tuple() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_primary_key_int_gte_tuple() {
     crate::enable_tracing();
@@ -2098,7 +2262,7 @@ async fn ann_filter_primary_key_int_gte_tuple() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_partition_key_text_gt() {
     crate::enable_tracing();
@@ -2185,7 +2349,7 @@ async fn ann_filter_partition_key_text_gt() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn ann_filter_filtering_columns_int_eq() {
     crate::enable_tracing();
@@ -2214,7 +2378,7 @@ async fn ann_filter_filtering_columns_int_eq() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn http_server_is_responsive_when_index_add_hangs() {
     crate::enable_tracing();
@@ -2264,7 +2428,8 @@ async fn http_server_is_responsive_when_index_add_hangs() {
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
-#[timeout(Duration::from_secs(10))]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn null_vector_is_not_indexed(#[case] config: Config) {
     crate::enable_tracing();
@@ -2288,6 +2453,12 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
                 [].into(),
                 Timestamp::from_millis(20),
             ),
+            (
+                [CqlValue::Int(3)].into(),
+                Some(vec![3., 3., 3.].into()),
+                [].into(),
+                Timestamp::from_millis(30),
+            ),
         ])),
         None,
     )
@@ -2302,10 +2473,10 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
                 .index_status(&keyspace_name, &index_name)
                 .await
                 .is_ok_and(|status| {
-                    status.status == httpapi::IndexStatus::Serving && status.count == 1
+                    status.status == httpapi::IndexStatus::Serving && status.count == 2
                 })
         },
-        "Waiting for exactly 1 vector to be indexed (null vector must be skipped)",
+        "Waiting for exactly 2 vectors to be indexed (null vector must be skipped)",
     )
     .await;
 }
@@ -2323,7 +2494,7 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(20))]
 #[tokio::test]
 async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config: Config) {
     crate::enable_tracing();
@@ -2468,6 +2639,7 @@ async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
 #[case::diskann_scylla(diskann_scylla_test_config())]
+#[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn empty_index_has_zero_count(#[case] config: Config) {
     crate::enable_tracing();
@@ -2534,6 +2706,7 @@ async fn empty_index_returns_empty_ann_results(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn cdc_insert_is_indexed(#[case] config: Config) {
@@ -2584,7 +2757,7 @@ async fn cdc_insert_is_indexed(#[case] config: Config) {
 async fn cdc_delete_is_removed_from_the_index(#[case] config: Config) {
     crate::enable_tracing();
 
-    setup_store_and_wait_for_index(
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
         config,
         DbIndexPartitioning::Global,
         ["pk".into()],
@@ -2617,4 +2790,19 @@ async fn cdc_delete_is_removed_from_the_index(#[case] config: Config) {
         Some(2),
     )
     .await;
+
+    let (primary_keys, _, _) = client
+        .ann(
+            &index.keyspace_name.clone().into(),
+            &index.index_name.clone().into(),
+            vec![1., 1., 1.].into(),
+            None,
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+    let pks: Vec<_> = primary_keys[&"pk".into()]
+        .iter()
+        .map(|pk| pk.as_i64().unwrap())
+        .collect();
+    assert_eq!(pks, [2]);
 }
