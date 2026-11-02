@@ -2706,6 +2706,7 @@ async fn empty_index_returns_empty_ann_results(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn cdc_insert_is_indexed(#[case] config: Config) {
