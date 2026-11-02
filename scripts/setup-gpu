@@ -14,7 +14,8 @@ filter_conda_noise() {
 
 repo=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
 PREFIX="${VECTOR_STORE_CUVS_GPU_PREFIX:-/opt/vector-store-cuvs-gpu}"
-MINIFORGE_PREFIX="$PREFIX/miniforge"
+MICROMAMBA_VERSION="2.10.0-0"
+micromamba="$PREFIX/bin/micromamba"
 ENV_PREFIX="$PREFIX/env"
 
 if [[ $EUID -ne 0 ]] || [[ -z "${SUDO_USER:-}" ]]; then
@@ -49,49 +50,40 @@ cuvs_sys_version=$(awk '/^name = "cuvs-sys"$/{getline; print; exit}' "$repo/Carg
 major_minor=$(echo "$cuvs_sys_version" | cut -d. -f1-2)
 log "cuvs-sys is resolved to version $cuvs_sys_version (need libcuvs $major_minor.x)"
 
-if [[ ! -x "$MINIFORGE_PREFIX/bin/conda" ]]; then
+if [[ "$("$micromamba" --version 2>/dev/null)" != "${MICROMAMBA_VERSION%-*}" ]]; then
     arch=$(uname -m)
     case "$arch" in
-        x86_64 | aarch64) ;;
+        x86_64)
+            platform=linux-64
+            expected_sha256=701f39c06f8e6a670a0e186c8479b9e5c0502a2f0cda6cef65d83bdd2875e8bd
+            ;;
+        aarch64)
+            platform=linux-aarch64
+            expected_sha256=3bb56786e21b9b24024f599fe9185b4a59dc3f9f59937a42311ee583adbbb23c
+            ;;
         *)
-            err "unsupported architecture: $arch (Miniforge only auto-installs for x86_64/aarch64)"
+            err "unsupported architecture: $arch (micromamba only auto-installs for x86_64/aarch64)"
             exit 1
             ;;
     esac
 
-    log "Resolving the latest Miniforge Linux/$arch release"
-    read -r installer_name installer_url checksum_url <<<"$(python3 - "$arch" <<'PY'
-import json, sys, urllib.request
-arch = sys.argv[1]
-data = json.load(urllib.request.urlopen(
-    "https://api.github.com/repos/conda-forge/miniforge/releases/latest", timeout=60))
-assets = {a["name"]: a["browser_download_url"] for a in data["assets"]}
-suffix = f"-Linux-{arch}.sh"
-name = next(n for n in assets if n.startswith("Miniforge3-") and n.endswith(suffix) and n + ".sha256" in assets)
-print(name, assets[name], assets[name + ".sha256"])
-PY
-)" || { err "could not resolve the latest Miniforge release for $arch."; exit 1; }
-
-    log "Installing Miniforge ($installer_name) into $MINIFORGE_PREFIX"
-    mkdir -p "$PREFIX"
+    url="https://github.com/mamba-org/micromamba-releases/releases/download/$MICROMAMBA_VERSION/micromamba-$platform"
+    log "Installing micromamba $MICROMAMBA_VERSION into $micromamba"
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' EXIT
-    tmp_installer="$tmp_dir/$installer_name"
-    curl -fL --progress-bar "$installer_url" -o "$tmp_installer"
-    curl -fL "$checksum_url" -o "$tmp_installer.sha256"
+    curl -fL --progress-bar "$url" -o "$tmp_dir/micromamba"
 
-    expected_sha256=$(awk '{print $1}' "$tmp_installer.sha256")
-    actual_sha256=$(sha256sum "$tmp_installer" | awk '{print $1}')
-    if [[ -z "$expected_sha256" ]] || [[ "$expected_sha256" != "$actual_sha256" ]]; then
-        err "Miniforge installer checksum mismatch (expected $expected_sha256, got $actual_sha256)"
+    actual_sha256=$(sha256sum "$tmp_dir/micromamba" | awk '{print $1}')
+    if [[ "$expected_sha256" != "$actual_sha256" ]]; then
+        err "micromamba checksum mismatch (expected $expected_sha256, got $actual_sha256)"
         exit 1
     fi
 
-    bash "$tmp_installer" -b -p "$MINIFORGE_PREFIX"
+    mkdir -p "$PREFIX/bin"
+    install -m 755 "$tmp_dir/micromamba" "$micromamba"
     rm -rf "$tmp_dir"
     trap - EXIT
 fi
-export PATH="$MINIFORGE_PREFIX/bin:$PATH"
 
 log "Resolving the latest libcuvs $major_minor.x package"
 resolved=$(python3 - "$major_minor" <<'PY'
@@ -139,7 +131,7 @@ conda_action="create"
 [[ -d "$ENV_PREFIX/conda-meta" ]] && conda_action="install"
 log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) conda env at $ENV_PREFIX"
 
-conda "$conda_action" -y --solver=libmamba -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
+"$micromamba" "$conda_action" -y -r "$PREFIX/micromamba" -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
     "$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" \
     "cuda-cudart=$cuda_version.*" cmake pkg-config 2>&1 | filter_conda_noise
 
