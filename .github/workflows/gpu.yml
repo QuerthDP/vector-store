@@ -1,0 +1,84 @@
+name: GPU
+
+on:
+  pull_request:
+    branches:
+    - 'cuvs-master'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: full
+  # A full parallel build overloads the runner.
+  CARGO_BUILD_JOBS: 8
+
+# The GPU runner is a self-hosted machine, so only branches of this repository
+# may use it. It only needs an NVIDIA driver, a C/C++ compiler, `curl`
+# and `python3`; the jobs set up everything else.
+jobs:
+  cargo-clippy-gpu:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
+
+    - name: Setup rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      with:
+        components: clippy
+        cache: false
+
+    - name: Setup cuVS
+      run: scripts/setup-gpu --github-env
+      env:
+        VECTOR_STORE_CUVS_GPU_PREFIX: ${{ runner.tool_cache }}/vector-store-cuvs-gpu
+
+    - name: Print rustc version
+      run: rustc --version
+
+    - name: Print cargo-clippy version
+      run: cargo clippy --version
+
+    - name: Run cargo-clippy checks for gpu feature flag
+      run: cargo clippy --features vector-store/gpu --all-targets --workspace -- -Dwarnings
+      env:
+        CARGO_TARGET_DIR: ${{ runner.tool_cache }}/vector-store-target
+        CARGO_INCREMENTAL: 1
+
+  cargo-test-gpu:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        persist-credentials: false
+
+    - name: Setup rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      with:
+        cache: false
+
+    - name: Setup cuVS
+      run: scripts/setup-gpu --github-env
+      env:
+        VECTOR_STORE_CUVS_GPU_PREFIX: ${{ runner.tool_cache }}/vector-store-cuvs-gpu
+
+    - name: Print rustc version
+      run: rustc --version
+
+    - name: Run cargo-test checks for gpu feature flag
+      run: cargo test --features dev-tools,slow-test-hooks,vector-store/gpu --verbose --all-targets --workspace
+      env:
+        CARGO_TARGET_DIR: ${{ runner.tool_cache }}/vector-store-target
+        CARGO_INCREMENTAL: 1
