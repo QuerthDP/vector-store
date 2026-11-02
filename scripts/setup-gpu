@@ -134,15 +134,23 @@ PY
 read -r channel pkg_name pkg_version pkg_build cuda_version <<< "$resolved"
 log "Resolved: $channel::$pkg_name=$pkg_version=$pkg_build (cuda $cuda_version)"
 
-conda_action="create"
-[[ -d "$ENV_PREFIX/conda-meta" ]] && conda_action="install"
-log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) conda env at $ENV_PREFIX"
+specs=("$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" "cuda-cudart=$cuda_version.*" cmake pkg-config)
+# The stamp is written only after a complete install, so an interrupted one
+# is retried, and a change of any requested package installs again.
+stamp="$ENV_PREFIX/.setup-gpu-stamp"
+if [[ -f "$stamp" && "$(<"$stamp")" == "$channel ${specs[*]}" ]]; then
+    log "$pkg_name $pkg_version ($pkg_build) is already installed in $ENV_PREFIX"
+else
+    conda_action="create"
+    [[ -d "$ENV_PREFIX/conda-meta" ]] && conda_action="install"
+    log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) conda env at $ENV_PREFIX"
 
-"$micromamba" "$conda_action" -y -r "$PREFIX/micromamba" -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
-    "$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" \
-    "cuda-cudart=$cuda_version.*" cmake pkg-config 2>&1 | filter_conda_noise
+    "$micromamba" "$conda_action" -y -r "$PREFIX/micromamba" -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
+        "${specs[@]}" 2>&1 | filter_conda_noise
+    echo "$channel ${specs[*]}" >"$stamp"
 
-[[ $EUID -ne 0 ]] || chmod -R a+rX "$PREFIX"
+    [[ $EUID -ne 0 ]] || chmod -R a+rX "$PREFIX"
+fi
 
 if [[ "${1:-}" == "--verify" ]]; then
     log "Verifying: cargo check -p vector-store --features gpu"
