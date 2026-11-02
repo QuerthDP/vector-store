@@ -59,6 +59,8 @@ impl TestClient {
                 vector,
                 filter,
                 limit,
+                routing: true,
+                return_columns: vec![],
             })
             .await
     }

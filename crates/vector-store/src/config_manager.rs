@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::Config;
@@ -15,6 +15,7 @@ use itertools::Itertools;
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -448,11 +449,21 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         );
     }
 
-    config.use_diskann = env("VECTOR_STORE_USE_DISKANN")
-        .unwrap_or("false".into())
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("Unable to parse VECTOR_STORE_USE_DISKANN env (bool)"))?;
+    if let Ok(diskann_max_points) = env("VECTOR_STORE_DISKANN_MAX_POINTS") {
+        let max_points = diskann_max_points
+            .trim()
+            .parse::<NonZeroUsize>()
+            .map_err(|_| {
+                anyhow!("Unable to parse VECTOR_STORE_DISKANN_MAX_POINTS env (positive integer)")
+            })?;
+        config.diskann_max_points = Some(max_points);
+    }
+
+    if let Ok(diskann_backend) = env("VECTOR_STORE_DISKANN_BACKEND") {
+        config.diskann_backend = Some(diskann_backend.trim().parse().map_err(|_| {
+            anyhow!("Unable to parse VECTOR_STORE_DISKANN_BACKEND env (inmem/scylla)")
+        })?);
+    }
 
     config.use_gpu = env("VECTOR_STORE_USE_GPU")
         .unwrap_or("false".into())
@@ -607,6 +618,7 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DiskannBackendKind;
     use secrecy::ExposeSecret;
     use std::collections::HashMap;
     use std::io::Write;
@@ -963,15 +975,53 @@ mod tests {
         let env = mock_env(HashMap::new());
         let config = load_config(env).await.unwrap();
         assert!(config.diskann_alpha.is_none());
-        assert!(!config.use_diskann);
+        assert!(config.diskann_max_points.is_none());
+        assert_eq!(config.diskann_backend, None);
 
         let env = mock_env(HashMap::from([
             ("VECTOR_STORE_DISKANN_ALPHA", "1.2".into()),
-            ("VECTOR_STORE_USE_DISKANN", "true".into()),
+            ("VECTOR_STORE_DISKANN_MAX_POINTS", "500000".into()),
+            ("VECTOR_STORE_DISKANN_BACKEND", "scylla".into()),
         ]));
         let config = load_config(env).await.unwrap();
         assert_eq!(config.diskann_alpha, Some(DiskannAlpha::new(1.2).unwrap()));
-        assert!(config.use_diskann);
+        assert_eq!(
+            config.diskann_max_points,
+            Some(NonZeroUsize::new(500_000).unwrap())
+        );
+        assert_eq!(config.diskann_backend, Some(DiskannBackendKind::Scylla));
+    }
+
+    #[tokio::test]
+    async fn load_config_diskann_backend_unknown_errors() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_DISKANN_BACKEND",
+            "nvme".into(),
+        )]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unable to parse VECTOR_STORE_DISKANN_BACKEND")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_config_diskann_max_points_zero_errors() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_DISKANN_MAX_POINTS",
+            "0".into(),
+        )]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unable to parse VECTOR_STORE_DISKANN_MAX_POINTS")
+        );
     }
 
     #[tokio::test]

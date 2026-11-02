@@ -1,19 +1,22 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::Filter;
 use crate::IndexKey;
 use crate::IndexName;
 use crate::IndexOptionsFts;
+use crate::IndexOptionsPattern;
 use crate::IndexOptionsVs;
 use crate::KeyspaceName;
 use crate::Progress;
 use crate::Quantization;
+use crate::QueryError;
 use crate::Restriction;
 use crate::SimilarityScore;
 use crate::SpaceType;
+use crate::cql_types;
 use crate::distance;
 use crate::engine::Engine;
 use crate::engine::EngineExt;
@@ -25,14 +28,19 @@ use crate::info::Info;
 use crate::internals::Internals;
 use crate::internals::InternalsExt;
 use crate::metrics::Metrics;
+use crate::metrics::OP_ANN;
+use crate::metrics::OP_BM25;
+use crate::metrics::OP_HIGHLIGHT;
+use crate::metrics::OP_LIKE;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::PatternIndex;
+use crate::pattern_index::PatternIndexExt;
 use crate::perf;
 use crate::vector;
 use crate::vs_index;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::VsIndexSearchExt;
-use anyhow::anyhow;
 use anyhow::bail;
 use axum::Router;
 use axum::extract;
@@ -49,38 +57,25 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::put;
 use axum_server_dual_protocol::Protocol;
-use bigdecimal::BigDecimal;
+use futures::future;
 use httpapi::DataType;
 use httpapi::FulltextIndexOptions;
 use httpapi::IndexInfo;
 use httpapi::IndexOptions;
+use httpapi::PatternIndexOptions;
 use httpapi::SimilarityFunction;
 use httpapi::VectorIndexOptions;
 use itertools::Itertools;
-use num_bigint::BigInt;
 use prometheus::Encoder;
 use prometheus::ProtobufEncoder;
 use prometheus::TextEncoder;
-use regex::Regex;
 use scylla::cluster::metadata::NativeType;
-use scylla::value::CqlDecimal;
-use scylla::value::CqlTimeuuid;
 use scylla::value::CqlValue;
-use scylla::value::CqlVarint;
-use serde_json::Number;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::num::NonZero;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::RwLock;
-use time::Date;
-use time::OffsetDateTime;
-use time::Time;
-use time::format_description::well_known::Iso8601;
-use time::format_description::well_known::iso8601::Config;
-use time::format_description::well_known::iso8601::TimePrecision;
 use tokio::sync::mpsc::Sender;
 use tower_http::trace::TraceLayer;
 use tracing::debug;
@@ -96,10 +91,10 @@ use utoipa_swagger_ui::SwaggerUi;
         description = "REST API for ScyllaDB Vector Store indexing service. Provides capabilities for executing vector search queries, \
         managing indexes, and checking service status.",
         license(
-            name = "LicenseRef-ScyllaDB-Source-Available-1.0"
+            name = "LicenseRef-ScyllaDB-Source-Available-1.1"
         ),
         // version should be updated manually when there are changes in API
-        version = "3.0.0"
+        version = "3.2.0"
     ),
     tags(
         (
@@ -169,6 +164,7 @@ pub fn api() -> utoipa::openapi::OpenApi {
     new_open_api_router().1
 }
 
+#[allow(deprecated)]
 fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(
@@ -178,6 +174,8 @@ fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi)
                 .routes(routes!(get_index_info))
                 .routes(routes!(post_index_ann))
                 .routes(routes!(post_index_bm25))
+                .routes(routes!(post_index_highlight))
+                .routes(routes!(post_index_like))
                 .routes(routes!(get_info))
                 .routes(routes!(get_status)),
         )
@@ -257,15 +255,17 @@ impl From<&IndexOptionsVs> for VectorIndexOptions {
 }
 
 impl From<&IndexOptionsFts> for FulltextIndexOptions {
-    fn from(_options: &IndexOptionsFts) -> Self {
-        // The service does not yet track per-index full-text options,
-        // and the full-text backend applies a fixed "standard" analyzer with
-        // token positions enabled.
-        // Report those defaults until the options are modeled.
+    fn from(options: &IndexOptionsFts) -> Self {
         FulltextIndexOptions {
-            analyzer: "standard".to_string(),
-            positions: true,
+            analyzer: options.analyzer.to_string(),
+            positions: *options.positions.as_ref(),
         }
+    }
+}
+
+impl From<&IndexOptionsPattern> for PatternIndexOptions {
+    fn from(_options: &IndexOptionsPattern) -> Self {
+        PatternIndexOptions {}
     }
 }
 
@@ -291,9 +291,11 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
     get,
     path = "/api/v1/indexes",
     tag = "scylla-vector-store-index",
-    description = "Returns the list of indexes managed by the Vector Store indexing service. \
+    description = "Returns the list of indexes managed by the Vector Store indexing service, each with its current operational status, \
+    the total number of items indexed and the progress of the initial table scan that backfills it. \
     The list includes both vector and fulltext indexes in any state (initializing, available/built, destroying). \
-    Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB.",
+    Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB. \
+    An index whose item count cannot be obtained, e.g. because it is being removed while the request is served, is omitted from the list.",
     responses(
         (
             status = 200,
@@ -312,7 +314,10 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
                         "search_beam_width": 64,
                         "similarity_function": "COSINE",
                         "quantization": "F32"
-                    }
+                    },
+                    "status": "SERVING",
+                    "count": 12345,
+                    "build_progress": 100.0
                 },
                 {
                     "keyspace": "my_keyspace",
@@ -321,7 +326,10 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
                         "type": "fulltext",
                         "analyzer": "standard",
                         "positions": true
-                    }
+                    },
+                    "status": "BOOTSTRAPPING",
+                    "count": 42,
+                    "build_progress": 37.5
                 }
             ])
         )
@@ -329,21 +337,62 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
 )]
 
 async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
-    let indexes_guard = state.indexes.read().unwrap();
+    let entries: Vec<_> = {
+        let indexes = state.indexes.read().unwrap();
+        indexes
+            .iter_vs()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    IndexOptions::Vector(entry.options().into()),
+                    IndexSender::Vs(entry.index().clone()),
+                    entry.status(),
+                    entry.progress(),
+                )
+            })
+            .chain(indexes.iter_fts().map(|(key, entry)| {
+                (
+                    key.clone(),
+                    IndexOptions::Fulltext(entry.options().into()),
+                    IndexSender::Fts(entry.index().clone()),
+                    entry.status(),
+                    entry.progress(),
+                )
+            }))
+            .chain(indexes.iter_pattern().map(|(key, entry)| {
+                (
+                    key.clone(),
+                    IndexOptions::Pattern(entry.options().into()),
+                    IndexSender::Pattern(entry.index().clone()),
+                    entry.status(),
+                    entry.progress(),
+                )
+            }))
+            .collect()
+    };
 
-    let indexes: Vec<_> = indexes_guard
-        .iter_vs()
-        .map(|(key, entry)| IndexInfo {
-            keyspace: key.keyspace().into(),
-            index: key.index().into(),
-            options: IndexOptions::Vector(entry.options().into()),
-        })
-        .chain(indexes_guard.iter_fts().map(|(key, entry)| IndexInfo {
-            keyspace: key.keyspace().into(),
-            index: key.index().into(),
-            options: IndexOptions::Fulltext(entry.options().into()),
-        }))
-        .collect();
+    let indexes: Vec<_> = future::join_all(entries.into_iter().map(
+        |(key, options, index, status, progress)| async move {
+            match index.count(key.clone()).await {
+                Ok(count) => Some(IndexInfo {
+                    keyspace: key.keyspace().into(),
+                    index: key.index().into(),
+                    options,
+                    status: status.into(),
+                    count,
+                    build_progress: progress_to_percentage(progress),
+                }),
+                Err(err) => {
+                    debug!("get_indexes: index.count request error for {key}: {err}");
+                    None
+                }
+            }
+        },
+    ))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
 
     (StatusCode::OK, response::Json(indexes)).into_response()
 }
@@ -351,6 +400,22 @@ async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
 /// A human-readable description of the error that occurred.
 #[derive(utoipa::ToSchema)]
 struct ErrorMessage(#[allow(dead_code)] String);
+
+enum IndexSender {
+    Vs(Sender<VsIndexSearch>),
+    Fts(Sender<FtsIndex>),
+    Pattern(Sender<PatternIndex>),
+}
+
+impl IndexSender {
+    async fn count(&self, index_key: IndexKey) -> anyhow::Result<usize> {
+        match self {
+            IndexSender::Vs(index) => index.count(index_key).await,
+            IndexSender::Fts(index) => index.count(index_key).await,
+            IndexSender::Pattern(index) => index.count(index_key).await,
+        }
+    }
+}
 
 impl From<crate::node_state::IndexStatus> for httpapi::IndexStatus {
     fn from(status: crate::node_state::IndexStatus) -> Self {
@@ -366,9 +431,8 @@ impl From<crate::node_state::IndexStatus> for httpapi::IndexStatus {
     get,
     path = "/api/v1/indexes/{keyspace}/{index}/status",
     tag = "scylla-vector-store-index",
-    description = "Retrieves the current operational status and item count for a specific index. \
-    The response includes the index's state and the total number of items currently indexed (excluding tombstoned or deleted entries). \
-    This endpoint enables clients to monitor index readiness and data availability for search operations.",
+    description = "Returns the same information about a single index as `/api/v1/indexes/{keyspace}/{index}`. \
+    Deprecated. Use that endpoint instead.",
     params(
         ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
         ("index" = httpapi::IndexName, Path, description = "The name of the ScyllaDB index within the specified keyspace to check status of.")
@@ -376,101 +440,7 @@ impl From<crate::node_state::IndexStatus> for httpapi::IndexStatus {
     responses(
         (
             status = 200,
-            description = "Successful operation. Returns the current operational status of the specified index, including its state \
-            and the total number of items currently indexed.",
-            body = httpapi::IndexStatusResponse,
-            content_type = "application/json",
-            example = json!({
-                "status": "SERVING",
-                "count": 12345,
-                "build_progress": 100.0
-            })
-        ),
-        (
-            status = 404,
-            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
-            content_type = "application/json",
-            body = ErrorMessage
-        ),
-        (
-            status = 500,
-            description = "Error while checking index state or counting vectors. Possible causes: internal error, or issues accessing the database.",
-            content_type = "application/json",
-            body = ErrorMessage
-        )
-    )
-)]
-async fn get_index_status(
-    State(state): State<RoutesInnerState>,
-    Path((keyspace_name, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
-) -> Response {
-    let keyspace_name: crate::KeyspaceName = keyspace_name.into();
-    let index_name: crate::IndexName = index_name.into();
-    let index_key = IndexKey::new(&keyspace_name, &index_name);
-
-    enum IndexSender {
-        Vs(Sender<VsIndexSearch>),
-        Fts(Sender<FtsIndex>),
-    }
-
-    let (index, status, progress) = {
-        let indexes = state.indexes.read().unwrap();
-        if let Some(entry) = indexes.get_vs(&index_key) {
-            (
-                IndexSender::Vs(entry.index().clone()),
-                entry.status(),
-                entry.progress(),
-            )
-        } else if let Some(entry) = indexes.get_fts(&index_key) {
-            (
-                IndexSender::Fts(entry.index().clone()),
-                entry.status(),
-                entry.progress(),
-            )
-        } else {
-            let msg = format!("missing index: {keyspace_name}.{index_name}");
-            debug!("get_index_status: {msg}");
-            return (StatusCode::NOT_FOUND, msg).into_response();
-        }
-    };
-
-    let count_result = match index {
-        IndexSender::Vs(s) => s.count(index_key).await,
-        IndexSender::Fts(s) => s.count(index_key).await,
-    };
-    match count_result {
-        Err(err) => {
-            let msg = format!("index.count request error: {err}");
-            debug!("get_index_status: {msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-        }
-        Ok(count) => (
-            StatusCode::OK,
-            response::Json(httpapi::IndexStatusResponse {
-                status: status.into(),
-                count,
-                build_progress: progress_to_percentage(progress),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/indexes/{keyspace}/{index}",
-    tag = "scylla-vector-store-index",
-    description = "Retrieves information about a specific index, including its search type and the options \
-    it was created with. This is the same information reported per-entry by the `/api/v1/indexes` listing, \
-    scoped to a single index.",
-    params(
-        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
-        ("index" = httpapi::IndexName, Path, description = "The name of the ScyllaDB index within the specified keyspace.")
-    ),
-    responses(
-        (
-            status = 200,
-            description = "Successful operation. Returns the index's type and creation options.",
+            description = "Successful operation. Returns the index's type, creation options, and the status it currently reports.",
             body = IndexInfo,
             content_type = "application/json",
             example = json!({
@@ -484,12 +454,77 @@ async fn get_index_status(
                     "search_beam_width": 64,
                     "similarity_function": "COSINE",
                     "quantization": "F32"
-                }
+                },
+                "status": "SERVING",
+                "count": 12345,
+                "build_progress": 100.0
             })
         ),
         (
             status = 404,
             description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while checking index state or counting indexed items. Possible causes: internal error, or issues accessing the database.",
+            content_type = "application/json",
+            body = ErrorMessage
+        )
+    )
+)]
+#[deprecated(note = "use get_index_info at /api/v1/indexes/{keyspace}/{index}")]
+async fn get_index_status(
+    state: State<RoutesInnerState>,
+    path: Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+) -> Response {
+    get_index_info(state, path).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/indexes/{keyspace}/{index}",
+    tag = "scylla-vector-store-index",
+    description = "Retrieves information about a specific index: its search type, the options it was created with, \
+    its current operational status, the total number of items indexed and the progress of the initial table scan \
+    that backfills it. Each entry of the `/api/v1/indexes` listing carries the same information.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the ScyllaDB index within the specified keyspace.")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Successful operation. Returns the index's type, creation options, and the status it currently reports.",
+            body = IndexInfo,
+            content_type = "application/json",
+            example = json!({
+                "keyspace": "my_keyspace",
+                "index": "my_vector_index",
+                "options": {
+                    "type": "vector",
+                    "dimensions": 384,
+                    "maximum_node_connections": 16,
+                    "construction_beam_width": 128,
+                    "search_beam_width": 64,
+                    "similarity_function": "COSINE",
+                    "quantization": "F32"
+                },
+                "status": "SERVING",
+                "count": 12345,
+                "build_progress": 100.0
+            })
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while checking index state or counting indexed items. Possible causes: internal error, or issues accessing the database.",
             content_type = "application/json",
             body = ErrorMessage
         )
@@ -503,26 +538,55 @@ async fn get_index_info(
     let index_name: crate::IndexName = index_name.into();
     let index_key = IndexKey::new(&keyspace_name, &index_name);
 
-    let indexes = state.indexes.read().unwrap();
-    let info = if let Some(entry) = indexes.get_vs(&index_key) {
-        IndexInfo {
-            keyspace: keyspace_name.into(),
-            index: index_name.into(),
-            options: IndexOptions::Vector(entry.options().into()),
+    let (options, index, status, progress) = {
+        let indexes = state.indexes.read().unwrap();
+        if let Some(entry) = indexes.get_vs(&index_key) {
+            (
+                IndexOptions::Vector(entry.options().into()),
+                IndexSender::Vs(entry.index().clone()),
+                entry.status(),
+                entry.progress(),
+            )
+        } else if let Some(entry) = indexes.get_fts(&index_key) {
+            (
+                IndexOptions::Fulltext(entry.options().into()),
+                IndexSender::Fts(entry.index().clone()),
+                entry.status(),
+                entry.progress(),
+            )
+        } else if let Some(entry) = indexes.get_pattern(&index_key) {
+            (
+                IndexOptions::Pattern(entry.options().into()),
+                IndexSender::Pattern(entry.index().clone()),
+                entry.status(),
+                entry.progress(),
+            )
+        } else {
+            let msg = format!("missing index: {keyspace_name}.{index_name}");
+            debug!("get_index_info: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
         }
-    } else if let Some(entry) = indexes.get_fts(&index_key) {
-        IndexInfo {
-            keyspace: keyspace_name.into(),
-            index: index_name.into(),
-            options: IndexOptions::Fulltext(entry.options().into()),
-        }
-    } else {
-        let msg = format!("missing index: {keyspace_name}.{index_name}");
-        debug!("get_index_info: {msg}");
-        return (StatusCode::NOT_FOUND, msg).into_response();
     };
 
-    (StatusCode::OK, response::Json(info)).into_response()
+    match index.count(index_key).await {
+        Err(err) => {
+            let msg = format!("index.count request error: {err}");
+            debug!("get_index_info: {msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        }
+        Ok(count) => (
+            StatusCode::OK,
+            response::Json(IndexInfo {
+                keyspace: keyspace_name.into(),
+                index: index_name.into(),
+                options,
+                status: status.into(),
+                count,
+                build_progress: progress_to_percentage(progress),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn refresh_index_metrics(
@@ -545,7 +609,7 @@ async fn refresh_index_metrics(
     }
 
     if let Some((index, _)) = state.engine.get_fts_index(key.clone()).await
-        && let Ok(stats) = index.stats(key).await
+        && let Ok(stats) = index.stats(key.clone()).await
     {
         state
             .metrics
@@ -562,6 +626,17 @@ async fn refresh_index_metrics(
             .fts_segment_count
             .with_label_values(&labels)
             .set(stats.segment_count as f64);
+        return;
+    }
+
+    if let Some((index, _)) = state.engine.get_pattern_index(key.clone()).await
+        && let Ok(count) = index.count(key).await
+    {
+        state
+            .metrics
+            .size
+            .with_label_values(&labels)
+            .set(count as f64);
     }
 }
 
@@ -726,18 +801,18 @@ async fn post_index_ann(
         let timer = state
             .metrics
             .latency
-            .with_label_values(&[keyspace.as_ref(), index_name.as_ref()])
+            .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_ANN])
             .start_timer();
 
         let index_key = IndexKey::new(&keyspace, &index_name);
         let (equality_cols, range_cols) = restriction_columns(&request.filter);
         let allow_filtering = request.filter.as_ref().is_some_and(|f| f.allow_filtering);
-        let best_index_state =
-            state
-                .indexes
-                .read()
-                .unwrap()
-                .best_index(&index_key, &equality_cols, &range_cols);
+        let best_index_state = state.indexes.read().unwrap().best_index(
+            &index_key,
+            &equality_cols,
+            &range_cols,
+            request.routing,
+        );
         let (routed_key, index, primary_key_columns, filtering_columns, table_columns) =
             match best_index_state {
             indexes::BestIndexState::Serving {
@@ -765,12 +840,13 @@ async fn post_index_ann(
                     table_columns,
                 )
             }
-            indexes::BestIndexState::NoGlobalIndex => {
+            indexes::BestIndexState::NoMatchingIndex => {
                 timer.observe_duration();
 
                 let msg = format!(
-                    "Global ANN query is not supported when only a local \
-                    vector index is available for {keyspace}.{index_name}"
+                    "The vector index {keyspace}.{index_name} and/or other vector indexes \
+                    defined on the same target don't support provided restrictions \
+                    (or lack thereof)"
                 );
                 debug!("post_index_ann: {msg}");
                 return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -822,6 +898,17 @@ async fn post_index_ann(
             ))
             .await;
 
+        // Filtering-column names whose stored values the caller wants back
+        // alongside the primary keys, instead of having to separately read
+        // every result row from the base table. A column not tracked by
+        // the index comes back as null, same as a tracked column with no
+        // stored value for a given row - neither is an error.
+        let return_columns: Arc<[crate::ColumnName]> = request
+            .return_columns
+            .into_iter()
+            .map(crate::ColumnName::from)
+            .collect();
+
         let search_result = if let Some(filter) = request.filter {
             let filter = match try_from_post_index_ann_filter(
                 filter,
@@ -840,11 +927,17 @@ async fn post_index_ann(
                     request.vector.into(),
                     filter,
                     request.limit.into(),
+                    Arc::clone(&return_columns),
                 )
                 .await
         } else {
             index
-                .ann(routed_key, request.vector.into(), request.limit.into())
+                .ann(
+                    routed_key,
+                    request.vector.into(),
+                    request.limit.into(),
+                    Arc::clone(&return_columns),
+                )
                 .await
         };
 
@@ -860,7 +953,7 @@ async fn post_index_ann(
                     (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
                 }
             },
-            Ok((primary_keys, distances)) => {
+            Ok((primary_keys, distances, column_values)) => {
                 if primary_keys.len() != distances.len() {
                     let msg = format!(
                         "wrong size of an ann response: \
@@ -886,21 +979,58 @@ async fn post_index_ann(
                             debug!("post_index_ann: {err}");
                             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                         }
-                        Ok(primary_keys) => (
-                            StatusCode::OK,
-                            response::Json(httpapi::PostIndexAnnResponse {
-                                primary_keys,
-                                distances: distances.into_iter().map(|d| d.into()).collect(),
-                                similarity_scores,
-                            }),
-                        )
-                            .into_response(),
+                        Ok(primary_keys) => {
+                            let column_values: HashMap<httpapi::ColumnName, Vec<Option<Value>>> =
+                                column_values
+                                    .into_iter()
+                                    .map(|(col_name, values)| {
+                                        let values = values
+                                            .into_iter()
+                                            .map(|v| v.and_then(|v| cql_types::to_json(v).ok()))
+                                            .collect();
+                                        (col_name.into(), values)
+                                    })
+                                    .collect();
+                            (
+                                StatusCode::OK,
+                                response::Json(httpapi::PostIndexAnnResponse {
+                                    primary_keys,
+                                    distances: distances.into_iter().map(|d| d.into()).collect(),
+                                    similarity_scores,
+                                    column_values,
+                                }),
+                            )
+                                .into_response()
+                        }
                     }
                 }
             }
         }
     })
     .await
+}
+
+async fn check_index_serving<T>(
+    serving_or_progress: Result<T, Progress>,
+    node_state: &Sender<NodeState>,
+    keyspace: &crate::KeyspaceName,
+    index_name: &crate::IndexName,
+    route_name: &str,
+) -> Result<T, Response> {
+    match serving_or_progress {
+        Ok(serving) => Ok(serving),
+        Err(Progress::InProgress(percentage)) => {
+            let reason = index_not_ready_reason(node_state, keyspace, index_name, percentage).await;
+            debug!("{route_name}: index {keyspace}.{index_name} not ready: {reason:?}");
+            Err((StatusCode::SERVICE_UNAVAILABLE, response::Json(reason)).into_response())
+        }
+        Err(Progress::Done) => {
+            let msg =
+                format!("Index {keyspace}.{index_name} is not serving, but full scan did finish.");
+            debug!("{route_name}: {msg}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, msg).into_response())
+        }
+    }
 }
 
 #[utoipa::path(
@@ -924,7 +1054,7 @@ If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         ),
         (
             status = 400,
-            description = "Bad request. Possible causes: malformed input, or missing required fields.",
+            description = "Bad request. Possible causes: malformed input, unparsable query, or missing required fields.",
             content_type = "application/json",
             body = ErrorMessage
         ),
@@ -967,7 +1097,7 @@ async fn post_index_bm25(
     let timer = state
         .metrics
         .latency
-        .with_label_values(&[keyspace.as_ref(), index_name.as_ref()])
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_BM25])
         .start_timer();
 
     let index_key = IndexKey::new(&keyspace, &index_name);
@@ -988,23 +1118,19 @@ async fn post_index_bm25(
         }
     };
 
-    let (fts_sender, primary_key_columns) = match serving_or_progress {
+    let (fts_sender, primary_key_columns) = match check_index_serving(
+        serving_or_progress,
+        &state.node_state,
+        &keyspace,
+        &index_name,
+        "post_index_bm25",
+    )
+    .await
+    {
         Ok(serving) => serving,
-        Err(Progress::InProgress(percentage)) => {
+        Err(resp) => {
             timer.observe_duration();
-
-            let reason =
-                index_not_ready_reason(&state.node_state, &keyspace, &index_name, percentage).await;
-            debug!("post_index_bm25: index {keyspace}.{index_name} not ready: {reason:?}");
-            return (StatusCode::SERVICE_UNAVAILABLE, response::Json(reason)).into_response();
-        }
-        Err(Progress::Done) => {
-            timer.observe_duration();
-
-            let msg =
-                format!("Index {keyspace}.{index_name} is not serving, but full scan did finish.");
-            debug!("post_index_bm25: {msg}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+            return resp;
         }
     };
 
@@ -1018,7 +1144,12 @@ async fn post_index_bm25(
         Err(err) => {
             let msg = format!("index.bm25 request error: {err}");
             debug!("post_index_bm25: {msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
         }
         Ok((primary_keys, scores)) => {
             if primary_keys.len() != scores.len() {
@@ -1053,6 +1184,273 @@ async fn post_index_bm25(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/indexes/{keyspace}/{index}/highlight",
+    tag = "scylla-vector-store-index",
+    description = "Computes a highlighted excerpt (snippet) for each of the supplied document texts. \
+The index is used only to analyze the query and to weight its terms by their document frequency, prioritizing \
+rarer terms when picking which fragment of a long text to show. \
+Highlights are returned in the same order as the requested documents. \
+A document that matches no query term yields `null`. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the full-text index within the specified keyspace to highlight against.")
+    ),
+    request_body = httpapi::PostIndexHighlightRequest,
+    responses(
+        (
+            status = 200,
+            description = "Successful highlighting. Returns one highlight per requested document, in the requested order.",
+            body = httpapi::PostIndexHighlightResponse
+        ),
+        (
+            status = 400,
+            description = "Bad request. Possible causes: malformed input, unparsable query, or missing required fields.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while highlighting. Possible causes: internal error, or search engine issues.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 503,
+            response = httpapi::IndexNotReadyResponse
+        )
+    )
+)]
+async fn post_index_highlight(
+    State(state): State<RoutesInnerState>,
+    extensions: Extensions,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexHighlightRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_highlight") {
+        return resp;
+    }
+
+    let timer = state
+        .metrics
+        .latency
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_HIGHLIGHT])
+        .start_timer();
+
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let serving_or_progress = {
+        let indexes = state.indexes.read().unwrap();
+        let Some(entry) = indexes.get_fts(&index_key) else {
+            timer.observe_duration();
+
+            let msg = format!("missing index: {keyspace}.{index_name}");
+            debug!("post_index_highlight: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        };
+        if entry.status() == crate::node_state::IndexStatus::Serving {
+            Ok(entry.index().clone())
+        } else {
+            Err(entry.progress())
+        }
+    };
+
+    let fts_sender = match check_index_serving(
+        serving_or_progress,
+        &state.node_state,
+        &keyspace,
+        &index_name,
+        "post_index_highlight",
+    )
+    .await
+    {
+        Ok(sender) => sender,
+        Err(resp) => {
+            timer.observe_duration();
+            return resp;
+        }
+    };
+
+    let result = fts_sender
+        .highlight(index_key, request.query, request.documents)
+        .await;
+
+    timer.observe_duration();
+
+    match result {
+        Err(err) => {
+            let msg = format!("index.highlight request error: {err}");
+            debug!("post_index_highlight: {msg}");
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
+        }
+        Ok(highlights) => (
+            StatusCode::OK,
+            response::Json(httpapi::PostIndexHighlightResponse { highlights }),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/indexes/{keyspace}/{index}/like",
+    tag = "scylla-vector-store-index",
+    description = "Performs a LIKE 'pattern' search query against the specified index. \
+Returns primary keys of the documents matched to the provided pattern. \
+The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, \
+'\\' is the escape character, and matching is case-sensitive. \
+The maximum number of results is controlled by the optional 'limit' parameter in the payload. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the pattern index within the specified keyspace to search.")
+    ),
+    request_body = httpapi::PostIndexLikeRequest,
+    responses(
+        (
+            status = 200,
+            description = "Successful pattern search. Returns a list of primary keys for the relevant documents found.",
+            body = httpapi::PostIndexLikeResponse
+        ),
+        (
+            status = 400,
+            description = "Bad request. Possible causes: malformed input, invalid pattern, or missing required fields.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while searching. Possible causes: internal error, or search engine issues.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 503,
+            response = httpapi::IndexNotReadyResponse
+        )
+    )
+)]
+async fn post_index_like(
+    State(state): State<RoutesInnerState>,
+    extensions: Extensions,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexLikeRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_like") {
+        return resp;
+    }
+
+    let timer = state
+        .metrics
+        .latency
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_LIKE])
+        .start_timer();
+
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let serving_or_progress = {
+        let indexes = state.indexes.read().unwrap();
+        let Some(entry) = indexes.get_pattern(&index_key) else {
+            timer.observe_duration();
+
+            let msg = format!("missing index: {keyspace}.{index_name}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        };
+        if entry.status() == crate::node_state::IndexStatus::Serving {
+            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
+        } else {
+            Err(entry.progress())
+        }
+    };
+
+    let (pattern_sender, primary_key_columns) = match check_index_serving(
+        serving_or_progress,
+        &state.node_state,
+        &keyspace,
+        &index_name,
+        "post_index_like",
+    )
+    .await
+    {
+        Ok(sender) => sender,
+        Err(resp) => {
+            timer.observe_duration();
+            return resp;
+        }
+    };
+
+    let search_result = pattern_sender
+        .like(index_key, request.pattern, request.limit.into())
+        .await;
+
+    timer.observe_duration();
+
+    match search_result {
+        Err(err) => {
+            let msg = format!("index.like request error: {err}");
+            debug!("post_index_like: {msg}");
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
+        }
+        Ok(primary_keys) => {
+            let primary_keys =
+                try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys);
+
+            match primary_keys {
+                Err(err) => {
+                    debug!("post_index_like: {err}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+                Ok(primary_keys) => (
+                    StatusCode::OK,
+                    response::Json(httpapi::PostIndexLikeResponse { primary_keys }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
 fn try_from_post_index_ann_filter(
     json_filter: httpapi::PostIndexAnnFilter,
     filtering_columns: &[crate::ColumnName],
@@ -1079,7 +1477,7 @@ fn try_from_post_index_ann_filter(
                 "Column '{column}' in filter restriction is not part of the table or is not a supported native type",
             )
         };
-        try_from_json(value, native_type)
+        cql_types::from_json(value, native_type)
     };
     Ok(Filter {
         restrictions: json_filter
@@ -1260,220 +1658,12 @@ fn try_collect_primary_keys(
                         .get(idx_column)
                         .expect("primary key index out of bounds after length check")
                 })
-                .map_ok(try_to_json)
+                .map_ok(cql_types::to_json)
                 .map(|primary_key| primary_key.flatten())
                 .collect();
             primary_keys.map(|primary_keys| (column.into(), primary_keys))
         })
         .collect()
-}
-
-fn try_to_json(value: CqlValue) -> anyhow::Result<Value> {
-    match value {
-        CqlValue::Ascii(value) => Ok(Value::String(value)),
-        CqlValue::Text(value) => Ok(Value::String(value)),
-
-        CqlValue::Boolean(value) => Ok(Value::Bool(value)),
-
-        CqlValue::Double(value) => {
-            Ok(Value::Number(Number::from_f64(value).ok_or_else(|| {
-                anyhow!("CqlValue::Double should be finite")
-            })?))
-        }
-        CqlValue::Float(value) => Ok(Value::Number(
-            Number::from_f64(value.into())
-                .ok_or_else(|| anyhow!("CqlValue::Float should be finite"))?,
-        )),
-
-        CqlValue::Int(value) => Ok(Value::Number(value.into())),
-        CqlValue::BigInt(value) => Ok(Value::Number(value.into())),
-        CqlValue::SmallInt(value) => Ok(Value::Number(value.into())),
-        CqlValue::TinyInt(value) => Ok(Value::Number(value.into())),
-
-        CqlValue::Uuid(value) => Ok(Value::String(value.into())),
-        CqlValue::Timeuuid(value) => Ok(Value::String((*value.as_ref()).into())),
-
-        CqlValue::Date(value) => Ok(Value::String(
-            TryInto::<Date>::try_into(value)?.format(&Iso8601::DATE)?,
-        )),
-        CqlValue::Time(value) => Ok(Value::String(
-            TryInto::<Time>::try_into(value)?
-                .format(&Iso8601::TIME)?
-                .strip_prefix("T")
-                .ok_or_else(|| anyhow!("CqlValue::Time: wrong formatting detected"))?
-                .to_string(), // remove 'T' prefix added by time crate
-        )),
-        CqlValue::Timestamp(value) => Ok(Value::String(
-            TryInto::<OffsetDateTime>::try_into(value)?.format({
-                const CONFIG: u128 = Config::DEFAULT
-                    .set_time_precision(TimePrecision::Second {
-                        decimal_digits: NonZero::new(3),
-                    })
-                    .encode();
-                &Iso8601::<CONFIG>
-            })?,
-        )),
-
-        CqlValue::Blob(value) => Ok(Value::String(const_hex::encode_prefixed(&value))),
-
-        CqlValue::Varint(value) => Ok(Value::String(BigInt::from(value).to_string())),
-
-        CqlValue::Decimal(value) => Ok(Value::String(BigDecimal::from(value).to_string())),
-
-        _ => unimplemented!(),
-    }
-}
-
-fn try_from_json(value: Value, cql_type: &NativeType) -> anyhow::Result<CqlValue> {
-    match value {
-        Value::String(value) => match cql_type {
-            NativeType::Ascii => Ok(CqlValue::Ascii(value)),
-            NativeType::Text => Ok(CqlValue::Text(value)),
-            NativeType::Uuid => {
-                let uuid = value
-                    .parse()
-                    .map_err(|err| anyhow!("Failed to parse UUID from string '{value}': {err}"))?;
-                Ok(CqlValue::Uuid(uuid))
-            }
-            NativeType::Timeuuid => {
-                let timeuuid: CqlTimeuuid = value.parse().map_err(|err| {
-                    anyhow!("Failed to parse TimeUUID from string '{value}': {err}")
-                })?;
-                Ok(CqlValue::Timeuuid(timeuuid))
-            }
-            NativeType::Date => {
-                let date = Date::parse(&value, &Iso8601::DATE)
-                    .map_err(|err| anyhow!("Failed to parse Date from string '{value}': {err}"))?;
-                Ok(CqlValue::Date(date.into()))
-            }
-            NativeType::Time => {
-                let time = Time::parse(value.strip_prefix("T").unwrap_or(&value), &Iso8601::TIME)
-                    .map_err(|err| {
-                    anyhow!("Failed to parse Time from string '{value}': {err}")
-                })?;
-                Ok(CqlValue::Time(time.into()))
-            }
-            NativeType::Timestamp => {
-                // CQL timestamps may use a space as the date-time separator
-                // (e.g. '2024-01-01 00:00:00.000Z'), but ISO 8601 requires 'T'.
-                // Only normalize when the space occurs at the expected date-time
-                // boundary after a YYYY-MM-DD prefix; otherwise, leave the input
-                // unchanged so that error reporting reflects the original value.
-                static CQL_TIMESTAMP_RE: LazyLock<Regex> =
-                    LazyLock::new(|| Regex::new(r"^(\d{4}-\d{2}-\d{2}) ").expect("valid regex"));
-                let normalized = CQL_TIMESTAMP_RE.replace(&value, "${1}T");
-                let datetime = OffsetDateTime::parse(&normalized, {
-                    const CONFIG: u128 = Config::DEFAULT
-                        .set_time_precision(TimePrecision::Second {
-                            decimal_digits: NonZero::new(3),
-                        })
-                        .encode();
-                    &Iso8601::<CONFIG>
-                })
-                .map_err(|err| anyhow!("Failed to parse Timestamp from string '{value}': {err}"))?;
-                Ok(CqlValue::Timestamp(datetime.into()))
-            }
-            NativeType::Blob => {
-                if !value.starts_with("0x") {
-                    bail!("Blob value must be a '0x'-prefixed hex string");
-                }
-                let bytes = const_hex::decode(&value)
-                    .map_err(|err| anyhow!("Invalid hex in blob value: {err}"))?;
-                Ok(CqlValue::Blob(bytes))
-            }
-            NativeType::Varint => {
-                let bi: BigInt = value.parse().map_err(|err| {
-                    anyhow!("Failed to parse Varint from string '{value}': {err}")
-                })?;
-                Ok(CqlValue::Varint(CqlVarint::from(bi)))
-            }
-            NativeType::Decimal => {
-                let bd: BigDecimal = value.parse().map_err(|err| {
-                    anyhow!("Failed to parse Decimal from string '{value}': {err}")
-                })?;
-                Ok(CqlValue::Decimal(CqlDecimal::try_from(bd).map_err(
-                    |err| anyhow!("Decimal value out of range: {err}"),
-                )?))
-            }
-            _ => bail!("Cannot convert string to CqlValue::{cql_type:?}, unsupported type"),
-        },
-
-        Value::Bool(value) => match cql_type {
-            NativeType::Boolean => Ok(CqlValue::Boolean(value)),
-            _ => bail!("Cannot convert bool to CqlValue::{cql_type:?}, unsupported type"),
-        },
-        Value::Number(value) => match cql_type {
-            NativeType::Double => {
-                Ok(CqlValue::Double(value.as_f64().ok_or_else(|| {
-                    anyhow!("Expected f64 for CqlValue::Double")
-                })?))
-            }
-            NativeType::Float => {
-                Ok(CqlValue::Float({
-                    // there is no TryFrom<f64> for f32, so we use explicit conversion
-                    let value = value
-                        .as_f64()
-                        .ok_or_else(|| anyhow!("Expected f32 (type f64) for CqlValue::Float"))?;
-                    if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64 {
-                        bail!("Expected f32 for CqlValue::Float: value out of range");
-                    }
-                    let value = value as f32;
-                    if !value.is_finite() {
-                        bail!("Expected finite f32 for CqlValue::Float");
-                    }
-                    value
-                }))
-            }
-            NativeType::Int => Ok(CqlValue::Int(
-                value
-                    .as_i64()
-                    .ok_or_else(|| anyhow!("Expected i32 (type i64) for CqlValue::Int"))?
-                    .try_into()
-                    .map_err(|err| anyhow!("Expected i32 for CqlValue::Int: {err}"))?,
-            )),
-            NativeType::BigInt => {
-                Ok(CqlValue::BigInt(value.as_i64().ok_or_else(|| {
-                    anyhow!("Expected i64 for CqlValue::BigInt")
-                })?))
-            }
-            NativeType::SmallInt => Ok(CqlValue::SmallInt(
-                value
-                    .as_i64()
-                    .ok_or_else(|| anyhow!("Expected i16 (type i64) for CqlValue::SmallInt"))?
-                    .try_into()
-                    .map_err(|err| anyhow!("Expected i16 for CqlValue::SmallInt: {err}"))?,
-            )),
-            NativeType::TinyInt => Ok(CqlValue::TinyInt(
-                value
-                    .as_i64()
-                    .ok_or_else(|| anyhow!("Expected i8 (type i64) for CqlValue::TinyInt"))?
-                    .try_into()
-                    .map_err(|err| anyhow!("Expected i8 for CqlValue::TinyInt: {err}"))?,
-            )),
-            NativeType::Varint => {
-                // Varint is always an integer; reject fractional JSON numbers.
-                let s = value.to_string();
-                let bi: BigInt = s
-                    .parse()
-                    .map_err(|err| anyhow!("Failed to parse Varint from number '{s}': {err}"))?;
-                Ok(CqlValue::Varint(CqlVarint::from(bi)))
-            }
-            NativeType::Decimal => {
-                let s = value.to_string();
-                let bd: BigDecimal = s
-                    .parse()
-                    .map_err(|err| anyhow!("Failed to parse Decimal from number '{s}': {err}"))?;
-                Ok(CqlValue::Decimal(CqlDecimal::try_from(bd).map_err(
-                    |err| anyhow!("Decimal value out of range: {err}"),
-                )?))
-            }
-            _ => bail!("Cannot convert number to CqlValue::{cql_type:?}, unsupported type"),
-        },
-
-        _ => {
-            bail!("Cannot convert JSON value '{value}' to CqlValue::{cql_type:?}, unsupported type")
-        }
-    }
 }
 
 #[utoipa::path(
@@ -1581,7 +1771,7 @@ async fn get_internal_session_counters(State(state): State<RoutesInnerState>) ->
 mod tests {
 
     use super::*;
-    use uuid::Uuid;
+    use crate::Analyzer;
 
     #[test]
     fn try_from_post_index_ann_filter_conversion_ok() {
@@ -1876,378 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn try_from_json_conversion() {
-        assert_eq!(
-            try_from_json(Value::String("ascii".to_string()), &NativeType::Ascii).unwrap(),
-            CqlValue::Ascii("ascii".to_string())
-        );
-        assert_eq!(
-            try_from_json(Value::String("text".to_string()), &NativeType::Text).unwrap(),
-            CqlValue::Text("text".to_string())
-        );
-
-        assert_eq!(
-            try_from_json(Value::Bool(true), &NativeType::Boolean).unwrap(),
-            CqlValue::Boolean(true)
-        );
-
-        assert_eq!(
-            try_from_json(
-                Value::Number(Number::from_f64(101.).unwrap()),
-                &NativeType::Double
-            )
-            .unwrap(),
-            CqlValue::Double(101.)
-        );
-        assert_eq!(
-            try_from_json(
-                Value::Number(Number::from_f64(201.).unwrap()),
-                &NativeType::Float
-            )
-            .unwrap(),
-            CqlValue::Float(201.)
-        );
-        assert!(
-            try_from_json(
-                Value::Number(Number::from_f64((f32::MAX as f64) * 10.).unwrap()),
-                &NativeType::Float
-            )
-            .is_err()
-        );
-        assert!(
-            try_from_json(
-                Value::Number(Number::from_f64((f32::MIN as f64) * 10.).unwrap()),
-                &NativeType::Float
-            )
-            .is_err()
-        );
-
-        assert_eq!(
-            try_from_json(Value::Number(10.into()), &NativeType::Int).unwrap(),
-            CqlValue::Int(10)
-        );
-        assert!(
-            try_from_json(
-                Value::Number((i32::MAX as i64 + 1).into()),
-                &NativeType::Int
-            )
-            .is_err()
-        );
-        assert_eq!(
-            try_from_json(Value::Number(20.into()), &NativeType::BigInt).unwrap(),
-            CqlValue::BigInt(20)
-        );
-        assert_eq!(
-            try_from_json(Value::Number(30.into()), &NativeType::SmallInt).unwrap(),
-            CqlValue::SmallInt(30)
-        );
-        assert!(
-            try_from_json(
-                Value::Number((i16::MAX as i64 + 1).into()),
-                &NativeType::SmallInt
-            )
-            .is_err()
-        );
-        assert_eq!(
-            try_from_json(Value::Number(40.into()), &NativeType::TinyInt).unwrap(),
-            CqlValue::TinyInt(40)
-        );
-        assert!(
-            try_from_json(
-                Value::Number((i8::MAX as i64 + 1).into()),
-                &NativeType::TinyInt
-            )
-            .is_err()
-        );
-
-        let uuid = Uuid::new_v4();
-        assert_eq!(
-            try_from_json(Value::String(uuid.into()), &NativeType::Uuid).unwrap(),
-            CqlValue::Uuid(uuid)
-        );
-        let uuid = Uuid::new_v4();
-        assert_eq!(
-            try_from_json(Value::String(uuid.into()), &NativeType::Timeuuid).unwrap(),
-            CqlValue::Timeuuid(uuid.into())
-        );
-
-        assert_eq!(
-            try_from_json(Value::String("2025-09-01".to_string()), &NativeType::Date).unwrap(),
-            CqlValue::Date(
-                Date::from_calendar_date(2025, time::Month::September, 1)
-                    .unwrap()
-                    .into()
-            )
-        );
-        assert_eq!(
-            try_from_json(
-                Value::String("12:10:10.000000000".to_string()),
-                &NativeType::Time
-            )
-            .unwrap(),
-            CqlValue::Time(Time::from_hms(12, 10, 10).unwrap().into())
-        );
-        assert_eq!(
-            try_from_json(
-                Value::String(
-                    // truncate microseconds
-                    OffsetDateTime::from_unix_timestamp(123456789)
-                        .unwrap()
-                        .format({
-                            const CONFIG: u128 = Config::DEFAULT
-                                .set_time_precision(TimePrecision::Second {
-                                    decimal_digits: NonZero::new(3),
-                                })
-                                .encode();
-                            &Iso8601::<CONFIG>
-                        })
-                        .unwrap()
-                ),
-                &NativeType::Timestamp
-            )
-            .unwrap(),
-            CqlValue::Timestamp(
-                OffsetDateTime::from_unix_timestamp(123456789)
-                    .unwrap()
-                    .into()
-            )
-        );
-
-        // CQL-style timestamp with space separator and Z offset
-        assert_eq!(
-            try_from_json(
-                Value::String("2024-01-01 00:00:00.000Z".to_string()),
-                &NativeType::Timestamp
-            )
-            .unwrap(),
-            CqlValue::Timestamp(
-                OffsetDateTime::from_unix_timestamp(1704067200)
-                    .unwrap()
-                    .into()
-            )
-        );
-
-        // CQL-style timestamp with space separator, Z offset, and non-zero time
-        assert_eq!(
-            try_from_json(
-                Value::String("1970-01-01 00:01:04.000Z".to_string()),
-                &NativeType::Timestamp
-            )
-            .unwrap(),
-            CqlValue::Timestamp(OffsetDateTime::from_unix_timestamp(64).unwrap().into())
-        );
-
-        assert_eq!(
-            try_from_json(Value::String("0xdeadbeef".to_string()), &NativeType::Blob).unwrap(),
-            CqlValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])
-        );
-        assert_eq!(
-            try_from_json(Value::String("0x".to_string()), &NativeType::Blob).unwrap(),
-            CqlValue::Blob(vec![])
-        );
-        assert_eq!(
-            try_from_json(Value::String("0x00".to_string()), &NativeType::Blob).unwrap(),
-            CqlValue::Blob(vec![0x00])
-        );
-
-        // missing 0x prefix
-        assert!(try_from_json(Value::String("deadbeef".to_string()), &NativeType::Blob).is_err());
-        // invalid hex characters
-        assert!(try_from_json(Value::String("0xgg".to_string()), &NativeType::Blob).is_err());
-        // odd-length hex digits (after stripping prefix)
-        assert!(try_from_json(Value::String("0xabc".to_string()), &NativeType::Blob).is_err());
-
-        // Varint from string
-        assert_eq!(
-            try_from_json(
-                Value::String("-98765432109876543210987654321098765432109876543210".to_string()),
-                &NativeType::Varint
-            )
-            .unwrap(),
-            CqlValue::Varint(CqlVarint::from(
-                "-98765432109876543210987654321098765432109876543210"
-                    .parse::<BigInt>()
-                    .unwrap()
-            ))
-        );
-        assert!(
-            try_from_json(
-                Value::String("not_a_number".to_string()),
-                &NativeType::Varint
-            )
-            .is_err()
-        );
-        // Varint from JSON number
-        assert_eq!(
-            try_from_json(Value::Number((-9876543210i64).into()), &NativeType::Varint).unwrap(),
-            CqlValue::Varint(CqlVarint::from(BigInt::from(-9876543210i64)))
-        );
-
-        // Decimal from string
-        assert_eq!(
-            try_from_json(
-                Value::String("-98765432109876543210.123456789".to_string()),
-                &NativeType::Decimal
-            )
-            .unwrap(),
-            CqlValue::Decimal(
-                CqlDecimal::try_from(
-                    "-98765432109876543210.123456789"
-                        .parse::<BigDecimal>()
-                        .unwrap()
-                )
-                .unwrap()
-            )
-        );
-        assert!(
-            try_from_json(
-                Value::String("not_a_decimal".to_string()),
-                &NativeType::Decimal
-            )
-            .is_err()
-        );
-        // Decimal from JSON number
-        assert_eq!(
-            try_from_json(
-                Value::Number(Number::from_f64(-1.25).unwrap()),
-                &NativeType::Decimal
-            )
-            .unwrap(),
-            CqlValue::Decimal(
-                CqlDecimal::try_from("-1.25".parse::<BigDecimal>().unwrap()).unwrap()
-            )
-        );
-    }
-
-    #[test]
-    fn try_to_json_conversion() {
-        assert_eq!(
-            try_to_json(CqlValue::Ascii("ascii".to_string())).unwrap(),
-            Value::String("ascii".to_string())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Text("text".to_string())).unwrap(),
-            Value::String("text".to_string())
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Boolean(true)).unwrap(),
-            Value::Bool(true)
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Double(101.)).unwrap(),
-            Value::Number(Number::from_f64(101.).unwrap())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Float(201.)).unwrap(),
-            Value::Number(Number::from_f64(201.).unwrap())
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Int(10)).unwrap(),
-            Value::Number(10.into())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::BigInt(20)).unwrap(),
-            Value::Number(20.into())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::SmallInt(30)).unwrap(),
-            Value::Number(30.into())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::TinyInt(40)).unwrap(),
-            Value::Number(40.into())
-        );
-
-        let uuid = Uuid::new_v4();
-        assert_eq!(
-            try_to_json(CqlValue::Uuid(uuid)).unwrap(),
-            Value::String(uuid.into())
-        );
-        let uuid = Uuid::new_v4();
-        assert_eq!(
-            try_to_json(CqlValue::Timeuuid(uuid.into())).unwrap(),
-            Value::String(uuid.into())
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Date(
-                Date::from_calendar_date(2025, time::Month::September, 1)
-                    .unwrap()
-                    .into()
-            ))
-            .unwrap(),
-            Value::String("2025-09-01".to_string())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Time(Time::from_hms(12, 10, 10).unwrap().into())).unwrap(),
-            Value::String("12:10:10.000000000".to_string())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Timestamp(
-                OffsetDateTime::from_unix_timestamp(123456789)
-                    .unwrap()
-                    .into()
-            ))
-            .unwrap(),
-            Value::String(
-                // truncate microseconds
-                OffsetDateTime::from_unix_timestamp(123456789)
-                    .unwrap()
-                    .format({
-                        const CONFIG: u128 = Config::DEFAULT
-                            .set_time_precision(TimePrecision::Second {
-                                decimal_digits: NonZero::new(3),
-                            })
-                            .encode();
-                        &Iso8601::<CONFIG>
-                    })
-                    .unwrap()
-            )
-        );
-        assert!(try_to_json(CqlValue::Float(f32::NAN)).is_err());
-        assert!(try_to_json(CqlValue::Double(f64::NAN)).is_err());
-
-        assert_eq!(
-            try_to_json(CqlValue::Blob(vec![0xde, 0xad, 0xbe, 0xef])).unwrap(),
-            Value::String("0xdeadbeef".to_string())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Blob(vec![])).unwrap(),
-            Value::String("0x".to_string())
-        );
-        assert_eq!(
-            try_to_json(CqlValue::Blob(vec![0x00])).unwrap(),
-            Value::String("0x00".to_string())
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Varint(CqlVarint::from(
-                "-98765432109876543210987654321098765432109876543210"
-                    .parse::<BigInt>()
-                    .unwrap()
-            )))
-            .unwrap(),
-            Value::String("-98765432109876543210987654321098765432109876543210".to_string())
-        );
-
-        assert_eq!(
-            try_to_json(CqlValue::Decimal(
-                CqlDecimal::try_from(
-                    "-98765432109876543210.123456789"
-                        .parse::<BigDecimal>()
-                        .unwrap()
-                )
-                .unwrap()
-            ))
-            .unwrap(),
-            Value::String("-98765432109876543210.123456789".to_string())
-        );
-    }
-
-    #[test]
     fn node_status_conversion() {
         assert_eq!(
             httpapi::NodeStatus::from(crate::node_state::NodeStatus::Initializing),
@@ -2333,10 +2151,20 @@ mod tests {
     #[test]
     fn fulltext_index_option_conversion() {
         assert_eq!(
-            FulltextIndexOptions::from(&IndexOptionsFts {}),
+            FulltextIndexOptions::from(&IndexOptionsFts::default()),
             FulltextIndexOptions {
                 analyzer: "standard".to_string(),
                 positions: true,
+            }
+        );
+        assert_eq!(
+            FulltextIndexOptions::from(&IndexOptionsFts {
+                analyzer: Analyzer::German,
+                positions: false.into(),
+            }),
+            FulltextIndexOptions {
+                analyzer: "german".to_string(),
+                positions: false,
             }
         );
     }

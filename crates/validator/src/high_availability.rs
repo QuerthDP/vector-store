@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use std::collections::HashMap;
@@ -26,10 +26,9 @@ struct Fixture {
 }
 
 impl e2etest::Fixture for Fixture {
-    async fn setup(setup: &mut impl e2etest::Setup) -> Self {
-        setup.setup::<TestActors>().await;
-        let actors = setup.get::<TestActors>().await.unwrap();
-        Self { actors }
+    async fn setup(setup: &mut impl e2etest::Setup) -> Option<Self> {
+        let actors = setup.setup::<TestActors>().await?;
+        Some(Self { actors })
     }
 
     async fn teardown(self) {
@@ -54,7 +53,7 @@ async fn test_secondary_uri_works_correctly(actors: Arc<TestActors>) {
             args: e2etest_scylla_cluster::default_scylla_args(),
             cert_path: Some(cert_path.clone()),
             key_path: Some(key_path.clone()),
-            extra_config: None,
+            extra_config: Some(scylla_auth_config()),
         },
         ScyllaNodeConfig {
             db_ip: actors.services_subnet.ip(DB_OCTET_2),
@@ -63,7 +62,7 @@ async fn test_secondary_uri_works_correctly(actors: Arc<TestActors>) {
             args: e2etest_scylla_cluster::default_scylla_args(),
             cert_path: Some(cert_path.clone()),
             key_path: Some(key_path.clone()),
-            extra_config: None,
+            extra_config: Some(scylla_auth_config()),
         },
         ScyllaNodeConfig {
             db_ip: actors.services_subnet.ip(DB_OCTET_3),
@@ -72,7 +71,7 @@ async fn test_secondary_uri_works_correctly(actors: Arc<TestActors>) {
             args: e2etest_scylla_cluster::default_scylla_args(),
             cert_path: Some(cert_path.clone()),
             key_path: Some(key_path.clone()),
-            extra_config: None,
+            extra_config: Some(scylla_auth_config()),
         },
     ];
     let cert_env = actors
@@ -89,10 +88,10 @@ async fn test_secondary_uri_works_correctly(actors: Arc<TestActors>) {
             "VECTOR_STORE_SCYLLADB_CERTIFICATE_FILE".to_string(),
             cert_env,
         )]),
-        user: None,
-        password: None,
+        user: Some(DEFAULT_DB_USER.to_string()),
+        password: Some(DEFAULT_DB_PASSWORD.to_string()),
     }];
-    init_with_config(&actors, scylla_configs, vs_configs).await;
+    init_with_config(&actors, scylla_configs, vs_configs, true).await;
 
     let vs_ips = vec![actors.services_subnet.ip(VS_OCTET_1)];
     let (session, clients) = prepare_connection_with_custom_vs_ips(&actors, vs_ips).await;

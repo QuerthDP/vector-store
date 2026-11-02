@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use macros::ToEnumSchema;
@@ -82,11 +82,21 @@ impl Serialize for Distance {
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-/// Information about an index, such as keyspace, name, and creation options.
+/// Information about an index: its keyspace, name, creation options, and the status it currently reports.
 pub struct IndexInfo {
     pub keyspace: KeyspaceName,
     pub index: IndexName,
     pub options: IndexOptions,
+    pub status: IndexStatus,
+    pub count: usize,
+    /// Progress of the initial full table scan that backfills the index,
+    /// expressed as a percentage in the range `0.0..=100.0`. This reflects
+    /// only how far the full scan has advanced; it is not a source of truth
+    /// for the index state. The `status` field is authoritative: an index
+    /// reporting `SERVING` is serving regardless of `build_progress`, which
+    /// may not reach `100.0` (e.g. if some scan ranges failed).
+    #[schema(minimum = 0, maximum = 100)]
+    pub build_progress: f64,
 }
 
 impl IndexInfo {
@@ -102,6 +112,9 @@ impl IndexInfo {
                 similarity_function: SimilarityFunction::Euclidean,
                 quantization: DataType::F32,
             }),
+            status: IndexStatus::Initializing,
+            count: 0,
+            build_progress: 0.0,
         }
     }
 }
@@ -180,6 +193,10 @@ pub struct FulltextIndexOptions {
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Options a pattern index was created with.
+pub struct PatternIndexOptions {}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 /// Options an index was created with, tagged with the index's type.
 pub enum IndexOptions {
@@ -187,27 +204,8 @@ pub enum IndexOptions {
     Vector(VectorIndexOptions),
     /// Full-text search index options.
     Fulltext(FulltextIndexOptions),
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-pub struct IndexStatusResponse {
-    pub status: IndexStatus,
-    pub count: usize,
-    /// Progress of the initial full table scan that backfills the index,
-    /// expressed as a percentage in the range `0.0..=100.0`. This reflects
-    /// only how far the full scan has advanced; it is not a source of truth
-    /// for the index state. The `status` field is authoritative: an index
-    /// reporting `SERVING` is serving regardless of `build_progress`, which
-    /// may not reach `100.0` (e.g. if some scan ranges failed). Defaults to
-    /// `100.0` when omitted, so a new client talking to an older server that
-    /// does not report the field falls back to relying solely on `status`.
-    #[serde(default = "default_build_progress")]
-    #[schema(minimum = 0, maximum = 100)]
-    pub build_progress: f64,
-}
-
-fn default_build_progress() -> f64 {
-    100.0
+    /// Pattern index options.
+    Pattern(PatternIndexOptions),
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -371,6 +369,16 @@ pub struct PostIndexAnnRequest {
     pub filter: Option<PostIndexAnnFilter>,
     #[serde(default)]
     pub limit: Limit,
+    /// By default, the query may be routed to a different, better-matching index on the same column. Set to `false` to force the query to be served by exactly the index named in the URL.
+    #[serde(default = "default_routing")]
+    pub routing: bool,
+    /// Column names whose stored values should be returned alongside the primary keys. A column the index doesn't track comes back as null for every row, the same as a tracked column with no stored value for a given row. Empty (the default) means return no column values. The index's own target column - the one holding the vector - may also be requested: no value for it is stored, so it is reconstructed from the index as an array of numbers, in the index's quantization (32-bit floats by default) rather than necessarily the values originally written. Only the usearch index can do this; the other index types reject a request for their target column.
+    #[serde(default)]
+    pub return_columns: Vec<ColumnName>,
+}
+
+fn default_routing() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -378,6 +386,9 @@ pub struct PostIndexAnnResponse {
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
     pub distances: Vec<Distance>,
     pub similarity_scores: Vec<SimilarityScore>,
+    /// Per-column stored values for the columns requested in `return_columns`. Each entry maps a column name to a Vec of `Option<Value>` — one entry per returned nearest neighbour, in the same order as `primary_keys`. `None` means the value was not present for that row (e.g. the attribute did not exist when the row was indexed, or the column isn't tracked by the index). Absent when `return_columns` was empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub column_values: HashMap<ColumnName, Vec<Option<Value>>>,
 }
 
 #[derive(Copy, Clone, Debug, serde::Deserialize, derive_more::From, utoipa::ToSchema)]
@@ -426,6 +437,7 @@ mod tests {
                 SimilarityScore::from(f32::NEG_INFINITY),
                 SimilarityScore::from(0.5),
             ],
+            column_values: HashMap::new(),
         })
         .unwrap();
 
@@ -444,6 +456,21 @@ mod tests {
 
         assert_eq!(distances, vec![f32::MAX, -f32::MAX, 1.5]);
         assert_eq!(similarity_scores, vec![f32::MAX, -f32::MAX, 0.5]);
+    }
+
+    #[test]
+    fn highlight_request_parses_query_and_documents() {
+        let request: PostIndexHighlightRequest =
+            serde_json::from_str(r#"{"query":"fox","documents":["the quick brown fox jumps","a completely different fox story"]}"#).unwrap();
+
+        assert_eq!(request.query, "fox");
+        assert_eq!(
+            request.documents,
+            vec![
+                "the quick brown fox jumps",
+                "a completely different fox story"
+            ]
+        );
     }
 }
 
@@ -475,4 +502,35 @@ pub struct PostIndexBm25Request {
 pub struct PostIndexBm25Response {
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
     pub scores: Vec<f32>,
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for highlighting.
+pub struct PostIndexHighlightRequest {
+    /// The text query whose terms should be marked in the documents.
+    pub query: String,
+    /// The documents to highlight.
+    pub documents: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for highlighting.
+pub struct PostIndexHighlightResponse {
+    /// The highlighted documents. Each document is a string of text with the query terms marked.
+    pub highlights: Vec<Option<String>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for LIKE search.
+pub struct PostIndexLikeRequest {
+    /// The text pattern to search for.
+    pub pattern: String,
+    #[serde(default)]
+    pub limit: Limit,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for LIKE search.
+pub struct PostIndexLikeResponse {
+    pub primary_keys: HashMap<ColumnName, Vec<Value>>,
 }

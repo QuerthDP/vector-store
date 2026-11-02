@@ -13,28 +13,171 @@ env:
   VECTOR_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.VECTOR_VERSION }}
 
 jobs:
-  build-docker:
-    runs-on: ubuntu-latest
+  release-get-scylla-nightly-digest:
+    uses: $/.github/workflows/get-scylla-nightly-digest.yml
+    with:
+      use-latest-scylla-nightly: false
+
+  release-build-validator:
+    uses: $/.github/workflows/build-validator.yml
+    with:
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.VECTOR_VERSION }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+
+  release-build-vector-store:
+    uses: $/.github/workflows/build-vector-store.yml
+    with:
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.VECTOR_VERSION }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+
+  release-get-validator-test-list:
+    needs: ["release-build-validator"]
+    uses: $/.github/workflows/get-validator-test-list.yml
+    with:
+      os: ubuntu-latest
+      arch: amd64
+
+  release-run-validator-tests:
+    needs: ["release-get-scylla-nightly-digest", "release-build-vector-store", "release-get-validator-test-list"]
+    uses: $/.github/workflows/run-validator-tests.yml
+    with:
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      testcase: ${{ matrix.testcase }}
+      ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.VECTOR_VERSION }}
+    strategy:
+      fail-fast: false
+      matrix:
+        testcase: ${{fromJSON(needs.release-get-validator-test-list.outputs.testcases)}}
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+
+  release-build-docker-archive-sbom:
+    needs: ["release-run-validator-tests"]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    env:
+      TARGETARCH: ${{ matrix.arch }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ env.VECTOR_VERSION }}
           fetch-depth: 0
-
-      - name: Set up QEMU (multi-arch emulation)
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+          fetch-tags: true
+          ref: ${{ env.VECTOR_VERSION }}
 
       - name: Install SBOM tooling (syft + cargo-cyclonedx) used by build-release
         run: |
           set -euo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          cargo install cargo-cyclonedx --locked
+          # syft-v1.51.1
+          export DOWNLOAD_TAG_INSTALL_SCRIPT=false
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/91a0032987d91b7411b52f6f5c185c5e7f775495/install.sh | sh -s -- -b /usr/local/bin v1.51.1
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Download vector-store artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vector-store-${{matrix.arch}}
+
+      - name: Copy downloaded vector-store into target directory
+        run: |
+          set -euo pipefail
+          chmod a+x vector-store
+          mkdir -p target/${{matrix.arch}}/release
+          cp vector-store target/${{matrix.arch}}/release
+
+      - name: Build docker for ${{ matrix.arch }}
+        run: ./scripts/build-dockers ${{ matrix.arch }}
+
+      - name: Build tarball and SBOMs for ${{ matrix.arch }}
+        run: ./scripts/generate-archive-sbom ${{ matrix.arch }}
+
+      - name: Save the docker image
+        run: docker save "scylladb/vector-store:${VECTOR_VERSION}-${{ matrix.arch }}" -o "vector-store-image-${VECTOR_VERSION}-${{ matrix.arch }}.tar"
+
+      - name: Upload the docker image as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vector-store-image-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}
+          path: vector-store-image-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}.tar
+
+      - name: Upload the release tarball as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vector-store-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}/release/vector-store-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}.tar.gz
+
+      - name: Upload SBOMs as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vector-store-sboms-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}
+          path: |
+            vector-store-${{ env.VECTOR_VERSION }}.cdx.json
+            vector-store-docker-${{ env.VECTOR_VERSION }}-${{ matrix.arch }}.cdx.json
+          if-no-files-found: warn
+
+  # Push the per-arch images built by the build job (no rebuild) and combine
+  # them into a multi-arch manifest.
+  push-docker:
+    needs: [release-build-docker-archive-sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # only the tags are needed, to tell whether VECTOR_VERSION is the
+      # newest GA release
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download the docker image artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vector-store-image-${{ env.VECTOR_VERSION }}-*
+          merge-multiple: true
+
+      - name: Load the docker images
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64 ; do
+            docker load -i "vector-store-image-${VECTOR_VERSION}-${arch}.tar"
+          done
 
       - name: Log in to Docker Hub
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
@@ -42,31 +185,130 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build images, SBOMs and manifest
-        run: ./scripts/build-release
-
-      - name: Push per-arch images and multi-arch manifest
+      - name: Push per-arch images and multi-arch index
         run: |
           set -euo pipefail
           IMAGE=scylladb/vector-store
+          sources=()
           for arch in amd64 arm64 ; do
             docker push "${IMAGE}:${VECTOR_VERSION}-${arch}"
+            # reference the linux/$arch manifest by digest, not the per-arch
+            # tag: with a provenance attestation attached the tag is an index
+            # bundling the image with an unknown/unknown manifest, which would
+            # otherwise be copied into the multi-arch tag as well
+            digest=$(docker buildx imagetools inspect --raw "${IMAGE}:${VECTOR_VERSION}-${arch}" \
+              | jq -r --arg arch "${arch}" \
+                '.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest')
+            if [[ -n "${digest}" ]] ; then
+              sources+=("${IMAGE}@${digest}")
+            else
+              sources+=("${IMAGE}:${VECTOR_VERSION}-${arch}")
+            fi
           done
-          docker manifest create --amend "${IMAGE}:${VECTOR_VERSION}" \
-            "${IMAGE}:${VECTOR_VERSION}-amd64" \
-            "${IMAGE}:${VECTOR_VERSION}-arm64"
-          docker manifest push --purge "${IMAGE}:${VECTOR_VERSION}"
+          # imagetools, not `docker manifest`: the latter refuses a source that
+          # is itself an index
+          docker buildx imagetools create --tag "${IMAGE}:${VECTOR_VERSION}" "${sources[@]}"
+
+      # `latest` follows the newest GA release, i.e. the highest X.Y.Z
+      # annotated tag, so a pre-release built via workflow_dispatch or a
+      # patch of an older series never moves it backwards. Moving `latest`
+      # anywhere else is a manual retag (docs/releasing.md).
+      - name: Tag the multi-arch index as latest
+        run: |
+          set -euo pipefail
+          IMAGE=scylladb/vector-store
+          newest=$(git tag --list --format='%(objecttype) %(refname:short)' \
+            | awk '$1 == "tag" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { print $2 }' \
+            | sort -V | tail -n 1)
+          if [[ "${VECTOR_VERSION}" == "${newest}" ]] ; then
+            docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${VECTOR_VERSION}"
+            echo "Tagged \`${IMAGE}:${VECTOR_VERSION}\` as \`${IMAGE}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "\`${IMAGE}:latest\` left unchanged: the newest GA release is \`${newest:-unknown}\`, not \`${VECTOR_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vector-store-sboms-${{ env.VECTOR_VERSION }}-*
+          merge-multiple: true
+          path: sboms
 
       - name: Archive SBOMs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vector-store-sboms-${{ env.VECTOR_VERSION }}
           path: |
-            vector-store-${{ env.VECTOR_VERSION }}.cdx.json
-            vector-store-docker-${{ env.VECTOR_VERSION }}-*.cdx.json
+            sboms/vector-store-${{ env.VECTOR_VERSION }}.cdx.json
+            sboms/vector-store-docker-${{ env.VECTOR_VERSION }}-*.cdx.json
           if-no-files-found: warn
 
+  # Attach the per-arch tarballs and the SBOMs to the GitHub release. This has
+  # to run before build-cloud-images: the packer provisioner installs the
+  # service by downloading
+  # releases/download/$VECTOR_VERSION/vector-store-$VECTOR_VERSION-$arch.tar.gz
+  # (see packer/files/vector_store_install_image), so with the tarballs missing
+  # from the release page the image build fails.
+  #
+  # Only a run started by publishing a release uploads: there the release the
+  # assets belong to is the one being published, while workflow_dispatch takes
+  # an arbitrary VECTOR_VERSION and would attach freshly built binaries to an
+  # already-published release. Re-running a failed release run keeps its
+  # `release` event, so that recovery path still uploads. The guard is on the
+  # steps rather than the job because a skipped job would skip
+  # build-cloud-images with it.
+  upload-release-assets:
+    needs: [release-build-docker-archive-sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # to attach the assets to the release
+    steps:
+      - name: Download the release tarball artifacts
+        if: github.event_name == 'release'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vector-store-${{ env.VECTOR_VERSION }}-*
+          merge-multiple: true
+          path: assets
+
+      - name: Download the SBOM artifacts
+        if: github.event_name == 'release'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vector-store-sboms-${{ env.VECTOR_VERSION }}-*
+          merge-multiple: true
+          path: assets
+
+      - name: Upload the tarballs and SBOMs to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # both arch legs generate the same Cargo SBOM, so merge-multiple
+          # leaves a single copy of it beside the per-arch tarballs and docker
+          # SBOMs
+          assets=("assets/vector-store-${VECTOR_VERSION}.cdx.json")
+          for arch in amd64 arm64 ; do
+            assets+=(
+              "assets/vector-store-${VECTOR_VERSION}-${arch}.tar.gz"
+              "assets/vector-store-docker-${VECTOR_VERSION}-${arch}.cdx.json"
+            )
+          done
+          for asset in "${assets[@]}" ; do
+            if [[ ! -f "${asset}" ]] ; then
+              echo "::error::${asset} is missing from the build artifacts"
+              exit 1
+            fi
+          done
+          # the release being published is addressed by its tag rather than
+          # through its upload_url; --clobber replaces assets left by an
+          # earlier attempt of the same run instead of failing on them
+          gh release upload "${VECTOR_VERSION}" "${assets[@]}" --clobber
+
   build-cloud-images:
+    needs: [push-docker, upload-release-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write     # to attach the packer manifest to the release
@@ -114,30 +356,264 @@ jobs:
           name: vector-store-cloud-images-${{ env.VECTOR_VERSION }}
           path: packer/packer-manifest.json
 
+      # `gh release upload` rather than actions/upload-release-asset: that
+      # action is archived and rejects an asset name that is already attached —
+      # so re-running this job after the manifest went up once would fail with
+      # `already_exists`, and this job is the one a release re-run repeats.
       - name: Upload Packer manifest to the release
-        if: github.event_name == 'release' && github.event.release
-        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        if: github.event_name == 'release'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # gh names the asset after the file, and docs/releasing.md points at
+          # vector-store-cloud-images-<version>.json for the manual siren
+          # fallback
+          cp packer/packer-manifest.json \
+            "vector-store-cloud-images-${VECTOR_VERSION}.json"
+          gh release upload "${VECTOR_VERSION}" \
+            "vector-store-cloud-images-${VECTOR_VERSION}.json" --clobber
+
+  # Hand the freshly built cloud images over to siren: extract the image IDs
+  # from the packer manifest and start
+  # https://github.com/scylladb/siren/actions/workflows/add-vectorstore-ver.yml,
+  # which opens a versions.yaml PR in scylladb/siren. A separate job consuming
+  # the manifest artifact (the push-docker pattern) keeps the dispatch
+  # re-runnable without rebuilding the images.
+  trigger-siren:
+    needs: [build-cloud-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check the version is a GA release
+        id: ga
+        run: |
+          set -euo pipefail
+          # siren validates the version against ^X.Y.Z$ and unconditionally
+          # moves its defaults.vectorstore to it, so pre-release and dev tags
+          # (1.6.1-rc0, X.Y.Z-dev) must not be dispatched. The release trigger
+          # already filters prereleases out, but workflow_dispatch takes an
+          # arbitrary VECTOR_VERSION — skip (not fail) the job on those.
+          if [[ "${VECTOR_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ; then
+            echo "ga=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ga=false" >> "$GITHUB_OUTPUT"
+            echo "Version \`${VECTOR_VERSION}\` is not a GA X.Y.Z release — skipping the siren dispatch" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download the packer manifest artifact
+        if: steps.ga.outputs.ga == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: packer/packer-manifest.json
-          asset_name: vector-store-cloud-images-${{ env.VECTOR_VERSION }}.json
-          asset_content_type: application/json
+          name: vector-store-cloud-images-${{ env.VECTOR_VERSION }}
+
+      - name: Extract the image IDs from the packer manifest
+        if: steps.ga.outputs.ga == 'true'
+        id: images
+        run: |
+          set -euo pipefail
+          # All three sequential packer builds append to the one .builds[]
+          # array, and a re-run appends rather than replaces — take the last
+          # matching entry. The AWS builds are told apart by the arch recorded
+          # in custom_data by the manifest post-processor; their artifact_id
+          # is a comma-separated region:ami list and siren expects the bare
+          # us-east-1 AMI (it prefixes the value with us-east-1/ itself).
+          # The GCP image needs no such disambiguation: only one architecture
+          # (amd64) is built there, so builder_type alone identifies it.
+          aws_ami() {
+            jq -r --arg arch "$1" \
+              '[.builds[] | select(.builder_type=="amazon-ebs" and .custom_data.arch==$arch)] | last | .artifact_id // empty' \
+              packer-manifest.json \
+              | tr ',' '\n' | { grep '^us-east-1:' || true ; } | cut -d: -f2
+          }
+          aws_amd64_ami=$(aws_ami amd64)
+          aws_arm64_ami=$(aws_ami arm64)
+          gcp_amd64_image=$(jq -r \
+            '[.builds[] | select(.builder_type=="googlecompute")] | last | .artifact_id // empty' \
+            packer-manifest.json)
+          for var in aws_amd64_ami aws_arm64_ami gcp_amd64_image ; do
+            if [[ -z "${!var}" ]] ; then
+              echo "::error::failed to extract ${var} from packer-manifest.json"
+              exit 1
+            fi
+            echo "${var}=${!var}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Check the siren token is set
+        if: steps.ga.outputs.ga == 'true'
+        env:
+          SIREN_REPO_TOKEN: ${{ secrets.SIREN_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # An unset secret expands to the empty string, and gh then asks for
+          # GH_TOKEN to be set to `github.token` — advice about this workflow,
+          # when it is the secret that is missing. The usual cause is the
+          # value having been added under Settings > Secrets and variables >
+          # Actions on the *Variables* tab: `secrets.` cannot see repository
+          # variables.
+          if [[ -z "${SIREN_REPO_TOKEN:-}" ]] ; then
+            echo "::error::SIREN_REPO_TOKEN is empty — it must be an Actions secret (not a repository variable) in scylladb/vector-store; see docs/releasing.md"
+            exit 1
+          fi
+
+      - name: Trigger the siren add-vectorstore-ver workflow
+        if: steps.ga.outputs.ga == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SIREN_REPO_TOKEN }}
+          AWS_AMD64_AMI: ${{ steps.images.outputs.aws_amd64_ami }}
+          AWS_ARM64_AMI: ${{ steps.images.outputs.aws_arm64_ami }}
+          GCP_AMD64_IMAGE: ${{ steps.images.outputs.gcp_amd64_image }}
+        run: |
+          set -euo pipefail
+          # add-vectorstore-ver accepts both triggers with the same four
+          # values, but they are reached through different endpoints, and
+          # each endpoint checks a different permission of SIREN_REPO_TOKEN:
+          # repository_dispatch needs `Contents: write` on scylladb/siren,
+          # workflow_dispatch `Actions: write`. Use workflow_dispatch, the
+          # narrower of the two — dispatching a release must not come with
+          # the right to write siren's contents.
+          #
+          # Unlike repository_dispatch, workflow_dispatch names the ref to
+          # run on. Ask siren which one that is instead of hardcoding a
+          # branch name that only siren gets to change.
+          #
+          # The token must therefore be a fine-grained PAT owned by scylladb,
+          # listing scylladb/siren among its repositories, approved by the
+          # organization and granting `Actions: read and write`. Provisioned
+          # in VECTOR-854.
+          #
+          # GitHub refuses a token short of that with a message naming
+          # neither the repository nor what the token lacks. Say which call
+          # failed; docs/releasing.md maps GitHub's message, which gh logs
+          # just above, to its cause.
+          fail() {
+            echo "::error::$1 — see GitHub's error above and docs/releasing.md"
+            exit 1
+          }
+
+          if ! ref=$(gh api /repos/scylladb/siren --jq .default_branch) ; then
+            fail "Reading scylladb/siren with SIREN_REPO_TOKEN failed"
+          fi
+          # gh prints a failed call's response body to stdout without a final
+          # newline, which would keep the annotation from starting a line of
+          # its own; its message is in gh's error anyway.
+          if ! jq -n \
+            --arg ref "${ref}" \
+            --arg version "${VECTOR_VERSION}" \
+            --arg aws_amd64_ami "${AWS_AMD64_AMI}" \
+            --arg aws_arm64_ami "${AWS_ARM64_AMI}" \
+            --arg gcp_amd64_image "${GCP_AMD64_IMAGE}" \
+            '{ref: $ref, inputs: {
+               version: $version,
+               aws_amd64_ami: $aws_amd64_ami,
+               aws_arm64_ami: $aws_arm64_ami,
+               gcp_amd64_image: $gcp_amd64_image
+             }}' \
+            | gh api --method POST --input - \
+              /repos/scylladb/siren/actions/workflows/add-vectorstore-ver.yml/dispatches \
+              > /dev/null ; then
+            fail "Starting add-vectorstore-ver in scylladb/siren with SIREN_REPO_TOKEN failed"
+          fi
+
+      - name: Log the siren workflow link
+        if: steps.ga.outputs.ga == 'true'
+        env:
+          AWS_AMD64_AMI: ${{ steps.images.outputs.aws_amd64_ami }}
+          AWS_ARM64_AMI: ${{ steps.images.outputs.aws_arm64_ami }}
+          GCP_AMD64_IMAGE: ${{ steps.images.outputs.gcp_amd64_image }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch returns 204 with no run id, so the run status
+          # cannot be reported here — link to the siren workflow page instead.
+          {
+            echo "Started \`add-vectorstore-ver\` for \`${VECTOR_VERSION}\` in scylladb/siren:"
+            echo ""
+            echo "- \`aws_amd64_ami\`: \`${AWS_AMD64_AMI}\`"
+            echo "- \`aws_arm64_ami\`: \`${AWS_ARM64_AMI}\`"
+            echo "- \`gcp_amd64_image\`: \`${GCP_AMD64_IMAGE}\`"
+            echo ""
+            echo "Check <https://github.com/scylladb/siren/actions/workflows/add-vectorstore-ver.yml> for the resulting run and versions.yaml PR."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   announce:
-    needs: [build-docker, build-cloud-images]
+    needs: [push-docker, build-cloud-images]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read      # to read the release notes
     steps:
+      - name: Compose the Slack announcement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Read the notes now rather than from the release event, so that a
+          # workflow_dispatch run finds them too and re-running this job after
+          # fixing them posts the fixed text.
+          gh release view "${VECTOR_VERSION}" --json body,url > release.json
+          url=$(jq -r .url release.json)
+
+          # The notes may carry the announcement in a hidden block, written
+          # in Slack mrkdwn (see docs/releasing.md):
+          #
+          #   <!-- slack-announcement
+          #   ...
+          #   -->
+          #
+          # Notes saved from GitHub's web editor end their lines with CRLF,
+          # and the editor can leave trailing spaces after a marker line.
+          # awk reads a file, not a pipe: it stops at the closing marker,
+          # which under pipefail would fail a writer still feeding it.
+          jq -r .body release.json | tr -d '\r' > body.txt
+          if ! awk '
+              { line = $0; sub(/[[:space:]]+$/, "", line) }
+              !inside && line == "<!-- slack-announcement" { inside = 1; found = 1; next }
+              inside && line == "-->" { closed = 1; exit }
+              inside && !started && /^[[:space:]]*$/ { next }
+              inside { started = 1; print }
+              END { if (found && !closed) exit 1 }
+            ' body.txt > announcement.txt ; then
+            echo "::error::The release notes open a slack-announcement block but no line holding only --> closes it"
+            exit 1
+          fi
+
+          if grep -q '[^[:space:]]' announcement.txt ; then
+            # Link the PR numbers the announcement cites, e.g. (#634, #645),
+            # as Slack does not do it by itself.
+            text="<!here> $(sed -E "s@(^|[ (,])#([0-9]+)@\1<https://github.com/${GH_REPO}/pull/\2|#\2>@g" announcement.txt)"
+            text+=$'\n'"Details: <${url}|ScyllaDB Vector Store ${VECTOR_VERSION} release notes>"
+          else
+            if grep -q 'slack-announcement' body.txt ; then
+              echo "::warning::The release notes mention slack-announcement, but hold no block with text in it; posting the short announcement"
+            fi
+            text="<!here> ScyllaDB Vector Store *${VECTOR_VERSION}* is released: <${url}|release notes>"
+          fi
+          printf '%s\n' "${text}" > announcement.txt
+
+          {
+            echo "Slack announcement:"
+            echo ""
+            echo '```'
+            cat announcement.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Announce release on Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
-          curl -sS -X POST -H 'Content-type: application/json' \
-            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-            --data "{
-              \"channel\": \"#release-announce\",
-              \"text\": \"<!here> ScyllaDB Vector Store *${VECTOR_VERSION}* is released\",
-              \"link_names\": 1
-            }" \
-            https://slack.com/api/chat.postMessage
+          set -euo pipefail
+          # chat.postMessage answers HTTP 200 even when it refuses a message,
+          # so success is read from the `ok` field of its response.
+          jq -n --rawfile text announcement.txt \
+            '{channel: "#release-announce", text: ($text | rtrimstr("\n")), link_names: true, unfurl_links: false}' \
+            | curl -sS -X POST -H 'Content-type: application/json; charset=utf-8' \
+              -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              --data @- \
+              https://slack.com/api/chat.postMessage > response.json
+          if ! jq -e .ok response.json > /dev/null ; then
+            echo "::error::Slack refused the announcement: $(jq -r '.error // .' response.json)"
+            exit 1
+          fi

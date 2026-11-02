@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::TestActors;
@@ -32,11 +32,10 @@ struct Fixture {
 }
 
 impl e2etest::Fixture for Fixture {
-    async fn setup(setup: &mut impl e2etest::Setup) -> Self {
-        setup.setup::<TestActors>().await;
-        let actors = setup.get::<TestActors>().await.unwrap();
+    async fn setup(setup: &mut impl e2etest::Setup) -> Option<Self> {
+        let actors = setup.setup::<TestActors>().await?;
         init_with_proxy_single_vs(&actors).await;
-        Self { actors }
+        Some(Self { actors })
     }
 
     async fn teardown(self) {
@@ -128,12 +127,7 @@ async fn full_scan_is_completed_when_responding_to_messages_concurrently(actors:
         .await
         .expect("failed to drop an index");
 
-    wait_for(
-        || async { client.indexes().await.is_empty() },
-        "index must be removed",
-        Duration::from_secs(60),
-    )
-    .await;
+    wait_for_no_index(client, &index).await;
 
     info!("Dropping keyspace");
     session
@@ -225,12 +219,7 @@ async fn full_scan_stops_when_index_is_dropped(actors: Arc<TestActors>) {
         .expect("failed to drop an index");
 
     info!("Waiting for index to be removed from vector-store");
-    wait_for(
-        || async { client.indexes().await.is_empty() },
-        "index must be removed",
-        DEFAULT_OPERATION_TIMEOUT,
-    )
-    .await;
+    wait_for_no_index(client, &index).await;
 
     info!("Verifying no DB execute traffic continues after index drop");
     let (tx_feedback, mut rx_feedback) = mpsc::unbounded_channel();

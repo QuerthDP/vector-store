@@ -1,14 +1,17 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+mod alternator;
 mod async_in_progress;
 mod config_manager;
+mod cql_types;
 pub mod db;
 mod db_cdc;
+mod db_driver;
 pub mod db_index;
-mod db_index_backend;
+mod db_value;
 mod distance;
 mod engine;
 mod file_monitor;
@@ -27,12 +30,15 @@ mod monitor_items;
 pub mod node_state;
 mod nonempty;
 mod partition_key;
+mod pattern_index;
 mod perf;
 mod primary_key;
 mod similarity;
 mod table;
+mod tantivy;
 mod timestamp;
 pub mod tls;
+mod tracing_output;
 mod vector;
 mod vs_index;
 mod worker;
@@ -42,6 +48,11 @@ pub use crate::config_manager::ConfigManager;
 pub use crate::config_manager::ConfigReceivers;
 pub use crate::config_manager::HttpServerConfig;
 pub use crate::config_manager::load_config;
+pub use crate::db_driver::CdcLogReaderConfig;
+pub use crate::db_driver::DbDriver;
+pub use crate::db_driver::DbIndexInfo;
+pub use crate::db_value::DbRow;
+pub use crate::db_value::DbValue;
 pub use crate::distance::Distance;
 pub use crate::httpserver::HttpServer;
 pub use crate::httpserver::HttpServerExt;
@@ -60,16 +71,22 @@ pub use crate::table::PartitionId;
 pub use crate::table::PrimaryId;
 pub use crate::timestamp::Timestamp;
 pub use crate::timestamp::Timestamped;
+pub use crate::tracing_output::TracingOutput;
+pub use crate::tracing_output::stdout_is_journal;
+pub use crate::tracing_output::stdout_is_terminal;
+pub use crate::tracing_output::tracing_layer;
 pub use crate::vector::Vector;
 use crate::vs_index::VsIndexFactory;
 use db::Db;
 use scylla::cluster::metadata::ColumnType;
+use scylla::cluster::metadata::NativeType;
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
 use scylla::serialize::writers::CellWriter;
 use scylla::serialize::writers::WrittenCellProof;
 use scylla::value::CqlValue;
 use scylla_cdc::CqlIdentifier;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
@@ -157,6 +174,26 @@ impl std::fmt::Display for TableIdentifier {
     }
 }
 
+/// Which data provider a DiskANN index is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskannBackendKind {
+    #[default]
+    Inmem,
+    Scylla,
+}
+
+impl FromStr for DiskannBackendKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "inmem" => Ok(Self::Inmem),
+            "scylla" => Ok(Self::Scylla),
+            _ => Err(anyhow::anyhow!("Unknown DiskANN backend: {s}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct DiskannAlpha(f32);
 
@@ -187,7 +224,8 @@ pub struct Config {
     pub credentials: Option<Credentials>,
     pub usearch_simulator: Option<Vec<Duration>>,
     pub diskann_alpha: Option<DiskannAlpha>,
-    pub use_diskann: bool,
+    pub diskann_max_points: Option<NonZeroUsize>,
+    pub diskann_backend: Option<DiskannBackendKind>,
     pub use_gpu: bool,
     pub cuvs_build_interval: Option<Duration>,
     pub alter_index_simulator: bool,
@@ -224,7 +262,8 @@ impl Default for Config {
             credentials: None,
             usearch_simulator: None,
             diskann_alpha: None,
-            use_diskann: false,
+            diskann_max_points: None,
+            diskann_backend: None,
             use_gpu: false,
             cuvs_build_interval: None,
             alter_index_simulator: false,
@@ -391,6 +430,7 @@ pub struct Dimensions(NonZeroUsize);
     derive_more::AsRef,
     derive_more::From,
     derive_more::Display,
+    derive_more::FromStr,
 )]
 /// Limit number of neighbors per graph node
 pub struct Connectivity(usize);
@@ -411,6 +451,7 @@ impl Default for Connectivity {
     derive_more::AsRef,
     derive_more::From,
     derive_more::Display,
+    derive_more::FromStr,
 )]
 /// Control the recall of indexing
 pub struct ExpansionAdd(usize);
@@ -431,6 +472,7 @@ impl Default for ExpansionAdd {
     derive_more::AsRef,
     derive_more::From,
     derive_more::Display,
+    derive_more::FromStr,
 )]
 /// Control the quality of the search
 pub struct ExpansionSearch(usize);
@@ -494,6 +536,74 @@ impl FromStr for Quantization {
             "I8" => Ok(Self::I8),
             "B1" => Ok(Self::B1),
             _ => Err(anyhow::anyhow!("Unknown quantization type: {s}")),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default, derive_more::Display)]
+/// A text analyzer a full-text index uses to split text into tokens.
+pub enum Analyzer {
+    #[default]
+    #[display("standard")]
+    Standard,
+    #[display("english")]
+    English,
+    #[display("german")]
+    German,
+    #[display("french")]
+    French,
+    #[display("spanish")]
+    Spanish,
+    #[display("italian")]
+    Italian,
+    #[display("portuguese")]
+    Portuguese,
+    #[display("russian")]
+    Russian,
+    #[display("simple")]
+    Simple,
+    #[display("whitespace")]
+    Whitespace,
+}
+
+impl FromStr for Analyzer {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "standard" => Ok(Self::Standard),
+            "english" => Ok(Self::English),
+            "german" => Ok(Self::German),
+            "french" => Ok(Self::French),
+            "spanish" => Ok(Self::Spanish),
+            "italian" => Ok(Self::Italian),
+            "portuguese" => Ok(Self::Portuguese),
+            "russian" => Ok(Self::Russian),
+            "simple" => Ok(Self::Simple),
+            "whitespace" => Ok(Self::Whitespace),
+            _ => Err(anyhow::anyhow!("Unknown analyzer: {s}")),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Whether a full-text index stores token positions, which are required by phrase queries.
+pub struct Positions(bool);
+
+impl Default for Positions {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+impl FromStr for Positions {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(Self(true)),
+            "false" => Ok(Self(false)),
+            _ => Err(anyhow::anyhow!("Unknown positions value: {s}")),
         }
     }
 }
@@ -604,34 +714,49 @@ pub struct IndexOptionsVs {
     pub quantization: Quantization,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 /// Full-text-search-specific index configuration.
-pub struct IndexOptionsFts {}
+pub struct IndexOptionsFts {
+    pub analyzer: Analyzer,
+    pub positions: Positions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Pattern-specific index configuration.
+pub struct IndexOptionsPattern {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// Discriminates between vector-search and full-text-search index.
+/// Discriminates between index types.
 pub enum IndexKind {
     Vs(IndexOptionsVs),
     Fts(IndexOptionsFts),
+    Pattern(IndexOptionsPattern),
 }
 
 impl IndexKind {
     pub fn as_vs(&self) -> Option<&IndexOptionsVs> {
         match self {
             IndexKind::Vs(vs) => Some(vs),
-            IndexKind::Fts(_) => None,
+            IndexKind::Fts(_) | IndexKind::Pattern(_) => None,
         }
     }
 
     pub fn as_fts(&self) -> Option<&IndexOptionsFts> {
         match self {
             IndexKind::Fts(fts) => Some(fts),
-            IndexKind::Vs(_) => None,
+            IndexKind::Vs(_) | IndexKind::Pattern(_) => None,
+        }
+    }
+
+    pub fn as_pattern(&self) -> Option<&IndexOptionsPattern> {
+        match self {
+            IndexKind::Pattern(pattern) => Some(pattern),
+            IndexKind::Vs(_) | IndexKind::Fts(_) => None,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Information about an index
 pub struct IndexMetadata {
     pub keyspace_name: KeyspaceName,
@@ -642,8 +767,37 @@ pub struct IndexMetadata {
     pub target_columns: NonemptyArc<ColumnName>,
     pub partitioning: DbIndexPartitioning,
     pub filtering_columns: Arc<[ColumnName]>,
+    /// For Alternator tables: the NativeType to decode each partition-key/
+    /// filtering column with no real column in the table's CQL schema as
+    /// (its value lives only in the ":attrs" map), derived from its
+    /// declared DynamoDB type ("S", "N" or "B"). Empty for CQL-native
+    /// tables and for columns that are real columns.
+    pub alternator_attribute_types: Arc<BTreeMap<ColumnName, NativeType>>,
     pub version: IndexVersion,
     pub kind: IndexKind,
+}
+
+// Manual impl because `NativeType` (in `alternator_attribute_types`) doesn't
+// implement `Hash`. Its variants are all fieldless, so hashing by
+// `mem::discriminant` is exactly as precise as hashing the value itself.
+impl std::hash::Hash for IndexMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.keyspace_name.hash(state);
+        self.index_name.hash(state);
+        self.table_name.hash(state);
+        self.primary_key_columns.hash(state);
+        self.partition_key_count.hash(state);
+        self.target_columns.hash(state);
+        self.partitioning.hash(state);
+        self.filtering_columns.hash(state);
+        self.alternator_attribute_types.len().hash(state);
+        for (name, native_type) in self.alternator_attribute_types.iter() {
+            name.hash(state);
+            std::mem::discriminant(native_type).hash(state);
+        }
+        self.version.hash(state);
+        self.kind.hash(state);
+    }
 }
 
 impl IndexMetadata {
@@ -657,6 +811,16 @@ impl IndexMetadata {
 
     pub fn fts(&self) -> Option<&IndexOptionsFts> {
         self.kind.as_fts()
+    }
+
+    pub fn pattern(&self) -> Option<&IndexOptionsPattern> {
+        self.kind.as_pattern()
+    }
+
+    /// The NativeType to treat `column` as, if it's a virtual Alternator
+    /// attribute (see alternator_attribute_types) - None otherwise.
+    pub fn alternator_native_type(&self, column: &ColumnName) -> Option<NativeType> {
+        self.alternator_attribute_types.get(column).cloned()
     }
 
     fn discard_version(&self) -> Self {
@@ -675,6 +839,15 @@ impl IndexMetadata {
             ),
         }
     }
+
+    /// The subset of `filtering_columns` not already in `primary_key_columns`.
+    /// Table::new() stores a primary-key column as Column::PrimaryKey, not a
+    /// value slot, so it can't also be fetched/stored as a filtering column.
+    fn nonpk_filtering_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        self.filtering_columns
+            .iter()
+            .filter(|col| !self.primary_key_columns.contains(col))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -688,6 +861,7 @@ pub enum DbIndexPartitioning {
 pub enum DbIndexKind {
     VectorSearch,
     FullTextSearch,
+    Pattern,
 }
 
 #[derive(Debug)]
@@ -700,6 +874,8 @@ pub struct DbCustomIndex {
     pub target_columns: NonemptyArc<ColumnName>,
     pub partitioning: DbIndexPartitioning,
     pub filtering_columns: Arc<[ColumnName]>,
+    /// See IndexMetadata::alternator_attribute_types.
+    pub alternator_attribute_types: Arc<BTreeMap<ColumnName, NativeType>>,
     pub kind: DbIndexKind,
 }
 
@@ -731,6 +907,15 @@ pub struct DbIndexedRow {
     pub operation: DbIndexedOperation,
 }
 
+#[derive(Debug, derive_more::Display)]
+struct NonRetryable;
+
+/// A query-related failure caused by the caller's input (an unparsable query, or a query
+/// construct that this endpoint cannot process, wrong pattern, etc.).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct QueryError(pub(crate) String);
+
 pub fn block_on<Output>(threads: Option<usize>, f: impl AsyncFnOnce() -> Output) -> Output {
     let mut builder = match threads {
         Some(0) | None => Builder::new_multi_thread(),
@@ -761,10 +946,11 @@ pub async fn run(
 
     let config_rx = config_receivers.config.clone();
     let opensearch_addr = config_rx.borrow().opensearch_addr.clone();
-    let use_diskann = config_rx.borrow().use_diskann;
+    let diskann_backend = config_rx.borrow().diskann_backend;
     let use_gpu = config_rx.borrow().use_gpu;
 
-    let internals = internals::new();
+    let db_driver = db_driver::new_scylla();
+    let internals = internals::new(db_driver.clone());
     let memory = memory::new(internals.clone(), config_rx.clone());
     let worker = worker::new();
 
@@ -774,8 +960,8 @@ pub async fn run(
     } else if use_gpu {
         tracing::info!("Using cuVS (GPU) index factory");
         vs_index::new_index_factory_cuvs(config_rx.clone())?
-    } else if use_diskann {
-        tracing::info!("Using DiskANN index factory");
+    } else if let Some(backend) = diskann_backend {
+        tracing::info!("Using DiskANN index factory with the {backend:?} backend");
         vs_index::new_index_factory_diskann(config_rx.clone(), worker.clone(), memory.clone())?
     } else {
         tracing::info!("Using Usearch index factory");
@@ -790,6 +976,7 @@ pub async fn run(
             node_state.clone(),
             internals.clone(),
             config_rx,
+            db_driver,
             Arc::clone(&metrics),
         )
         .await?
@@ -797,12 +984,15 @@ pub async fn run(
 
     let index_engine_version = vs_index_factory.index_engine_version();
     let indexes = Arc::new(RwLock::new(Indexes::new()));
-    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory);
+    let fts_index_factory =
+        fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
+    let pattern_index_factory = pattern_index::new_factory_tantivy(worker, memory);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {
             vs: vs_index_factory,
             fts: fts_index_factory,
+            pattern: pattern_index_factory,
         },
         node_state.clone(),
         metrics.clone(),
@@ -905,5 +1095,123 @@ mod tests {
         assert!(Percentage::try_from(101.0).is_err());
         assert!(Percentage::try_from(0.0).is_ok());
         assert!(Percentage::try_from(100.0).is_ok());
+    }
+
+    #[test]
+    fn analyzer_parses_every_value_scylladb_accepts() {
+        for (text, expected) in [
+            ("standard", Analyzer::Standard),
+            ("english", Analyzer::English),
+            ("german", Analyzer::German),
+            ("french", Analyzer::French),
+            ("spanish", Analyzer::Spanish),
+            ("italian", Analyzer::Italian),
+            ("portuguese", Analyzer::Portuguese),
+            ("russian", Analyzer::Russian),
+            ("simple", Analyzer::Simple),
+            ("whitespace", Analyzer::Whitespace),
+        ] {
+            assert_eq!(text.parse::<Analyzer>().unwrap(), expected);
+            assert_eq!(text.to_uppercase().parse::<Analyzer>().unwrap(), expected);
+            assert_eq!(expected.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn analyzer_rejects_unknown_value() {
+        assert!("klingon".parse::<Analyzer>().is_err());
+    }
+
+    fn index_metadata_with_alternator_types(
+        types: impl IntoIterator<Item = (&'static str, NativeType)>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            keyspace_name: "alternator_ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["embedding"]).unwrap(),
+            partitioning: DbIndexPartitioning::Global,
+            filtering_columns: Arc::new([]),
+            alternator_attribute_types: Arc::new(
+                types
+                    .into_iter()
+                    .map(|(name, typ)| (ColumnName::from(name), typ))
+                    .collect(),
+            ),
+            version: IndexVersion(Uuid::new_v4()),
+            kind: IndexKind::Vs(IndexOptionsVs {
+                dimensions: NonZeroUsize::new(3).unwrap().into(),
+                connectivity: Default::default(),
+                expansion_add: Default::default(),
+                expansion_search: Default::default(),
+                space_type: SpaceType::Euclidean,
+                quantization: Default::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn alternator_native_type_none_for_unknown_column() {
+        let metadata = index_metadata_with_alternator_types([("color", NativeType::Text)]);
+        assert_eq!(metadata.alternator_native_type(&"size".into()), None);
+    }
+
+    #[test]
+    fn alternator_native_type_returns_declared_type() {
+        let metadata = index_metadata_with_alternator_types([("color", NativeType::Text)]);
+        assert_eq!(
+            metadata.alternator_native_type(&"color".into()),
+            Some(NativeType::Text)
+        );
+    }
+
+    #[test]
+    fn analyzer_defaults_to_standard() {
+        assert_eq!(Analyzer::default(), Analyzer::Standard);
+    }
+
+    #[test]
+    fn positions_parses_booleans_case_insensitively() {
+        assert!(*"true".parse::<Positions>().unwrap().as_ref());
+        assert!(*"TRUE".parse::<Positions>().unwrap().as_ref());
+        assert!(!*"false".parse::<Positions>().unwrap().as_ref());
+        assert!(!*"False".parse::<Positions>().unwrap().as_ref());
+        assert!("yes".parse::<Positions>().is_err());
+    }
+
+    #[test]
+    fn positions_defaults_to_enabled() {
+        assert!(*Positions::default().as_ref());
+    }
+
+    #[test]
+    fn nonpk_filtering_columns_excludes_primary_key_columns() {
+        let metadata = IndexMetadata {
+            keyspace_name: "ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            // "pk" is the partition key, "ck" a clustering key.
+            primary_key_columns: NonemptyArc::new(["pk", "ck"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["embedding"]).unwrap(),
+            partitioning: DbIndexPartitioning::Local(NonemptyArc::new(["pk"]).unwrap()),
+            // "ck" is also a primary-key column; "f" is a genuine value column.
+            filtering_columns: Arc::new(["ck".into(), "f".into()]),
+            alternator_attribute_types: Arc::new(BTreeMap::new()),
+            version: Uuid::new_v4().into(),
+            kind: IndexKind::Vs(IndexOptionsVs {
+                dimensions: Dimensions(NonZeroUsize::new(3).unwrap()),
+                connectivity: Default::default(),
+                expansion_add: Default::default(),
+                expansion_search: Default::default(),
+                space_type: Default::default(),
+                quantization: Default::default(),
+            }),
+        };
+
+        let filtering_columns: Vec<_> = metadata.nonpk_filtering_columns().cloned().collect();
+        assert_eq!(filtering_columns, vec!["f".into()]);
     }
 }

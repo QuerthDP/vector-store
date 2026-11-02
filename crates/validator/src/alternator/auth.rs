@@ -18,35 +18,12 @@ use crate::common;
 use scylla::client::session::Session;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::alternator;
 use crate::alternator::ALTERNATOR_PORT;
-use crate::alternator::JsonBodyInjectInterceptor;
 use aws_sdk_dynamodb::error::ProvideErrorMetadata as _;
-
-static SUPERUSER_NAME: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
-static SUPERUSER_PASSWORD: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
-static SUPERUSER_SALTED_PASSWORD: LazyLock<String> = LazyLock::new(|| {
-    bcrypt::hash(&*SUPERUSER_PASSWORD, bcrypt::DEFAULT_COST)
-        .expect("failed to hash superuser password")
-});
-
-/// Builds the ScyllaDB extra-config YAML that enables password authentication,
-/// CQL authorization, and sets the superuser credentials.
-fn scylla_auth_config() -> Vec<u8> {
-    let name = &*SUPERUSER_NAME;
-    let salted = &*SUPERUSER_SALTED_PASSWORD;
-    format!(
-        "authenticator: PasswordAuthenticator\n\
-         authorizer: CassandraAuthorizer\n\
-         auth_superuser_name: '{name}'\n\
-         auth_superuser_salted_password: '{salted}'"
-    )
-    .into_bytes()
-}
 
 /// Polls the Alternator endpoint with the given credentials until it responds
 /// successfully. With `--alternator-enforce-authorization=true`, the standard
@@ -97,8 +74,12 @@ async fn alternator_with_auth_enabled(actors: Arc<TestActors>) {
     let db_ip = actors.services_subnet.ip(common::DB_OCTET_1);
 
     info!("Connecting to ScyllaDB as superuser");
-    let (session, vs_clients) =
-        common::prepare_connection_with_auth(&actors, &SUPERUSER_NAME, &SUPERUSER_PASSWORD).await;
+    let (session, vs_clients) = common::prepare_connection_with_auth(
+        &actors,
+        &common::SUPERUSER_NAME,
+        &common::SUPERUSER_PASSWORD,
+    )
+    .await;
 
     let role_name = Uuid::new_v4().simple().to_string();
     let role_password = Uuid::new_v4().simple().to_string();
@@ -127,9 +108,9 @@ async fn alternator_with_auth_enabled(actors: Arc<TestActors>) {
     info!("Fetching salted_hash for limited role '{role_name}'");
     let limited_salted_hash = get_salted_hash(&session, &role_name).await;
 
-    let superuser_salted_hash = get_salted_hash(&session, &SUPERUSER_NAME).await;
+    let superuser_salted_hash = get_salted_hash(&session, &common::SUPERUSER_NAME).await;
 
-    wait_for_alternator_with_creds(db_ip, &SUPERUSER_NAME, &superuser_salted_hash).await;
+    wait_for_alternator_with_creds(db_ip, &common::SUPERUSER_NAME, &superuser_salted_hash).await;
 
     let limited_client =
         alternator::make_dynamodb_client_with_creds(db_ip, &role_name, &limited_salted_hash).await;
@@ -205,28 +186,16 @@ async fn alternator_with_auth_enabled(actors: Arc<TestActors>) {
         let mut try_delete = true;
         loop {
             let update = if try_delete {
-                serde_json::json!([{"Delete": {"IndexName": index_name.as_ref()}}])
+                alternator::delete_vector_index_update(index_name.as_ref())
             } else {
-                serde_json::json!([{
-                    "Create": {
-                        "IndexName": index_name.as_ref(),
-                        "VectorAttribute": {
-                                "AttributeName": vec_attr,
-                            "Dimensions": 3
-                        }
-                    }
-                }])
+                alternator::create_vector_index_update(index_name.as_ref(), vec_attr, 3)
             };
             try_delete = !try_delete;
 
             let result = limited_client
                 .update_table()
                 .table_name(&table_name)
-                .customize()
-                .interceptor(JsonBodyInjectInterceptor::new([(
-                    "VectorIndexUpdates",
-                    update,
-                )]))
+                .vector_index_updates(update)
                 .send()
                 .await;
 
@@ -276,26 +245,25 @@ struct Fixture {
 }
 
 impl e2etest::Fixture for Fixture {
-    async fn setup(setup: &mut impl e2etest::Setup) -> Self {
-        setup.setup::<TestActors>().await;
-        let actors = setup.get::<TestActors>().await.unwrap();
+    async fn setup(setup: &mut impl e2etest::Setup) -> Option<Self> {
+        let actors = setup.setup::<TestActors>().await?;
 
         let scylla_configs = alternator::get_scylla_configs(
             &actors,
             [("--alternator-enforce-authorization", "true")],
-            Some(scylla_auth_config()),
+            Some(common::scylla_auth_config()),
         )
         .await;
 
         let mut vs_configs = common::get_default_vs_node_configs(&actors).await;
         for config in &mut vs_configs {
-            config.user = Some(SUPERUSER_NAME.clone());
-            config.password = Some(SUPERUSER_PASSWORD.clone());
+            config.user = Some(common::SUPERUSER_NAME.clone());
+            config.password = Some(common::SUPERUSER_PASSWORD.clone());
         }
 
-        common::init_with_config(&actors, scylla_configs, vs_configs).await;
+        common::init_with_config(&actors, scylla_configs, vs_configs, false).await;
 
-        Self { actors }
+        Some(Self { actors })
     }
 
     async fn teardown(self) {

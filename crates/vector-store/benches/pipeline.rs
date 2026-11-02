@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #[path = "../tests/integration/db_basic.rs"]
@@ -17,8 +17,8 @@ use db_basic::Table;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream;
+use httpapi::IndexInfo;
 use httpapi::IndexStatus;
-use httpapi::IndexStatusResponse;
 use itertools::Itertools;
 use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlValue;
@@ -131,6 +131,7 @@ fn default_index_metadata(
         target_columns: NonemptyArc::new(["embedding"]).unwrap(),
         partitioning: DbIndexPartitioning::Global,
         filtering_columns: Arc::new([]),
+        alternator_attribute_types: Default::default(),
         version: Uuid::new_v4().into(),
         kind: IndexKind::Vs(IndexOptionsVs {
             dimensions: NonZeroUsize::new(dimensions).unwrap().into(),
@@ -245,7 +246,7 @@ async fn wait_until_index_is_ready(
     loop {
         let response = client.index_status(keyspace_name, index_name).await;
         if response.status_code() == StatusCode::OK
-            && response.json::<IndexStatusResponse>().status == IndexStatus::Serving
+            && response.json::<IndexInfo>().status == IndexStatus::Serving
         {
             break;
         }

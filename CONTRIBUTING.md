@@ -98,10 +98,10 @@ needs two release binaries plus a ScyllaDB image.
 ```
 
 Build with `run-with-release-toolchain` rather than a plain host `cargo build`.
-The script builds inside the pinned toolchain image and writes to
-`target/<arch>/release/`, producing binaries whose glibc is compatible with the
-ScyllaDB container that runs them. Host-built binaries may link a newer glibc and
-fail to start inside the image.
+The script builds inside the frozen toolchain image `vector-store-toolchain`
+and writes to `target/<arch>/release/`, producing binaries whose glibc is
+compatible with the ScyllaDB container that runs them. Host-built binaries may
+link a newer glibc and fail to start inside the image.
 
 `<arch>` is the `TARGETARCH` the script builds for; it defaults to `amd64`
 (so the path is `target/amd64/release/`). It must match the architecture of the
@@ -191,6 +191,11 @@ We use GitHub Actions for CI, configured in `rust.yml`.
 
 **All checks must pass before a pull request can be merged.**
 
+When a test or job fails in CI, file or update a VECTOR issue and set its
+**Problem Symptom** field to `ci stability`. Use the field rather than a
+label: its values are a fixed list, so every open CI failure can be found
+with `"Problem Symptom" = "ci stability"`.
+
 ## OpenAPI Specification
 
 Vector Store exposes an HTTP REST API, documented in the OpenAPI specification file at `api/openapi.json`.
@@ -204,6 +209,9 @@ cargo openapi
 
 The `api/openapi.json` file must always be synchronized with the actual API definition in the source code.
 This synchronization is enforced by an integration test in our CI pipeline.
+
+The benchmark in [scylladb/vector-store-bench](https://github.com/scylladb/vector-store-bench) uses the API types and client of this repository (`crates/httpapi`, `crates/httpclient`) as git dependencies, pinned to a commit in its `Cargo.lock`.
+CI here does not build the benchmark, so a change to these crates that breaks it needs a matching change in vector-store-bench, which moves the pin with `cargo update -p httpapi -p httpclient`.
 
 When modifying or extending the Vector Store REST API, please follow this convention:
 

@@ -1,5 +1,5 @@
 # Copyright 2025-present ScyllaDB
-# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 [workspace]
 members = ["crates/*"]
@@ -9,16 +9,15 @@ resolver = "3"
 [workspace.package]
 version = "0.0.0-dev"
 edition = "2024"
-license = "LicenseRef-ScyllaDB-Source-Available-1.0"
+license = "LicenseRef-ScyllaDB-Source-Available-1.1"
 
 [workspace.dependencies]
 anyhow = "1.0.97"
 aws-config = "1.8.14"
 aws-credential-types = "1.2.12"
-aws-sdk-dynamodb = { version = "1.105.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { version = "1.127.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1.11.4"
 aws-smithy-types = "1.4.4"
-arrow-array = "56.0.0"
 async-backtrace = "0.2.7"
 async-channel = "2.5.0"
 async-trait = "0.1.88"
@@ -28,27 +27,28 @@ axum-server-dual-protocol = "0.8.0"
 axum-test = "20.0.0"
 bcrypt = "0.15"
 bigdecimal = "0.4"
+bytemuck = { version = "1.23.0", features = ["derive"] }
 bytes = "1.12.0"
 const-hex = "1.18.1"
 clap = { version = "4.5.40", features = ["derive"] }
-chrono = "0.4.43"
 console-subscriber = "0.5.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 cuvs = { git = "https://github.com/NVIDIA/cuvs", rev = "cd4bbab12464c297292e89f5f5fbcaf7c2fbc777" }
 cuvs-sys = { git = "https://github.com/NVIDIA/cuvs", rev = "cd4bbab12464c297292e89f5f5fbcaf7c2fbc777" }
 dashmap = "6.1.0"
 derive_more = { version = "2.0.1", features = ["full"] }
-diskann = { git = "https://github.com/microsoft/DiskANN.git", rev = "90f49467a7558bd53e01f61617c294611a96158d" }
-diskann-vector = { git = "https://github.com/microsoft/DiskANN.git", rev = "90f49467a7558bd53e01f61617c294611a96158d" }
-diskann-inmem = { git = "https://github.com/microsoft/DiskANN.git", rev = "90f49467a7558bd53e01f61617c294611a96158d" }
+diskann = "=0.57.0"
+diskann-vector = "=0.57.0"
+diskann-inmem = "=0.57.0"
+diskann-utils = "=0.57.0"
 dotenvy = "0.15.7"
-e2etest = "0.2.0"
+e2etest = "0.3.1"
 e2etest-dns = "0.1.0"
 e2etest-firewall = "0.1.0"
 e2etest-scylla-cluster = "0.1.1"
 e2etest-scylla-proxy-cluster = "0.1.0"
 e2etest-tls = "0.1.0"
-e2etest-vector-store-cluster = "0.1.1"
+e2etest-vector-store-cluster = "0.1.2"
 futures = "0.3.31"
 hotpath = { version = "0.15.0", features = ["tokio", "futures", "async-channel"] }
 http = "1.4.0"
@@ -58,13 +58,12 @@ humantime = "2.2.0"
 itertools = "0.14.0"
 linkme = "0.3.36"
 macros = { path = "crates/macros" }
-mimalloc = "0.1.48"
+mimalloc = { version = "0.1.48", features = ["override"] }
 mockall = "0.13.1"
 num-bigint = "0.4"
 rustls = "0.23"
 rustls-pki-types = "1.13.1"
 opensearch = { version = "2.3.0", default-features = false, features = ["rustls-tls"] }
-parquet = { version = "56.0.0", features = ["async"] }
 prometheus = "0.14"
 quote = "1.0"
 rand = "0.10.1"
@@ -72,8 +71,8 @@ rcgen = "0.14.5"
 regex = "1.11.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
 rstest = "0.26.1"
-scylla = { version = "1.7.0", features = ["time-03", "rustls-023", "metrics", "bigdecimal-04", "num-bigint-04"] }
-scylla-cdc = "0.6.3"
+scylla = { version = "1.8.0", features = ["time-03", "rustls-023", "metrics", "bigdecimal-04", "num-bigint-04"] }
+scylla-cdc = "0.7.0"
 scylla-proxy = "0.0.5"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -86,23 +85,36 @@ testclient = { path = "crates/testclient" }
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["formatting", "parsing"] }
 tokio = { version = "1.44.2", features = ["full"] }
-tokio-stream = { version = "0.1.17", features = ["full"] }
-toml = "0.9.8"
 tower-http = { version = "0.6.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-test = "0.2.5"
-usearch = "2.22.0"
-utoipa = { version = "5.3.1", features = ["axum_extras"] }
-utoipa-axum = "0.2.0"
-utoipa-swagger-ui = { version = "9.0.0", features = ["axum", "vendored"] }
+usearch = "2.26.5"
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
+utoipa-axum = "0.3.0"
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"] }
 uuid = "1.16.0"
 vector-store = { path = "crates/vector-store" }
 secrecy = "0.10.3"
 
 [patch.crates-io]
+# numkong 7.8.5 with scylladb/NumKong's kernel patches (VECTOR-720, VECTOR-1054), branch
+# f32-accumulate-angular-f32-x86: the opt-in f32 accumulation of the f32 angular kernels on NEON, SVE,
+# Haswell and Skylake (the NEON/SVE part is proposed upstream as ashvardanian/NumKong#393), and f16
+# angular kernels on SVE2 and FEAT_FHM that accumulate with widening multiply-adds instead of
+# converting every lane. The switch is set in .cargo/config.toml. Drop this entry once upstream ships
+# both.
+numkong = { git = "https://github.com/scylladb/NumKong.git", rev = "23067331805af83747a42aea8836a77e071ae294" }
 # Currently, axum-server-dual-protocol doesn't have a published version that supports axum 0.8, so we need to use the git version from the PR.
 axum-server-dual-protocol = { git = "https://github.com/vinchona/axum-server-dual-protocol", rev = "ca6db055254255b74238673ce4135698e347d71c" }
+# The zip that utoipa-swagger-ui unpacks the vendored Swagger UI with is covered by RUSTSEC-2026-0367,
+# -0368 and -0369: 3.0.0 behind release 9.0.2, and 8.6 behind 10.0.1, the latest release. The fix is
+# zip >= 9.0.0, which upstream took in juhaku/utoipa#1645 (2026-10-17) but has not released. utoipa and
+# utoipa-axum come from the same commit, so that one copy of utoipa is linked. Drop these three entries
+# once a utoipa-swagger-ui release depends on zip >= 9.
+utoipa = { git = "https://github.com/juhaku/utoipa", rev = "5aff30b375c0c72aeccfa8fa6100db8f2901b3ba" }
+utoipa-axum = { git = "https://github.com/juhaku/utoipa", rev = "5aff30b375c0c72aeccfa8fa6100db8f2901b3ba" }
+utoipa-swagger-ui = { git = "https://github.com/juhaku/utoipa", rev = "5aff30b375c0c72aeccfa8fa6100db8f2901b3ba" }
 
 [profile.dev]
 opt-level = 1

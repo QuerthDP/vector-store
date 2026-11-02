@@ -1,13 +1,12 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use httpapi::ColumnName;
 use httpapi::Distance;
 use httpapi::IndexInfo;
 use httpapi::IndexName;
-use httpapi::IndexStatusResponse;
 use httpapi::InfoResponse;
 use httpapi::KeyspaceName;
 use httpapi::Limit;
@@ -17,6 +16,10 @@ use httpapi::PostIndexAnnRequest;
 use httpapi::PostIndexAnnResponse;
 use httpapi::PostIndexBm25Request;
 use httpapi::PostIndexBm25Response;
+use httpapi::PostIndexHighlightRequest;
+use httpapi::PostIndexHighlightResponse;
+use httpapi::PostIndexLikeRequest;
+use httpapi::PostIndexLikeResponse;
 use httpapi::SimilarityScore;
 use httpapi::Vector;
 use reqwest::Client;
@@ -90,6 +93,8 @@ impl HttpClient {
             vector,
             filter,
             limit,
+            routing: true,
+            return_columns: vec![],
         };
         self.post_ann_data(keyspace_name, index_name, &request)
             .await
@@ -147,11 +152,80 @@ impl HttpClient {
             .unwrap()
     }
 
+    pub async fn highlight(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        query: String,
+        documents: Vec<String>,
+    ) -> Vec<Option<String>> {
+        self.post_highlight(keyspace_name, index_name, query, documents)
+            .await
+            .json::<PostIndexHighlightResponse>()
+            .await
+            .unwrap()
+            .highlights
+    }
+
+    pub async fn post_highlight(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        query: String,
+        documents: Vec<String>,
+    ) -> reqwest::Response {
+        let request = PostIndexHighlightRequest { query, documents };
+        self.client
+            .post(format!(
+                "{}/indexes/{}/{}/highlight",
+                self.url_api, keyspace_name, index_name
+            ))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    pub async fn like(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+    ) -> HashMap<ColumnName, Vec<Value>> {
+        let resp = self
+            .post_like(keyspace_name, index_name, pattern, limit)
+            .await
+            .json::<PostIndexLikeResponse>()
+            .await
+            .unwrap();
+        resp.primary_keys
+    }
+
+    pub async fn post_like(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+    ) -> reqwest::Response {
+        let request = PostIndexLikeRequest { pattern, limit };
+        self.client
+            .post(format!(
+                "{}/indexes/{}/{}/like",
+                self.url_api, keyspace_name, index_name
+            ))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+    }
+
     pub async fn index_status(
         &self,
         keyspace_name: &KeyspaceName,
         index_name: &IndexName,
-    ) -> anyhow::Result<IndexStatusResponse> {
+    ) -> anyhow::Result<IndexInfo> {
         let response = self
             .client
             .get(format!(
@@ -162,7 +236,7 @@ impl HttpClient {
             .await?;
 
         if response.status().is_success() {
-            Ok(response.json::<IndexStatusResponse>().await?)
+            Ok(response.json::<IndexInfo>().await?)
         } else {
             let status = response.status();
             let error_text = response.text().await?;

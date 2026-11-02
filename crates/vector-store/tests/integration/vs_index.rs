@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::Duration;
@@ -8,21 +8,28 @@ use crate::create_config_channels;
 use crate::db_basic;
 use crate::db_basic::DbBasic;
 use crate::db_basic::ScanFn;
+use crate::db_basic::StoreVectors;
 use crate::db_basic::Table;
 use crate::wait_for;
 use crate::wait_for_value;
 use httpapi::IndexNotReadyReason;
 use httpapi::IndexStatus;
 use httpapi::PostIndexAnnFilter;
+use httpapi::PostIndexAnnRequest;
 use httpapi::PostIndexAnnResponse;
 use httpapi::PostIndexAnnRestriction;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
 use rstest::rstest;
 use scylla::cluster::metadata::NativeType;
+use scylla::value::Counter;
 use scylla::value::CqlValue;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -33,6 +40,7 @@ use vector_store::Config;
 use vector_store::Connectivity;
 use vector_store::DbIndexPartitioning;
 use vector_store::Dimensions;
+use vector_store::DiskannBackendKind;
 use vector_store::ExpansionAdd;
 use vector_store::ExpansionSearch;
 use vector_store::HttpServerExt;
@@ -69,7 +77,21 @@ pub(crate) fn cuvs_test_config() -> Config {
 fn diskann_test_config() -> Config {
     Config {
         vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        use_diskann: true,
+        diskann_backend: Some(DiskannBackendKind::Inmem),
+        ..Default::default()
+    }
+}
+
+/// The DiskANN Scylla backend re-reads the vectors it indexed from the base
+/// table, so the db mock has to keep them.
+fn store_vectors(config: &Config) -> StoreVectors {
+    (config.diskann_backend == Some(DiskannBackendKind::Scylla)).into()
+}
+
+fn diskann_scylla_test_config() -> Config {
+    Config {
+        vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        diskann_backend: Some(DiskannBackendKind::Scylla),
         ..Default::default()
     }
 }
@@ -121,7 +143,7 @@ pub(crate) async fn setup_store_with_quantization(
 ) {
     let node_state = vector_store::new_node_state().await;
 
-    let (db_actor, db) = db_basic::new(node_state.clone());
+    let (db_actor, db) = db_basic::new_with(node_state.clone(), store_vectors(&config));
 
     let primary_keys = primary_keys.into_iter().collect_nonempty_arc().unwrap();
     let columns: Arc<HashMap<_, _>> = Arc::new(columns.into_iter().collect());
@@ -139,6 +161,7 @@ pub(crate) async fn setup_store_with_quantization(
         target_columns: NonemptyArc::new(["embedding"]).unwrap(),
         partitioning,
         filtering_columns,
+        alternator_attribute_types: Default::default(),
         version: Uuid::new_v4().into(),
         kind: IndexKind::Vs(IndexOptionsVs {
             dimensions: dimension,
@@ -238,6 +261,7 @@ pub(crate) async fn setup_store_and_wait_for_index(
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn simple_create_search_delete_index(#[case] config: Config) {
@@ -292,7 +316,8 @@ async fn simple_create_search_delete_index(#[case] config: Config) {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 1);
-    assert_eq!(indexes[0], httpapi::IndexInfo::new("vector", "ann"));
+    assert_eq!(indexes[0].keyspace.as_ref(), "vector");
+    assert_eq!(indexes[0].index.as_ref(), "ann");
 
     let (primary_keys, distances, similarity_scores) = client
         .ann(
@@ -326,12 +351,13 @@ async fn simple_create_search_delete_index(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn failed_db_index_create(#[case] config: Config) {
     crate::enable_tracing();
 
     let node_state = vector_store::new_node_state().await;
-    let (db_actor, db) = db_basic::new(node_state.clone());
+    let (db_actor, db) = db_basic::new_with(node_state.clone(), store_vectors(&config));
 
     let index = IndexMetadata {
         keyspace_name: "vector".into(),
@@ -342,6 +368,7 @@ async fn failed_db_index_create(#[case] config: Config) {
         target_columns: NonemptyArc::new(["embedding"]).unwrap(),
         partitioning: DbIndexPartitioning::Global,
         filtering_columns: Arc::new([]),
+        alternator_attribute_types: Default::default(),
         version: Uuid::new_v4().into(),
         kind: IndexKind::Vs(IndexOptionsVs {
             dimensions: NonZeroUsize::new(3).unwrap().into(),
@@ -412,8 +439,9 @@ async fn failed_db_index_create(#[case] config: Config) {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 2);
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann2")));
+    let names: Vec<_> = indexes.iter().map(|info| info.index.as_ref()).collect();
+    assert!(names.contains(&"ann"));
+    assert!(names.contains(&"ann2"));
 
     db.add_index(
         IndexMetadata {
@@ -433,9 +461,10 @@ async fn failed_db_index_create(#[case] config: Config) {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 3);
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann2")));
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann3")));
+    let names: Vec<_> = indexes.iter().map(|info| info.index.as_ref()).collect();
+    assert!(names.contains(&"ann"));
+    assert!(names.contains(&"ann2"));
+    assert!(names.contains(&"ann3"));
 
     db.del_index(&index.keyspace_name, &"ann2".into()).unwrap();
 
@@ -447,13 +476,375 @@ async fn failed_db_index_create(#[case] config: Config) {
 
     let indexes = client.indexes().await;
     assert_eq!(indexes.len(), 2);
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann")));
-    assert!(indexes.contains(&httpapi::IndexInfo::new("vector", "ann3")));
+    let names: Vec<_> = indexes.iter().map(|info| info.index.as_ref()).collect();
+    assert!(names.contains(&"ann"));
+    assert!(names.contains(&"ann3"));
 }
 
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
+#[tokio::test]
+async fn ann_returns_requested_column_values(#[case] config: Config) {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("color".to_string().into(), NativeType::Text),
+        ],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [Some(CqlValue::Text("red".to_string()))].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                // No "color" stored for this row: it must come back as
+                // null, not be silently omitted or default to a bogus
+                // value.
+                [CqlValue::Int(2)].into(),
+                Some(vec![2., -2., 2.].into()),
+                [None].into(),
+                Timestamp::from_millis(20),
+            ),
+            (
+                [CqlValue::Int(3)].into(),
+                Some(vec![3., 3., 3.].into()),
+                [Some(CqlValue::Text("blue".to_string()))].into(),
+                Timestamp::from_millis(30),
+            ),
+        ])),
+        None,
+        Some(3),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![2.1, -2., 2.].into(),
+                filter: None,
+                limit: NonZeroUsize::new(3).unwrap().into(),
+                routing: true,
+                return_columns: vec!["color".into()],
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: PostIndexAnnResponse = response.json().await.unwrap();
+
+    let pks = response.primary_keys.get(&"pk".into()).unwrap();
+    let colors = response.column_values.get(&"color".into()).unwrap();
+    assert_eq!(pks.len(), 3);
+    assert_eq!(colors.len(), 3);
+
+    // primary_keys, column_values and similarity_scores are aligned
+    // row-by-row, not necessarily in insertion order, so recover the
+    // per-row correspondence from the response itself.
+    let color_by_pk: HashMap<i64, Option<String>> = pks
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .zip(
+            colors
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.as_str().unwrap().to_string())),
+        )
+        .collect();
+    assert_eq!(color_by_pk[&1].as_deref(), Some("red"));
+    assert_eq!(color_by_pk[&2], None);
+    assert_eq!(color_by_pk[&3].as_deref(), Some("blue"));
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_return_columns_null_for_column_not_tracked_by_index(#[case] config: Config) {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Int(1)].into(),
+            Some(vec![1., 1., 1.].into()),
+            [].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+        Some(1),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![1., 1., 1.].into(),
+                filter: None,
+                limit: NonZeroUsize::new(1).unwrap().into(),
+                routing: true,
+                return_columns: vec!["not_a_real_column".into()],
+            },
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: PostIndexAnnResponse = response.json().await.unwrap();
+    assert_eq!(
+        response.column_values.get(&"not_a_real_column".into()),
+        Some(&vec![None])
+    );
+}
+
+/// An ANN request may also ask for the index's own target column - the one
+/// holding the vector. Unlike a filtering column, the table stores no value
+/// for it, so it is reconstructed from the index itself.
+/// This is usearch-only: the other backends can't reconstruct a vector, and
+/// reject the request instead (see the test below).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_return_columns_includes_target_vector() {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        usearch_test_config(),
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Int(1)].into(),
+            Some(vec![1., 2., -3.].into()),
+            [].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+        Some(1),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![1., 2., -3.].into(),
+                filter: None,
+                limit: NonZeroUsize::new(1).unwrap().into(),
+                routing: true,
+                return_columns: vec!["embedding".into()],
+            },
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: PostIndexAnnResponse = response.json().await.unwrap();
+    assert_eq!(
+        response.column_values.get(&"embedding".into()),
+        Some(&vec![Some(serde_json::json!([1.0, 2.0, -3.0]))])
+    );
+}
+
+/// Only usearch can reconstruct the vector it indexed, so asking another
+/// backend for the target column's value must fail loudly rather than come
+/// back as a silently missing value.
+#[rstest]
+#[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_return_columns_target_vector_unsupported(#[case] config: Config) {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [("pk".to_string().into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Int(1)].into(),
+            Some(vec![1., 2., -3.].into()),
+            [].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+        Some(1),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![1., 2., -3.].into(),
+                filter: None,
+                limit: NonZeroUsize::new(1).unwrap().into(),
+                routing: true,
+                return_columns: vec!["embedding".into()],
+            },
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(response.text().await.unwrap().contains("embedding"));
+}
+
+/// Unlike the `ann()` tests above, the `filtered_ann()` ones are usearch
+/// only: filtered search simply isn't implemented for the other backends -
+/// DiskANN rejects a `FilteredAnn` message with "DiskANN index does not
+/// support filtered search" and OpenSearch with "Filtering not supported" -
+/// so this test would fail if given a `diskann`/`diskann_scylla` case.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_filtered_ann_returns_requested_column_values() {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        usearch_test_config(),
+        DbIndexPartitioning::Global,
+        ["pk".into()],
+        1,
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("color".to_string().into(), NativeType::Text),
+        ],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Int(1)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [Some(CqlValue::Text("red".to_string()))].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Int(2)].into(),
+                Some(vec![1., 1., 1.].into()),
+                [Some(CqlValue::Text("blue".to_string()))].into(),
+                Timestamp::from_millis(20),
+            ),
+        ])),
+        None,
+        Some(2),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![1., 1., 1.].into(),
+                filter: Some(PostIndexAnnFilter {
+                    restrictions: vec![PostIndexAnnRestriction::Eq {
+                        lhs: "pk".into(),
+                        rhs: 1.into(),
+                    }],
+                    allow_filtering: true,
+                }),
+                limit: NonZeroUsize::new(10).unwrap().into(),
+                routing: true,
+                return_columns: vec!["color".into()],
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: PostIndexAnnResponse = response.json().await.unwrap();
+
+    assert_eq!(
+        response.primary_keys.get(&"pk".into()).unwrap(),
+        &[Value::from(1)]
+    );
+    assert_eq!(
+        response.column_values.get(&"color".into()).unwrap(),
+        &[Some(Value::from("red"))]
+    );
+}
+
+/// Filtering by a primary-key value that was never indexed (here, pk =
+/// 999, when only pk = 1 was ever inserted) is a well-formed query that
+/// matches zero rows - it's not the same as "no such partition exists".
+/// `column_values` must still come back present, with "color" mapped to
+/// an empty list, rather than being built as an empty map and dropped
+/// from the JSON response by serde's `skip_serializing_if` on an empty
+/// HashMap: the documented contract says `column_values` is absent only
+/// when `return_columns` is empty, which isn't the case here.
+///
+/// usearch only, for the same reason as the test above.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_filtered_ann_returns_empty_column_values_for_partition_with_no_rows() {
+    crate::enable_tracing();
+
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        usearch_test_config(),
+        DbIndexPartitioning::Local(NonemptyArc::new(["pk"]).unwrap()),
+        ["pk".into()],
+        1,
+        [
+            ("pk".to_string().into(), NativeType::Int),
+            ("color".to_string().into(), NativeType::Text),
+        ],
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Int(1)].into(),
+            Some(vec![1., 1., 1.].into()),
+            [Some(CqlValue::Text("red".to_string()))].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+        Some(1),
+    )
+    .await;
+
+    let response = client
+        .post_ann_data(
+            &index.keyspace_name.into(),
+            &index.index_name.into(),
+            &PostIndexAnnRequest {
+                vector: vec![1., 1., 1.].into(),
+                filter: Some(PostIndexAnnFilter {
+                    restrictions: vec![PostIndexAnnRestriction::Eq {
+                        lhs: "pk".into(),
+                        rhs: 999.into(),
+                    }],
+                    allow_filtering: true,
+                }),
+                limit: NonZeroUsize::new(10).unwrap().into(),
+                routing: true,
+                return_columns: vec!["color".into()],
+            },
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: PostIndexAnnResponse = response.json().await.unwrap();
+
+    assert!(response.primary_keys.get(&"pk".into()).unwrap().is_empty());
+    assert_eq!(response.column_values.get(&"color".into()), Some(&vec![]));
+}
+
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn ann_returns_bad_request_when_provided_vector_size_is_not_eq_index_dimensions(
     #[case] config: Config,
@@ -542,6 +933,7 @@ async fn ann_returns_bad_request_when_filtering_required_but_not_allowed() {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Config) {
     crate::enable_tracing();
@@ -595,6 +987,7 @@ async fn ann_fail_while_building_when_node_is_bootstrapping(#[case] config: Conf
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
     crate::enable_tracing();
@@ -681,6 +1074,7 @@ async fn ann_fail_while_building_when_node_is_serving(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
     crate::enable_tracing();
@@ -726,6 +1120,173 @@ async fn ann_failed_when_wrong_number_of_primary_keys(#[case] config: Config) {
         "Waiting for index to be return internal server error on ANN",
     )
     .await;
+}
+
+/// Regression for VECTOR-878.
+/// An inet primary key must not panic the worker.
+#[rstest]
+#[case::usearch(usearch_test_config())]
+#[case::diskann(diskann_test_config())]
+#[tokio::test]
+async fn ann_returns_inet_primary_key(#[case] config: Config) {
+    crate::enable_tracing();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        config,
+        DbIndexPartitioning::Global,
+        vec!["addr".into()],
+        1,
+        [("addr".into(), NativeType::Inet)],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Inet(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))].into(),
+                Some(vec![1., 0., 0.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Inet(IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                )))]
+                .into(),
+                Some(vec![0., 1., 0.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
+        None,
+        Some(2),
+    )
+    .await;
+
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+
+    let (primary_keys, distances, _) = client
+        .ann(
+            &keyspace_name,
+            &index_name,
+            vec![1.0, 0.0, 0.0].into(),
+            None,
+            NonZeroUsize::new(2).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(distances.len(), 2);
+    let addrs = primary_keys.get(&"addr".into()).unwrap();
+    assert_eq!(addrs.len(), 2);
+
+    // Nearest neighbour is the IPv4 row.
+    assert_eq!(addrs.first().unwrap().as_str().unwrap(), "10.0.0.1");
+    assert_eq!(
+        addrs
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<HashSet<_>>(),
+        ["10.0.0.1", "2001:db8::1"].into_iter().collect()
+    );
+}
+
+/// An `inet` filter must match rows, not silently exclude them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_filter_inet_eq() {
+    crate::enable_tracing();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        usearch_test_config(),
+        DbIndexPartitioning::Global,
+        vec!["addr".into()],
+        1,
+        [("addr".into(), NativeType::Inet)],
+        Some(db_basic::scan_fn_vectors([
+            (
+                [CqlValue::Inet(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))].into(),
+                Some(vec![1., 0., 0.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+            (
+                [CqlValue::Inet(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))].into(),
+                Some(vec![0., 1., 0.].into()),
+                [].into(),
+                Timestamp::from_millis(10),
+            ),
+        ])),
+        None,
+        Some(2),
+    )
+    .await;
+
+    let addr_column: httpapi::ColumnName = "addr".into();
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+
+    let (primary_keys, distances, _) = client
+        .ann(
+            &keyspace_name,
+            &index_name,
+            vec![1.0, 0.0, 0.0].into(),
+            Some(PostIndexAnnFilter {
+                restrictions: vec![PostIndexAnnRestriction::Eq {
+                    lhs: addr_column.clone(),
+                    rhs: "10.0.0.2".into(),
+                }],
+                allow_filtering: true,
+            }),
+            NonZeroUsize::new(10).unwrap().into(),
+        )
+        .await;
+
+    // Exactly the filtered row, not an empty result set.
+    assert_eq!(distances.len(), 1);
+    let addrs = primary_keys.get(&addr_column).unwrap();
+    assert_eq!(addrs.len(), 1);
+    assert_eq!(addrs.first().unwrap().as_str().unwrap(), "10.0.0.2");
+}
+
+/// Regression for VECTOR-878.
+/// An unsupported key type must fail the request, not panic the worker.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+async fn ann_returns_error_for_unsupported_primary_key_type() {
+    crate::enable_tracing();
+    let (index, client, _db, _server, _node_state) = setup_store_and_wait_for_index(
+        usearch_test_config(),
+        DbIndexPartitioning::Global,
+        vec!["pk".into()],
+        1,
+        [("pk".into(), NativeType::Int)],
+        Some(db_basic::scan_fn_vectors([(
+            [CqlValue::Counter(Counter(1))].into(),
+            Some(vec![1., 1., 1.].into()),
+            [].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+        Some(1),
+    )
+    .await;
+
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+
+    let response = client
+        .post_ann(
+            &keyspace_name,
+            &index_name,
+            vec![1.0, 1.0, 1.0].into(),
+            None,
+            NonZeroUsize::new(1).unwrap().into(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("unsupported CQL type"),
+        "error should report the unsupported type, got: {message}"
+    );
 }
 
 #[rstest]
@@ -1702,6 +2263,7 @@ async fn http_server_is_responsive_when_index_add_hangs() {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 async fn null_vector_is_not_indexed(#[case] config: Config) {
@@ -1759,6 +2321,7 @@ async fn null_vector_is_not_indexed(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
@@ -1766,7 +2329,7 @@ async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config
     crate::enable_tracing();
 
     let node_state = vector_store::new_node_state().await;
-    let (db_actor, db) = db_basic::new(node_state.clone());
+    let (db_actor, db) = db_basic::new_with(node_state.clone(), store_vectors(&config));
 
     // Use a 1-D Euclidean index so distances are easy to predict.
     let index = IndexMetadata {
@@ -1778,6 +2341,7 @@ async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config
         target_columns: NonemptyArc::new(["embedding"]).unwrap(),
         partitioning: DbIndexPartitioning::Global,
         filtering_columns: Arc::new([]),
+        alternator_attribute_types: Default::default(),
         version: Uuid::new_v4().into(),
         kind: IndexKind::Vs(IndexOptionsVs {
             dimensions: NonZeroUsize::new(1).unwrap().into(),
@@ -1903,6 +2467,7 @@ async fn similarity_scores_are_decreasing_and_correctly_converted(#[case] config
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[tokio::test]
 async fn empty_index_has_zero_count(#[case] config: Config) {
     crate::enable_tracing();
@@ -1933,6 +2498,7 @@ async fn empty_index_has_zero_count(#[case] config: Config) {
 #[rstest]
 #[case::usearch(usearch_test_config())]
 #[case::diskann(diskann_test_config())]
+#[case::diskann_scylla(diskann_scylla_test_config())]
 #[cfg_attr(feature = "gpu", case::cuvs(cuvs_test_config()))]
 #[tokio::test]
 async fn empty_index_returns_empty_ann_results(#[case] config: Config) {

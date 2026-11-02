@@ -1,8 +1,9 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use crate::ColumnName;
 use crate::Connectivity;
 use crate::Dimensions;
 use crate::Distance;
@@ -14,6 +15,7 @@ use crate::PartitionId;
 use crate::SpaceType;
 use crate::Vector;
 use crate::VsIndexFactory;
+use crate::db_index::DbIndex;
 use crate::perf;
 use crate::table::IndexIdGenerator;
 use crate::table::PrimaryId;
@@ -53,6 +55,7 @@ use tracing::warn;
 
 use super::actor::AnnR;
 use super::actor::CountR;
+use super::actor::empty_column_values;
 
 pub struct OpenSearchIndexFactory {
     client: Arc<OpenSearch>,
@@ -91,6 +94,7 @@ impl VsIndexFactory for OpenSearchIndexFactory {
         &self,
         index: VsIndexConfiguration,
         table: Arc<RwLock<Table>>,
+        _db_index: mpsc::Sender<DbIndex>,
     ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
         new(
             index.key,
@@ -297,11 +301,20 @@ async fn process(
         Message::Search(VsIndexSearch::Ann {
             embedding,
             limit,
+            return_columns,
             tx,
             ..
         }) => {
             ann(
-                index_key, tx, embedding, dimensions, limit, space_type, table, client,
+                index_key,
+                tx,
+                embedding,
+                dimensions,
+                limit,
+                space_type,
+                return_columns,
+                table,
+                client,
             )
             .await
         }
@@ -362,12 +375,31 @@ async fn ann(
     dimensions: Dimensions,
     limit: Limit,
     space_type: SpaceType,
+    return_columns: Arc<[ColumnName]>,
     table: Arc<RwLock<impl TableSearch>>,
     client: Arc<OpenSearch>,
 ) {
     if let Err(err) = validator::embedding_dimensions(&embedding, dimensions) {
         return tx_ann
             .send(Err(err))
+            .unwrap_or_else(|_| trace!("ann: unable to send response"));
+    }
+
+    // Only usearch can reconstruct the vector it stored, so asking this index
+    // for its target column is an error rather than a silently missing value.
+    let target_column = {
+        let table = table.read().unwrap();
+        table
+            .index_id(&key)
+            .and_then(|index_id| table.target_column(index_id))
+    };
+    if let Some(target_column) = target_column
+        && return_columns.contains(&target_column)
+    {
+        return tx_ann
+            .send(Err(anyhow!(
+                "ann: returning the indexed column '{target_column}' is not supported by this index"
+            )))
             .unwrap_or_else(|_| trace!("ann: unable to send response"));
     }
 
@@ -419,21 +451,41 @@ async fn ann(
     let index_id = IndexIdGenerator::new().next(true).unwrap();
     let partition_id = PartitionId::global(index_id);
 
-    let hits = {
+    let (keys, scores, column_values) = {
         let table = table.read().unwrap();
-        hits.unwrap()
-            .iter()
-            .map(|hit| {
-                let id = hit["_id"].as_str().unwrap();
-                let score = hit["_score"].as_f64().unwrap();
-                let primary_id = PrimaryId::from(id.parse::<u64>().unwrap());
-                let primary_key = table.primary_key(partition_id, primary_id).unwrap();
-                (primary_key, score)
-            })
-            .collect::<Vec<_>>()
+        let mut keys = Vec::new();
+        let mut scores = Vec::new();
+        let mut column_values = empty_column_values(&return_columns);
+        for hit in hits.unwrap() {
+            let Some(id) = hit["_id"].as_str() else {
+                warn!("ann: hit has no valid '_id' string, skipping: {hit}");
+                continue;
+            };
+            let Some(score) = hit["_score"].as_f64() else {
+                warn!("ann: hit has no valid '_score' number, skipping: {hit}");
+                continue;
+            };
+            let Ok(id) = id.parse::<u64>() else {
+                warn!("ann: hit '_id' is not a valid u64, skipping: {id}");
+                continue;
+            };
+            let primary_id = PrimaryId::from(id);
+            let Some(primary_key) = table.primary_key(partition_id, primary_id) else {
+                debug!(
+                    "not defined primary key for partition_id {partition_id:?} \
+                    and primary_id {primary_id:?}"
+                );
+                continue;
+            };
+            keys.push(primary_key);
+            scores.push(score);
+            for (column, values) in &mut column_values {
+                values.push(table.column_value_for(partition_id, primary_id, column));
+            }
+        }
+        (keys, scores, column_values)
     };
 
-    let (keys, scores): (Vec<_>, Vec<_>) = hits.iter().cloned().unzip();
     let distances: anyhow::Result<Vec<_>> = scores
         .iter()
         .map(|score| Distance::try_from((*score as f32, space_type, Some(dimensions))))
@@ -447,7 +499,7 @@ async fn ann(
     };
 
     tx_ann
-        .send(Ok((keys, distances)))
+        .send(Ok((keys, distances, column_values)))
         .unwrap_or_else(|_| trace!("ann: unable to send response"));
 }
 

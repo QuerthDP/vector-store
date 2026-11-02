@@ -1,11 +1,18 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::Dimensions;
+use crate::alternator;
 use anyhow::anyhow;
 use anyhow::bail;
+use scylla::cluster::metadata::ColumnType;
+use scylla::cluster::metadata::NativeType;
+use scylla::deserialize::DeserializationError;
+use scylla::deserialize::FrameSlice;
+use scylla::deserialize::TypeCheckError;
+use scylla::deserialize::value::DeserializeValue;
 use scylla::value::CqlValue;
 use std::num::NonZeroUsize;
 
@@ -50,7 +57,7 @@ impl TryFrom<CqlValue> for Vector {
                     Ok(f)
                 })
                 .collect(),
-            CqlValue::Blob(bytes) => parse_alternator_vector(&bytes),
+            CqlValue::Blob(bytes) => alternator::parse_alternator_vector(&bytes),
             other => Err(anyhow!(
                 "unsupported CQL type for embedding column: {other:?}"
             )),
@@ -59,78 +66,53 @@ impl TryFrom<CqlValue> for Vector {
     }
 }
 
-/// Alternator type tag for unoptimized JSON encoding.
-/// Type `0x04` (`NOT_SUPPORTED_YET`) is used for any type that does not have an optimized encoding.
-/// The payload is an unoptimized JSON value.
-const ALTERNATOR_TYPE_JSON: u8 = 4;
-
-/// Alternator type tag for the optimized `FLOAT32VECTOR` type.
-/// The value is serialized as this 1-byte tag followed by sequential 32-bit big-endian floats,
-/// matching the CQL `VECTOR<float, N>` on-wire encoding.
-const ALTERNATOR_TYPE_FLOAT32VECTOR: u8 = 5;
-
-/// Parses an Alternator-encoded vector stored as raw bytes.
-///
-/// Alternator prefixes each attribute value in the `:attrs` map column with a 1-byte type discriminator.
-/// Handles two representations based on the discriminator:
-/// - [`ALTERNATOR_TYPE_FLOAT32VECTOR`]: optimized sequential 32-bit big-endian floats.
-/// - [`ALTERNATOR_TYPE_JSON`]: unoptimized JSON representing List values.
-fn parse_alternator_vector(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    match bytes.first() {
-        Some(&ALTERNATOR_TYPE_FLOAT32VECTOR) => parse_alternator_vector_binary(&bytes[1..]),
-        Some(&ALTERNATOR_TYPE_JSON) => parse_alternator_list_json(&bytes[1..]),
-        Some(tag) => bail!("unsupported Alternator type tag: {tag:#04x}"),
-        None => bail!("empty blob for Alternator attribute value"),
-    }
+/// A failure of [`Vector`] decoding, reported through the driver's error
+/// types, which require [`std::error::Error`].
+#[derive(Debug, thiserror::Error)]
+enum EmbeddingColumnError {
+    #[error("unsupported CQL type for an embedding column: {0:?}")]
+    UnsupportedType(ColumnType<'static>),
+    #[error("invalid Alternator embedding: {0:#}")]
+    Alternator(anyhow::Error),
 }
 
-/// Parses the optimized Alternator vector encoding: sequential 32-bit big-endian floats.
-fn parse_alternator_vector_binary(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    let chunks = bytes.chunks_exact(4);
-
-    if !chunks.remainder().is_empty() {
-        bail!(
-            "invalid Alternator vector encoding: byte length {} is not a multiple of 4",
-            bytes.len()
-        );
+/// Deserializes a [`Vector`] straight out of the frame, accepting both
+/// representations an embedding column can have: a native
+/// `vector<float, N>`, deserialized by the driver's [`Vec<f32>`]
+/// deserializer, and a blob, which is an Alternator embedding.
+impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for Vector {
+    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
+        match typ {
+            ColumnType::Vector { .. } => <Vec<f32>>::type_check(typ),
+            ColumnType::Native(NativeType::Blob) => Ok(()),
+            other => Err(TypeCheckError::new(EmbeddingColumnError::UnsupportedType(
+                other.clone().into_owned(),
+            ))),
+        }
     }
 
-    Ok(chunks
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().expect("chunks_exact guarantees 4 bytes");
-            f32::from_be_bytes(arr)
-        })
-        .collect())
-}
-
-/// Parses an Alternator JSON list of numbers: `{"L": [{"N": "..."}, ...]}`.
-fn parse_alternator_list_json(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    #[derive(serde::Deserialize)]
-    struct DynamoDbList {
-        #[serde(rename = "L")]
-        l: Vec<DynamoDbNumber>,
+    fn deserialize(
+        typ: &'metadata ColumnType<'metadata>,
+        v: Option<FrameSlice<'frame>>,
+    ) -> Result<Self, DeserializationError> {
+        match typ {
+            ColumnType::Vector { .. } => <Vec<f32>>::deserialize(typ, v).map(Self::from),
+            // Type-checked above
+            _ => {
+                let bytes = <&'frame [u8]>::deserialize(typ, v)?;
+                alternator::parse_alternator_vector(bytes)
+                    .map(Self::from)
+                    .map_err(|err| DeserializationError::new(EmbeddingColumnError::Alternator(err)))
+            }
+        }
     }
-
-    #[derive(serde::Deserialize)]
-    struct DynamoDbNumber {
-        #[serde(rename = "N")]
-        n: String,
-    }
-
-    let list: DynamoDbList = serde_json::from_slice(bytes)?;
-    list.l
-        .into_iter()
-        .map(|item| {
-            item.n
-                .parse::<f32>()
-                .map_err(|e| anyhow!("invalid value in Alternator list element: {e}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alternator::ALTERNATOR_TYPE_FLOAT32VECTOR;
+    use alternator::ALTERNATOR_TYPE_JSON;
 
     /// Prepend the [`ALTERNATOR_TYPE_JSON`] tag to a DynamoDB JSON string,
     /// mirroring how Alternator serialises List values.
@@ -148,6 +130,53 @@ mod tests {
             v.extend_from_slice(&f.to_be_bytes());
         }
         v
+    }
+
+    fn deserialize_cql_vector(floats: &[f32]) -> anyhow::Result<Vector> {
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Float)),
+            dimensions: floats.len() as u16,
+        };
+        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_be_bytes()).collect();
+        deserialize_column(&typ, &bytes)
+    }
+
+    fn deserialize_blob(bytes: &[u8]) -> anyhow::Result<Vector> {
+        deserialize_column(&ColumnType::Native(NativeType::Blob), bytes)
+    }
+
+    fn deserialize_column(typ: &ColumnType<'static>, bytes: &[u8]) -> anyhow::Result<Vector> {
+        <Vector>::type_check(typ).map_err(|err| anyhow!("{err}"))?;
+        <Vector>::deserialize(typ, Some(FrameSlice::new_borrowed(bytes)))
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    #[test]
+    fn deserialize_from_cql_vector() {
+        let result = deserialize_cql_vector(&[1.0, 2.5, 3.0]).unwrap();
+        assert_eq!(result, Vector::from(vec![1.0, 2.5, 3.0]));
+    }
+
+    #[test]
+    fn deserialize_from_dynamodb_json_blob() {
+        let json = r#"{"L": [{"N": "123.4"}, {"N": "234.5"}, {"N": "345.6"}]}"#;
+        let result = deserialize_blob(&alternator_list_blob(json)).unwrap();
+        assert_eq!(result, Vector::from(vec![123.4, 234.5, 345.6]));
+    }
+
+    #[test]
+    fn deserialize_from_alternator_vector_blob() {
+        let result = deserialize_blob(&alternator_vector_blob(&[1.0, 2.5, 3.0])).unwrap();
+        assert_eq!(result, Vector::from(vec![1.0, 2.5, 3.0]));
+    }
+
+    #[test]
+    fn deserialize_rejects_a_wrong_vector_element_type() {
+        let typ = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Int)),
+            dimensions: 1,
+        };
+        assert!(<Vector>::type_check(&typ).is_err());
     }
 
     #[test]

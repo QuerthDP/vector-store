@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::db_basic;
@@ -168,6 +168,7 @@ async fn quantization_is_returned_as_index_data_type() {
                 assert_eq!(options.quantization, expected_data_type);
             }
             httpapi::IndexOptions::Fulltext(_) => panic!("expected vector index options"),
+            httpapi::IndexOptions::Pattern(_) => panic!("expected vector index options"),
         }
     }
 }

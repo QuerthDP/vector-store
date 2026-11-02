@@ -1,8 +1,9 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use crate::ColumnName;
 use crate::Config;
 use crate::DbIndexPartitioning;
 use crate::IndexKey;
@@ -14,17 +15,23 @@ use crate::db::DbExt;
 use crate::db_index::DbIndex;
 use crate::db_index::DbIndexExt;
 use crate::fts_index::FtsIndex;
+use crate::fts_index::FtsIndexConfiguration;
 use crate::fts_index::FtsIndexFactory;
 use crate::indexes::Indexes;
 use crate::monitor_indexes;
 use crate::monitor_items;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::PatternIndex;
+use crate::pattern_index::PatternIndexConfiguration;
+use crate::pattern_index::PatternIndexFactory;
 use crate::perf;
 use crate::table::Table;
 use crate::vs_index::VsIndexConfiguration;
 use crate::vs_index::VsIndexFactory;
 use crate::vs_index::VsIndexSearch;
+use scylla::cluster::metadata::NativeType;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -42,6 +49,7 @@ use tracing::trace;
 type AddIndexR = anyhow::Result<()>;
 type GetVsIndexR = Option<(mpsc::Sender<VsIndexSearch>, mpsc::Sender<DbIndex>)>;
 type GetFtsIndexR = Option<(mpsc::Sender<FtsIndex>, mpsc::Sender<DbIndex>)>;
+type GetPatternIndexR = Option<(mpsc::Sender<PatternIndex>, mpsc::Sender<DbIndex>)>;
 
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum Engine {
@@ -60,6 +68,10 @@ pub(crate) enum Engine {
         key: IndexKey,
         tx: oneshot::Sender<GetFtsIndexR>,
     },
+    GetPatternIndex {
+        key: IndexKey,
+        tx: oneshot::Sender<GetPatternIndexR>,
+    },
 }
 
 pub(crate) trait EngineExt {
@@ -67,6 +79,7 @@ pub(crate) trait EngineExt {
     async fn del_index(&self, key: IndexKey);
     async fn get_vs_index(&self, key: IndexKey) -> GetVsIndexR;
     async fn get_fts_index(&self, key: IndexKey) -> GetFtsIndexR;
+    async fn get_pattern_index(&self, key: IndexKey) -> GetPatternIndexR;
 }
 
 impl EngineExt for mpsc::Sender<Engine> {
@@ -102,11 +115,21 @@ impl EngineExt for mpsc::Sender<Engine> {
         rx.await
             .expect("EngineExt::get_fts_index: internal actor should send response")
     }
+
+    async fn get_pattern_index(&self, key: IndexKey) -> GetPatternIndexR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Engine::GetPatternIndex { key, tx })
+            .await
+            .expect("EngineExt::get_pattern_index: internal actor should receive request");
+        rx.await
+            .expect("EngineExt::get_pattern_index: internal actor should send response")
+    }
 }
 
 pub(crate) struct IndexFactories {
     pub(crate) vs: Box<dyn VsIndexFactory + Send + Sync>,
     pub(crate) fts: Box<dyn FtsIndexFactory + Send + Sync>,
+    pub(crate) pattern: Box<dyn PatternIndexFactory + Send + Sync>,
 }
 
 pub(crate) async fn new(
@@ -163,6 +186,10 @@ pub(crate) async fn new(
                                 get_fts_index(key, tx, &indexes).await
                             }
 
+                            Engine::GetPatternIndex { key, tx } => {
+                                get_pattern_index(key, tx, &indexes).await
+                            }
+
                         }
                     }
 
@@ -177,6 +204,31 @@ pub(crate) async fn new(
     );
 
     Ok(tx)
+}
+
+/// Builds the in-memory `Table` for `metadata`, given the native-typed columns of the
+/// underlying CQL table.
+fn build_table(
+    key: &IndexKey,
+    metadata: &IndexMetadata,
+    table_columns: Arc<HashMap<ColumnName, NativeType>>,
+) -> anyhow::Result<Table> {
+    let partition_key_columns = match &metadata.partitioning {
+        DbIndexPartitioning::Local(partition_key_columns) => Some(partition_key_columns.clone()),
+        DbIndexPartitioning::Global => None,
+    };
+    // Must match the columns db_index.rs/db_cdc actually fetch a value for,
+    // or Table::new()'s column list goes out of sync with update_columns().
+    let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
+    Table::new(
+        key.clone(),
+        metadata.primary_key_columns.clone(),
+        metadata.partition_key_count,
+        partition_key_columns,
+        metadata.target_columns.clone(),
+        filtering_columns,
+        table_columns,
+    )
 }
 
 async fn add_index(
@@ -208,19 +260,7 @@ async fn add_index(
     };
 
     let table_columns = db_index.get_table_columns().await;
-    let partition_key_columns = match &metadata.partitioning {
-        DbIndexPartitioning::Local(partition_key_columns) => Some(partition_key_columns.clone()),
-        DbIndexPartitioning::Global => None,
-    };
-    let table = match Table::new(
-        key.clone(),
-        metadata.primary_key_columns.clone(),
-        metadata.partition_key_count,
-        partition_key_columns,
-        metadata.target_columns.len(),
-        Arc::clone(&metadata.filtering_columns),
-        table_columns,
-    ) {
+    let table = match build_table(&key, &metadata, table_columns) {
         Ok(table) => Arc::new(RwLock::new(table)),
         Err(err) => {
             debug!("unable to create a table cache for an index {key}: {err}");
@@ -241,10 +281,10 @@ async fn add_index(
         metadata,
     };
 
-    let result = if let IndexKind::Vs(_) = ctx.metadata.kind {
-        add_index_vs(ctx).await
-    } else {
-        add_index_fts(ctx).await
+    let result = match ctx.metadata.kind {
+        IndexKind::Vs(_) => add_index_vs(ctx).await,
+        IndexKind::Fts(_) => add_index_fts(ctx).await,
+        IndexKind::Pattern(_) => add_index_pattern(ctx).await,
     };
 
     match result {
@@ -286,6 +326,7 @@ async fn add_index_vs(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
             quantization: options.quantization,
         },
         Arc::clone(&ctx.table),
+        ctx.db_index.clone(),
     )?;
 
     let monitor_actor = monitor_items::new(
@@ -305,10 +346,17 @@ async fn add_index_vs(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
 }
 
 async fn add_index_fts(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
-    let fts_sender = ctx
-        .index_factories
-        .fts
-        .create_index(ctx.key.clone(), Arc::clone(&ctx.table));
+    let options = ctx.metadata.fts().ok_or_else(|| {
+        anyhow::anyhow!("add_index_fts must be called with a full-text-search index")
+    })?;
+    let fts_sender = ctx.index_factories.fts.create_index(
+        FtsIndexConfiguration {
+            key: ctx.key.clone(),
+            analyzer: options.analyzer,
+            positions: options.positions,
+        },
+        Arc::clone(&ctx.table),
+    );
 
     let monitor_actor = monitor_items::new(
         ctx.key.clone(),
@@ -323,6 +371,38 @@ async fn add_index_fts(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
         crate::indexes::FtsIndexEntry::new(ctx.metadata, fts_sender, monitor_actor, ctx.db_index)
             .await?;
     ctx.indexes.write().unwrap().insert_fts(ctx.key, entry);
+    Ok(())
+}
+
+async fn add_index_pattern(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
+    let _options = ctx
+        .metadata
+        .pattern()
+        .ok_or_else(|| anyhow::anyhow!("add_index_pattern must be called with a pattern index"))?;
+    let pattern_sender = ctx.index_factories.pattern.create_index(
+        PatternIndexConfiguration {
+            key: ctx.key.clone(),
+        },
+        Arc::clone(&ctx.table),
+    );
+
+    let monitor_actor = monitor_items::new(
+        ctx.key.clone(),
+        ctx.table,
+        ctx.embeddings_stream,
+        pattern_sender.clone(),
+        ctx.metrics,
+    )
+    .await?;
+
+    let entry = crate::indexes::PatternIndexEntry::new(
+        ctx.metadata,
+        pattern_sender,
+        monitor_actor,
+        ctx.db_index,
+    )
+    .await?;
+    ctx.indexes.write().unwrap().insert_pattern(ctx.key, entry);
     Ok(())
 }
 
@@ -357,6 +437,20 @@ async fn get_fts_index(
     );
 }
 
+async fn get_pattern_index(
+    key: IndexKey,
+    tx: oneshot::Sender<GetPatternIndexR>,
+    indexes: &RwLock<Indexes>,
+) {
+    _ = tx.send(
+        indexes
+            .read()
+            .unwrap()
+            .get_pattern(&key)
+            .map(|entry| (entry.index().clone(), entry.db_index())),
+    );
+}
+
 async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes>) {
     let actual_indexes: Vec<_> = {
         let indexes = indexes.read().unwrap();
@@ -371,6 +465,14 @@ async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes
                 )
             })
             .chain(indexes.iter_fts().map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.db_index(),
+                    entry.progress(),
+                    entry.status(),
+                )
+            }))
+            .chain(indexes.iter_pattern().map(|(key, entry)| {
                 (
                     key.clone(),
                     entry.db_index(),
@@ -395,6 +497,9 @@ async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes
                 entry.set_progress(new_progress);
                 entry.set_status(new_status);
             } else if let Some(entry) = indexes.get_fts_mut(&key) {
+                entry.set_progress(new_progress);
+                entry.set_status(new_status);
+            } else if let Some(entry) = indexes.get_pattern_mut(&key) {
                 entry.set_progress(new_progress);
                 entry.set_status(new_status);
             }
@@ -428,6 +533,12 @@ pub(crate) mod tests {
             key: IndexKey,
             tx: oneshot::Sender<GetFtsIndexR>,
         ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn get_pattern_index(
+            &self,
+            key: IndexKey,
+            tx: oneshot::Sender<GetPatternIndexR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
     }
 
     pub(crate) fn new(sim: impl SimEngine + Send + 'static) -> mpsc::Sender<Engine> {
@@ -450,6 +561,7 @@ pub(crate) mod tests {
                         Engine::DelIndex { key } => sim.del_index(key).await,
                         Engine::GetVsIndex { key, tx } => sim.get_vs_index(key, tx).await,
                         Engine::GetFtsIndex { key, tx } => sim.get_fts_index(key, tx).await,
+                        Engine::GetPatternIndex { key, tx } => sim.get_pattern_index(key, tx).await,
                     }
                 }
 
@@ -459,5 +571,132 @@ pub(crate) mod tests {
         );
 
         tx
+    }
+
+    /// A local index can declare a filtering column ("ck") that is also one of the base
+    /// table's primary-key columns. This drives build_table() - the code that add_index()
+    /// actually calls - end to end with the real (undeduped) metadata.filtering_columns,
+    /// then upserts a row the way db_index.rs/db_cdc really would (no fetched value for
+    /// "ck", since it comes from the primary key) and checks the target vector and the
+    /// other filtering column ("f") land on the right columns. Unlike
+    /// table::tests::local_index_filtering_on_primary_key_column_stays_aligned, which
+    /// hands Table::new() an already-deduped column list, this test would fail if
+    /// build_table() ever went back to passing metadata.filtering_columns through as-is.
+    #[test]
+    fn build_table_dedupes_filtering_column_shared_with_primary_key() {
+        use crate::Connectivity;
+        use crate::CqlValue;
+        use crate::DbIndexedValue;
+        use crate::Dimensions;
+        use crate::ExpansionAdd;
+        use crate::ExpansionSearch;
+        use crate::IndexOptionsVs;
+        use crate::NonemptyArc;
+        use crate::NonemptyBox;
+        use crate::PrimaryKey;
+        use crate::Quantization;
+        use crate::Restriction;
+        use crate::SpaceType;
+        use crate::Timestamp;
+        use crate::table::Operation;
+        use crate::table::TableModify;
+        use crate::table::TableSearch;
+        use crate::timestamp::Timestamped;
+        use std::collections::BTreeMap;
+        use std::num::NonZeroUsize;
+        use uuid::Uuid;
+
+        let metadata = IndexMetadata {
+            keyspace_name: "ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            // The base table's primary key: "pk" is the partition key, "ck" a
+            // clustering key.
+            primary_key_columns: NonemptyArc::new(["pk", "ck"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["embedding"]).unwrap(),
+            // The local index is partitioned by "pk" alone, so "ck" is not part of
+            // its own partition key either.
+            partitioning: DbIndexPartitioning::Local(NonemptyArc::new(["pk"]).unwrap()),
+            // Declares "ck" (a primary-key column) and "f" (a genuine value column)
+            // as filtering columns, exactly as metadata coming from the DB would.
+            filtering_columns: Arc::new(["ck".into(), "f".into()]),
+            alternator_attribute_types: Arc::new(BTreeMap::new()),
+            version: Uuid::new_v4().into(),
+            kind: IndexKind::Vs(IndexOptionsVs {
+                dimensions: Dimensions(NonZeroUsize::new(3).unwrap()),
+                connectivity: Connectivity::default(),
+                expansion_add: ExpansionAdd::default(),
+                expansion_search: ExpansionSearch::default(),
+                space_type: SpaceType::default(),
+                quantization: Quantization::default(),
+            }),
+        };
+
+        let table_columns = Arc::new(
+            [
+                ("pk".into(), NativeType::Int),
+                ("ck".into(), NativeType::Int),
+                ("f".into(), NativeType::Int),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut table = build_table(&metadata.key(), &metadata, table_columns).unwrap();
+
+        // A row fetched by the real pipeline: a value for the target vector, then a
+        // value for each *non*-primary-key filtering column - "ck" has no value of
+        // its own here, matching db_index.rs/db_cdc.
+        let primary_key: PrimaryKey = [CqlValue::Int(1), CqlValue::Int(2)].into();
+        let values = NonemptyBox::<Timestamped<DbIndexedValue>>::new([
+            Timestamped::new(
+                Timestamp::from_millis(100),
+                Some(DbIndexedValue::Vector(vec![0.1, 0.2, 0.3].into())),
+            ),
+            Timestamped::new(
+                Timestamp::from_millis(100),
+                Some(DbIndexedValue::Filtering(CqlValue::Int(42))),
+            ),
+        ])
+        .unwrap();
+
+        let operations = table
+            .upsert(&metadata.key(), primary_key.clone(), values)
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        let (primary_id, partition_id) = match operations.first().unwrap() {
+            Operation::AddVector {
+                primary_id,
+                partition_id,
+                vector,
+                is_update: false,
+            } => {
+                assert_eq!(vector, &vec![0.1, 0.2, 0.3].into());
+                (*primary_id, *partition_id)
+            }
+            _ => panic!("Expected AddVector operation"),
+        };
+
+        assert_eq!(
+            table.primary_key(partition_id, primary_id).unwrap(),
+            primary_key
+        );
+        assert!(table.is_valid_for(
+            partition_id,
+            primary_id,
+            &Restriction::Eq {
+                lhs: "ck".into(),
+                rhs: CqlValue::Int(2),
+            }
+        ));
+        assert!(table.is_valid_for(
+            partition_id,
+            primary_id,
+            &Restriction::Eq {
+                lhs: "f".into(),
+                rhs: CqlValue::Int(42),
+            }
+        ));
     }
 }

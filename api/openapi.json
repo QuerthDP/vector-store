@@ -4,9 +4,9 @@
     "title": "ScyllaDB Vector Store API",
     "description": "REST API for ScyllaDB Vector Store indexing service. Provides capabilities for executing vector search queries, managing indexes, and checking service status.",
     "license": {
-      "name": "LicenseRef-ScyllaDB-Source-Available-1.0"
+      "name": "LicenseRef-ScyllaDB-Source-Available-1.1"
     },
-    "version": "3.0.0"
+    "version": "3.2.0"
   },
   "paths": {
     "/api/v1/indexes": {
@@ -14,7 +14,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Returns the list of indexes managed by the Vector Store indexing service. The list includes both vector and fulltext indexes in any state (initializing, available/built, destroying). Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB.",
+        "description": "Returns the list of indexes managed by the Vector Store indexing service, each with its current operational status, the total number of items indexed and the progress of the initial table scan that backfills it. The list includes both vector and fulltext indexes in any state (initializing, available/built, destroying). Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB. An index whose item count cannot be obtained, e.g. because it is being removed while the request is served, is omitted from the list.",
         "operationId": "get_indexes",
         "responses": {
           "200": {
@@ -29,6 +29,8 @@
                 },
                 "example": [
                   {
+                    "build_progress": 100.0,
+                    "count": 12345,
                     "index": "my_vector_index",
                     "keyspace": "my_keyspace",
                     "options": {
@@ -39,16 +41,20 @@
                       "search_beam_width": 64,
                       "similarity_function": "COSINE",
                       "type": "vector"
-                    }
+                    },
+                    "status": "SERVING"
                   },
                   {
+                    "build_progress": 37.5,
+                    "count": 42,
                     "index": "my_fulltext_index",
                     "keyspace": "my_keyspace",
                     "options": {
                       "analyzer": "standard",
                       "positions": true,
                       "type": "fulltext"
-                    }
+                    },
+                    "status": "BOOTSTRAPPING"
                   }
                 ]
               }
@@ -62,7 +68,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Retrieves information about a specific index, including its search type and the options it was created with. This is the same information reported per-entry by the `/api/v1/indexes` listing, scoped to a single index.",
+        "description": "Retrieves information about a specific index: its search type, the options it was created with, its current operational status, the total number of items indexed and the progress of the initial table scan that backfills it. Each entry of the `/api/v1/indexes` listing carries the same information.",
         "operationId": "get_index_info",
         "parameters": [
           {
@@ -86,13 +92,15 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful operation. Returns the index's type and creation options.",
+            "description": "Successful operation. Returns the index's type, creation options, and the status it currently reports.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/IndexInfo"
                 },
                 "example": {
+                  "build_progress": 100.0,
+                  "count": 12345,
                   "index": "my_vector_index",
                   "keyspace": "my_keyspace",
                   "options": {
@@ -103,13 +111,24 @@
                     "search_beam_width": 64,
                     "similarity_function": "COSINE",
                     "type": "vector"
-                  }
+                  },
+                  "status": "SERVING"
                 }
               }
             }
           },
           "404": {
             "description": "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error while checking index state or counting indexed items. Possible causes: internal error, or issues accessing the database.",
             "content": {
               "application/json": {
                 "schema": {
@@ -264,7 +283,195 @@
             }
           },
           "400": {
-            "description": "Bad request. Possible causes: malformed input, or missing required fields.",
+            "description": "Bad request. Possible causes: malformed input, unparsable query, or missing required fields.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error while searching. Possible causes: internal error, or search engine issues.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/IndexNotReadyResponse"
+          }
+        }
+      }
+    },
+    "/api/v1/indexes/{keyspace}/{index}/highlight": {
+      "post": {
+        "tags": [
+          "scylla-vector-store-index"
+        ],
+        "description": "Computes a highlighted excerpt (snippet) for each of the supplied document texts. The index is used only to analyze the query and to weight its terms by their document frequency, prioritizing rarer terms when picking which fragment of a long text to show. Highlights are returned in the same order as the requested documents. A document that matches no query term yields `null`. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "operationId": "post_index_highlight",
+        "parameters": [
+          {
+            "name": "keyspace",
+            "in": "path",
+            "description": "The name of the ScyllaDB keyspace containing the index.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyspaceName"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "The name of the full-text index within the specified keyspace to highlight against.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IndexName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostIndexHighlightRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful highlighting. Returns one highlight per requested document, in the requested order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostIndexHighlightResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Possible causes: malformed input, unparsable query, or missing required fields.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error while highlighting. Possible causes: internal error, or search engine issues.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/IndexNotReadyResponse"
+          }
+        }
+      }
+    },
+    "/api/v1/indexes/{keyspace}/{index}/like": {
+      "post": {
+        "tags": [
+          "scylla-vector-store-index"
+        ],
+        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive. The maximum number of results is controlled by the optional 'limit' parameter in the payload. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "operationId": "post_index_like",
+        "parameters": [
+          {
+            "name": "keyspace",
+            "in": "path",
+            "description": "The name of the ScyllaDB keyspace containing the index.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyspaceName"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "The name of the pattern index within the specified keyspace to search.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IndexName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostIndexLikeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful pattern search. Returns a list of primary keys for the relevant documents found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostIndexLikeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Possible causes: malformed input, invalid pattern, or missing required fields.",
             "content": {
               "application/json": {
                 "schema": {
@@ -314,7 +521,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Retrieves the current operational status and item count for a specific index. The response includes the index's state and the total number of items currently indexed (excluding tombstoned or deleted entries). This endpoint enables clients to monitor index readiness and data availability for search operations.",
+        "description": "Returns the same information about a single index as `/api/v1/indexes/{keyspace}/{index}`. Deprecated. Use that endpoint instead.",
         "operationId": "get_index_status",
         "parameters": [
           {
@@ -338,15 +545,26 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful operation. Returns the current operational status of the specified index, including its state and the total number of items currently indexed.",
+            "description": "Successful operation. Returns the index's type, creation options, and the status it currently reports.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/IndexStatusResponse"
+                  "$ref": "#/components/schemas/IndexInfo"
                 },
                 "example": {
                   "build_progress": 100.0,
                   "count": 12345,
+                  "index": "my_vector_index",
+                  "keyspace": "my_keyspace",
+                  "options": {
+                    "construction_beam_width": 128,
+                    "dimensions": 384,
+                    "maximum_node_connections": 16,
+                    "quantization": "F32",
+                    "search_beam_width": 64,
+                    "similarity_function": "COSINE",
+                    "type": "vector"
+                  },
                   "status": "SERVING"
                 }
               }
@@ -363,7 +581,7 @@
             }
           },
           "500": {
-            "description": "Error while checking index state or counting vectors. Possible causes: internal error, or issues accessing the database.",
+            "description": "Error while checking index state or counting indexed items. Possible causes: internal error, or issues accessing the database.",
             "content": {
               "application/json": {
                 "schema": {
@@ -372,7 +590,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/api/v1/info": {
@@ -464,13 +683,27 @@
       },
       "IndexInfo": {
         "type": "object",
-        "description": "Information about an index, such as keyspace, name, and creation options.",
+        "description": "Information about an index: its keyspace, name, creation options, and the status it currently reports.",
         "required": [
           "keyspace",
           "index",
-          "options"
+          "options",
+          "status",
+          "count",
+          "build_progress"
         ],
         "properties": {
+          "build_progress": {
+            "type": "number",
+            "format": "double",
+            "description": "Progress of the initial full table scan that backfills the index,\nexpressed as a percentage in the range `0.0..=100.0`. This reflects\nonly how far the full scan has advanced; it is not a source of truth\nfor the index state. The `status` field is authoritative: an index\nreporting `SERVING` is serving regardless of `build_progress`, which\nmay not reach `100.0` (e.g. if some scan ranges failed).",
+            "maximum": 100,
+            "minimum": 0
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
           "index": {
             "$ref": "#/components/schemas/IndexName"
           },
@@ -479,6 +712,9 @@
           },
           "options": {
             "$ref": "#/components/schemas/IndexOptions"
+          },
+          "status": {
+            "$ref": "#/components/schemas/IndexStatus"
           }
         }
       },
@@ -569,6 +805,29 @@
               }
             ],
             "description": "Full-text search index options."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PatternIndexOptions",
+                "description": "Pattern index options."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "pattern"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Pattern index options."
           }
         ],
         "description": "Options an index was created with, tagged with the index's type."
@@ -586,29 +845,6 @@
           "The index is performing the initial full scan of the underlying table to populate the index.",
           "The index has completed the initial table scan. It is now monitoring the database for changes."
         ]
-      },
-      "IndexStatusResponse": {
-        "type": "object",
-        "required": [
-          "status",
-          "count"
-        ],
-        "properties": {
-          "build_progress": {
-            "type": "number",
-            "format": "double",
-            "description": "Progress of the initial full table scan that backfills the index,\nexpressed as a percentage in the range `0.0..=100.0`. This reflects\nonly how far the full scan has advanced; it is not a source of truth\nfor the index state. The `status` field is authoritative: an index\nreporting `SERVING` is serving regardless of `build_progress`, which\nmay not reach `100.0` (e.g. if some scan ranges failed). Defaults to\n`100.0` when omitted, so a new client talking to an older server that\ndoes not report the field falls back to relying solely on `status`.",
-            "maximum": 100,
-            "minimum": 0
-          },
-          "count": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "status": {
-            "$ref": "#/components/schemas/IndexStatus"
-          }
-        }
       },
       "InfoResponse": {
         "type": "object",
@@ -656,6 +892,10 @@
           "The node has completed the initial database scan and built the indexes defined at that time. It is now monitoring the database for changes."
         ]
       },
+      "PatternIndexOptions": {
+        "type": "object",
+        "description": "Options a pattern index was created with."
+      },
       "PostIndexAnnFilter": {
         "type": "object",
         "description": "A filter used in ANN search requests.",
@@ -685,15 +925,26 @@
           "filter": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PostIndexAnnFilter"
               },
               {
-                "$ref": "#/components/schemas/PostIndexAnnFilter"
+                "type": "null"
               }
             ]
           },
           "limit": {
             "$ref": "#/components/schemas/Limit"
+          },
+          "return_columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnName"
+            },
+            "description": "Column names whose stored values should be returned alongside the primary keys. A column the index doesn't track comes back as null for every row, the same as a tracked column with no stored value for a given row. Empty (the default) means return no column values. The index's own target column - the one holding the vector - may also be requested: no value for it is stored, so it is reconstructed from the index as an array of numbers, in the index's quantization (32-bit floats by default) rather than necessarily the values originally written. Only the usearch index can do this; the other index types reject a request for their target column."
+          },
+          "routing": {
+            "type": "boolean",
+            "description": "By default, the query may be routed to a different, better-matching index on the same column. Set to `false` to force the query to be served by exactly the index named in the URL."
           },
           "vector": {
             "$ref": "#/components/schemas/Vector"
@@ -708,6 +959,18 @@
           "similarity_scores"
         ],
         "properties": {
+          "column_values": {
+            "type": "object",
+            "description": "Per-column stored values for the columns requested in `return_columns`. Each entry maps a column name to a Vec of `Option<Value>` — one entry per returned nearest neighbour, in the same order as `primary_keys`. `None` means the value was not present for that row (e.g. the attribute did not exist when the row was indexed, or the column isn't tracked by the index). Absent when `return_columns` was empty.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {}
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Name of the column in a db table."
+            }
+          },
           "distances": {
             "type": "array",
             "items": {
@@ -1060,6 +1323,82 @@
             "items": {
               "type": "number",
               "format": "float"
+            }
+          }
+        }
+      },
+      "PostIndexHighlightRequest": {
+        "type": "object",
+        "description": "Request body for highlighting.",
+        "required": [
+          "query",
+          "documents"
+        ],
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The documents to highlight."
+          },
+          "query": {
+            "type": "string",
+            "description": "The text query whose terms should be marked in the documents."
+          }
+        }
+      },
+      "PostIndexHighlightResponse": {
+        "type": "object",
+        "description": "Response for highlighting.",
+        "required": [
+          "highlights"
+        ],
+        "properties": {
+          "highlights": {
+            "type": "array",
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": "The highlighted documents. Each document is a string of text with the query terms marked."
+          }
+        }
+      },
+      "PostIndexLikeRequest": {
+        "type": "object",
+        "description": "Request body for LIKE search.",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "limit": {
+            "$ref": "#/components/schemas/Limit"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "The text pattern to search for."
+          }
+        }
+      },
+      "PostIndexLikeResponse": {
+        "type": "object",
+        "description": "Response for LIKE search.",
+        "required": [
+          "primary_keys"
+        ],
+        "properties": {
+          "primary_keys": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {}
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Name of the column in a db table."
             }
           }
         }

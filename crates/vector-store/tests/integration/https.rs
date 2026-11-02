@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::create_config_channels;
@@ -99,6 +99,8 @@ async fn test_https_server_responds() {
             vector: vec![1.0].into(),
             filter: None,
             limit: NonZeroUsize::new(1).unwrap().into(),
+            routing: true,
+            return_columns: vec![],
         })
         .send()
         .await
@@ -111,6 +113,8 @@ async fn test_https_server_responds() {
             vector: vec![1.0].into(),
             filter: None,
             limit: NonZeroUsize::new(1).unwrap().into(),
+            routing: true,
+            return_columns: vec![],
         })
         .send()
         .await

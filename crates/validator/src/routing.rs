@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::TestActors;
@@ -18,7 +18,7 @@ use std::time::Duration;
 use tracing::info;
 
 const ANN_LIMIT: usize = 5;
-const FRAME_DELAY: Duration = Duration::from_millis(100);
+const FRAME_DELAY: Duration = Duration::from_millis(500);
 
 e2etest::group!(
     name = routing,
@@ -31,11 +31,10 @@ struct Fixture {
 }
 
 impl e2etest::Fixture for Fixture {
-    async fn setup(setup: &mut impl e2etest::Setup) -> Self {
-        setup.setup::<TestActors>().await;
-        let actors = setup.get::<TestActors>().await.unwrap();
+    async fn setup(setup: &mut impl e2etest::Setup) -> Option<Self> {
+        let actors = setup.setup::<TestActors>().await?;
         init_with_proxy_single_vs(&actors).await;
-        Self { actors }
+        Some(Self { actors })
     }
 
     async fn teardown(self) {
@@ -129,18 +128,7 @@ async fn ann_routes_to_serving_index_while_replacement_is_bootstrapping(actors: 
         .await
         .expect("failed to drop oldest index");
 
-    wait_for(
-        || async {
-            client
-                .indexes()
-                .await
-                .iter()
-                .all(|i| i.index != oldest.index)
-        },
-        "oldest index must be removed",
-        DEFAULT_OPERATION_TIMEOUT,
-    )
-    .await;
+    wait_for_no_index(client, &oldest).await;
 
     get_query_results(
         format!(
@@ -371,12 +359,7 @@ async fn ann_returns_not_found_after_index_is_dropped(actors: Arc<TestActors>) {
         .await
         .expect("failed to drop index");
 
-    wait_for(
-        || async { client.indexes().await.is_empty() },
-        "index must be removed",
-        DEFAULT_OPERATION_TIMEOUT,
-    )
-    .await;
+    wait_for_no_index(client, &index).await;
 
     session
         .query_unpaged(

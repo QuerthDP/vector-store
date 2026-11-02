@@ -1,14 +1,16 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use crate::Analyzer;
 use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
 use crate::Credentials;
 use crate::DbCustomIndex;
+use crate::DbDriver;
 use crate::DbIndexKind;
 use crate::DbIndexPartitioning;
 use crate::DbIndexedRow;
@@ -17,17 +19,21 @@ use crate::ExpansionAdd;
 use crate::ExpansionSearch;
 use crate::IndexMetadata;
 use crate::IndexName;
+use crate::IndexOptionsFts;
+use crate::IndexOptionsPattern;
 use crate::IndexVersion;
 use crate::KeyspaceName;
 use crate::Metrics;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
+use crate::Positions;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::TableName;
+use crate::cql_types;
+use crate::db_driver::DbIndexInfo;
 use crate::db_index;
 use crate::db_index::DbIndex;
-use crate::db_index_backend;
 use crate::internals::Internals;
 use crate::internals::InternalsExt;
 use crate::node_state::Event;
@@ -39,32 +45,22 @@ use anyhow::anyhow;
 use anyhow::bail;
 use futures::TryStreamExt;
 use regex::Regex;
-use rustls::ClientConfig;
-use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
-use scylla::client::session::Session;
-use scylla::client::session::TlsContext;
-use scylla::client::session_builder::SessionBuilder;
 use scylla::cluster::metadata::ColumnType;
 use scylla::cluster::metadata::NativeType;
-use scylla::cluster::metadata::Table;
-use scylla::statement::prepared::PreparedStatement;
-use scylla::value::CqlTimeuuid;
 use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tap::Pipe;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::Instrument;
 use tracing::debug;
+use tracing::error;
 use tracing::error_span;
 use tracing::info;
 use tracing::trace;
@@ -75,11 +71,11 @@ type GetDbIndexR = anyhow::Result<(
     mpsc::Sender<DbIndex>,
     mpsc::Receiver<(DbIndexedRow, AsyncInProgress)>,
 )>;
-pub(crate) type LatestSchemaVersionR = anyhow::Result<Option<CqlTimeuuid>>;
+pub(crate) type LatestSchemaVersionR = anyhow::Result<Uuid>;
 type GetIndexesR = anyhow::Result<Vec<DbCustomIndex>>;
 type GetIndexVersionR = anyhow::Result<Option<IndexVersion>>;
-type GetIndexTargetTypeR = anyhow::Result<Option<Dimensions>>;
-type GetIndexParamsR = anyhow::Result<
+type GetIndexTargetDimensionsR = anyhow::Result<Option<Dimensions>>;
+type GetVsIndexParamsR = anyhow::Result<
     Option<(
         Connectivity,
         ExpansionAdd,
@@ -88,7 +84,10 @@ type GetIndexParamsR = anyhow::Result<
         Quantization,
     )>,
 >;
+type GetFtsIndexParamsR = anyhow::Result<Option<IndexOptionsFts>>;
+type GetPatternIndexParamsR = anyhow::Result<Option<IndexOptionsPattern>>;
 type IsValidIndexR = bool;
+type IsValidSchemaR = bool;
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -113,31 +112,50 @@ pub enum Db {
         tx: oneshot::Sender<GetIndexVersionR>,
     },
 
-    GetIndexTargetType {
+    GetIndexTargetDimensions {
         keyspace: KeyspaceName,
         table: TableName,
+        index: IndexName,
         target_column: ColumnName,
-        index: IndexName,
-        tx: oneshot::Sender<GetIndexTargetTypeR>,
+        tx: oneshot::Sender<GetIndexTargetDimensionsR>,
     },
 
-    GetIndexParams {
+    GetVsIndexParams {
         keyspace: KeyspaceName,
         table: TableName,
         index: IndexName,
-        tx: oneshot::Sender<GetIndexParamsR>,
+        tx: oneshot::Sender<GetVsIndexParamsR>,
     },
 
-    // Schema changes are concurrent processes without an atomic view from the client/driver side.
-    // A process of retrieving an index metadata from the vector-store could be faster than similar
-    // process in a driver itself. The vector-store reads some schema metadata from system tables
-    // directly, because they are not available from a rust driver, and it reads some other schema
-    // metadata from the rust driver, so there must be an agreement between data read directly from
-    // a db and a driver. This message checks if index metadata are correct and if there is an
-    // agreement on a db schema in the rust driver.
+    GetFtsIndexParams {
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+        tx: oneshot::Sender<GetFtsIndexParamsR>,
+    },
+
+    GetPatternIndexParams {
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+        tx: oneshot::Sender<GetPatternIndexParamsR>,
+    },
+
+    // The vector-store reads some schema metadata from system tables directly, because they are
+    // not available from a rust driver, and it reads some other schema metadata from the rust
+    // driver, so there must be an agreement between data read directly from a db and a driver.
+    // This message checks if index metadata are aligned between a vector-store and a rust driver.
     IsValidIndex {
         metadata: IndexMetadata,
         tx: oneshot::Sender<IsValidIndexR>,
+    },
+
+    // Schema changes are concurrently processed and a vector-store uses system tables which are
+    // in LocalStrategy, so we need to check if the latest schema_version didn't change and
+    // is agreed between all nodes in a cluster.
+    IsValidSchema {
+        schema_version: Uuid,
+        tx: oneshot::Sender<IsValidSchemaR>,
     },
 }
 
@@ -155,22 +173,38 @@ pub(crate) trait DbExt {
         index: IndexName,
     ) -> GetIndexVersionR;
 
-    async fn get_index_target_type(
+    async fn get_index_target_dimensions(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
+        index: IndexName,
         target_column: ColumnName,
-        index: IndexName,
-    ) -> GetIndexTargetTypeR;
+    ) -> GetIndexTargetDimensionsR;
 
-    async fn get_index_params(
+    async fn get_vs_index_params(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
         index: IndexName,
-    ) -> GetIndexParamsR;
+    ) -> GetVsIndexParamsR;
+
+    async fn get_fts_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetFtsIndexParamsR;
+
+    async fn get_pattern_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetPatternIndexParamsR;
 
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR;
+
+    async fn is_valid_schema(&self, schema_version: Uuid) -> IsValidSchemaR;
 }
 
 impl DbExt for mpsc::Sender<Db> {
@@ -209,18 +243,35 @@ impl DbExt for mpsc::Sender<Db> {
         rx.await?
     }
 
-    async fn get_index_target_type(
+    async fn get_index_target_dimensions(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
-        target_column: ColumnName,
         index: IndexName,
-    ) -> GetIndexTargetTypeR {
+        target_column: ColumnName,
+    ) -> GetIndexTargetDimensionsR {
         let (tx, rx) = oneshot::channel();
-        self.send(Db::GetIndexTargetType {
+        self.send(Db::GetIndexTargetDimensions {
             keyspace,
             table,
+            index,
             target_column,
+            tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    async fn get_vs_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetVsIndexParamsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Db::GetVsIndexParams {
+            keyspace,
+            table,
             index,
             tx,
         })
@@ -228,14 +279,31 @@ impl DbExt for mpsc::Sender<Db> {
         rx.await?
     }
 
-    async fn get_index_params(
+    async fn get_fts_index_params(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
         index: IndexName,
-    ) -> GetIndexParamsR {
+    ) -> GetFtsIndexParamsR {
         let (tx, rx) = oneshot::channel();
-        self.send(Db::GetIndexParams {
+        self.send(Db::GetFtsIndexParams {
+            keyspace,
+            table,
+            index,
+            tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    async fn get_pattern_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetPatternIndexParamsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Db::GetPatternIndexParams {
             keyspace,
             table,
             index,
@@ -253,12 +321,22 @@ impl DbExt for mpsc::Sender<Db> {
         rx.await
             .expect("DbExt::is_valid_index: internal actor should send response")
     }
+
+    async fn is_valid_schema(&self, schema_version: Uuid) -> IsValidSchemaR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Db::IsValidSchema { schema_version, tx })
+            .await
+            .expect("DbExt::is_valid_schema: internal actor should receive request");
+        rx.await
+            .expect("DbExt::is_valid_schema: internal actor should send response")
+    }
 }
 
-pub(crate) async fn new(
-    node_state: Sender<NodeState>,
-    internals: Sender<Internals>,
+pub(crate) async fn new<T: DbDriver>(
+    node_state: mpsc::Sender<NodeState>,
+    internals: mpsc::Sender<Internals>,
     mut config_rx: watch::Receiver<Arc<Config>>,
+    db_driver: T,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<mpsc::Sender<Db>> {
     let (tx, mut rx) = mpsc::channel(perf::channel_size().into());
@@ -273,7 +351,7 @@ pub(crate) async fn new(
 
             // Use watch channel to share session, starting with None
             let (session_tx, session_rx) = watch::channel(None);
-            let mut statements: Option<Arc<Statements>> = None;
+            let mut statements: Option<Arc<Statements<T>>> = None;
 
             loop {
                 tokio::select! {
@@ -282,19 +360,34 @@ pub(crate) async fn new(
                         if session_rx.borrow().is_none() {
                             match create_session(
                                 config.clone(),
+                                db_driver.clone(),
                                 &node_state
                             ).await {
                                 Ok(session) => {
-                                    node_state.send_event(Event::ConnectedToDb).await;
-                                    internals.create_session(Some(session.clone())).await;
-                                    session_tx.send(Some(session)).ok();
                                     if statements.is_none() {
-                                        statements = Some(Arc::new(Statements::new(config_rx.clone(), session_rx.clone(), metrics.clone()).await.unwrap()));
+                                        let new_statements = Statements::new(
+                                            session.clone(),
+                                            config_rx.clone(),
+                                            db_driver.clone(),
+                                            session_rx.clone(),
+                                            metrics.clone()
+                                        )
+                                        .await;
+                                        statements = match new_statements {
+                                            Ok(statements) => Some(Arc::new(statements)),
+                                            Err(err) => {
+                                                error!("Failed to prepare statements: {err:#}");
+                                                continue;
+                                            }
+                                        };
                                     }
+                                    node_state.send_event(Event::ConnectedToDb).await;
+                                    internals.create_session(Some(Box::new(session.clone()))).await;
+                                    session_tx.send(Some(session)).ok();
                                     info!("Connected to ScyllaDB at {}", config.scylladb_uri);
                                 }
                                 Err(e) => {
-                                    tracing::error!(
+                                    error!(
                                         "Failed to connect to ScyllaDB (error: {}) at {}, retrying in {}s",
                                         e,
                                         config.scylladb_uri,
@@ -380,23 +473,32 @@ fn respond_with_error(msg: Db, error: anyhow::Error) {
         Db::GetIndexVersion { tx, .. } => {
             let _ = tx.send(Err(error));
         }
-        Db::GetIndexTargetType { tx, .. } => {
+        Db::GetIndexTargetDimensions { tx, .. } => {
             let _ = tx.send(Err(error));
         }
-        Db::GetIndexParams { tx, .. } => {
+        Db::GetVsIndexParams { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
+        Db::GetFtsIndexParams { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
+        Db::GetPatternIndexParams { tx, .. } => {
             let _ = tx.send(Err(error));
         }
         Db::IsValidIndex { tx, .. } => {
             let _ = tx.send(false);
         }
+        Db::IsValidSchema { tx, .. } => {
+            let _ = tx.send(false);
+        }
     }
 }
 
-async fn process(
-    statements: Arc<Statements>,
+async fn process<T: DbDriver>(
+    statements: Arc<Statements<T>>,
     msg: Db,
-    node_state: Sender<NodeState>,
-    internals: Sender<Internals>,
+    node_state: mpsc::Sender<NodeState>,
+    internals: mpsc::Sender<Internals>,
     cdc_error_notify: Arc<Notify>,
 ) {
     match msg {
@@ -427,33 +529,79 @@ async fn process(
             .send(statements.get_index_version(keyspace, table, index).await)
             .unwrap_or_else(|_| trace!("process: Db::GetIndexVersion: unable to send response")),
 
-        Db::GetIndexTargetType {
+        Db::GetIndexTargetDimensions {
             keyspace,
             table,
+            index,
             target_column,
+            tx,
+        } => tx
+            .send(
+                statements
+                    .get_index_target_dimensions(keyspace, table, index, target_column)
+                    .await,
+            )
+            .unwrap_or_else(|_| {
+                trace!("process: Db::GetIndexTargetDimensions: unable to send response")
+            }),
+
+        Db::GetVsIndexParams {
+            keyspace,
+            table,
+            index,
+            tx,
+        } => tx
+            .send(statements.get_vs_index_params(keyspace, table, index).await)
+            .unwrap_or_else(|_| trace!("process: Db::GetVsIndexParams: unable to send response")),
+
+        Db::GetFtsIndexParams {
+            keyspace,
+            table,
             index,
             tx,
         } => tx
             .send(
                 statements
-                    .get_index_target_type(keyspace, table, target_column, index)
+                    .get_fts_index_params(keyspace, table, index)
                     .await,
             )
-            .unwrap_or_else(|_| trace!("process: Db::GetIndexTargetType: unable to send response")),
+            .unwrap_or_else(|_| trace!("process: Db::GetFtsIndexParams: unable to send response")),
 
-        Db::GetIndexParams {
+        Db::GetPatternIndexParams {
             keyspace,
             table,
             index,
             tx,
         } => tx
-            .send(statements.get_index_params(keyspace, table, index).await)
-            .unwrap_or_else(|_| trace!("process: Db::GetIndexParams: unable to send response")),
+            .send(
+                statements
+                    .get_pattern_index_params(keyspace, table, index)
+                    .await,
+            )
+            .unwrap_or_else(|_| {
+                trace!("process: Db::GetPatternIndexParams: unable to send response")
+            }),
 
         Db::IsValidIndex { metadata, tx } => tx
             .send(statements.is_valid_index(metadata).await)
             .unwrap_or_else(|_| trace!("process: Db::IsValidIndex: unable to send response")),
+
+        Db::IsValidSchema { schema_version, tx } => tx
+            .send(statements.is_valid_schema(schema_version).await)
+            .unwrap_or_else(|_| trace!("process: Db::IsValidSchema: unable to send response")),
     }
+}
+
+/// Parses a single value of an index `options` map, falling back to its default
+/// when the option is absent or carries an unsupported value.
+fn parse_index_option<T: FromStr + Default>(options: &BTreeMap<String, String>, name: &str) -> T {
+    let Some(value) = options.get(name) else {
+        return T::default();
+    };
+    value.parse().unwrap_or_else(|_| {
+        warn!("unsupported value '{value}' of the index option '{name}', using the default");
+        T::default()
+    })
 }
 
 fn reconnect_reasons(old_config: &Config, new_config: &Config) -> Vec<&'static str> {
@@ -511,192 +659,54 @@ fn credentials_changed(
     }
 }
 
-struct Statements {
+struct Statements<T: DbDriver> {
     config_rx: watch::Receiver<Arc<Config>>,
-    session_rx: watch::Receiver<Option<Arc<Session>>>,
+    db_driver: T,
+    session_rx: watch::Receiver<Option<T::Session>>,
     metrics: Arc<Metrics>,
-    st_latest_schema_version: PreparedStatement,
-    st_get_indexes: PreparedStatement,
-    st_get_index_target_type: PreparedStatement,
-    st_get_index_options: PreparedStatement,
-    re_get_index_target_type: Regex,
+    st_latest_schema_version: T::Statement,
+    st_get_indexes: T::Statement,
+    st_get_index_target_type: T::Statement,
+    st_get_index_options: T::Statement,
+    re_get_index_target_dimensions: Regex,
 }
 
-async fn create_session(
+async fn create_session<T: DbDriver>(
     config: Arc<Config>,
-    node_state: &Sender<NodeState>,
-) -> anyhow::Result<Arc<Session>> {
+    db_driver: T,
+    node_state: &mpsc::Sender<NodeState>,
+) -> anyhow::Result<T::Session> {
     node_state.send_event(Event::ConnectingToDb).await;
-    let mut builder = SessionBuilder::new()
-        .known_node(&config.scylladb_uri)
-        .pipe(|builder| {
-            if let Some(interval) = config.cql_keepalive_interval {
-                info!("Setting CQL keepalive interval to {interval:?}");
-                builder.keepalive_interval(interval)
-            } else {
-                builder
-            }
-        })
-        .pipe(|builder| {
-            if let Some(timeout) = config.cql_keepalive_timeout {
-                info!("Setting CQL keepalive timeout to {timeout:?}");
-                builder.keepalive_timeout(timeout)
-            } else {
-                builder
-            }
-        })
-        .pipe(|builder| {
-            if let Some(interval) = config.cql_tcp_keepalive_interval {
-                info!("Setting CQL TCP keepalive interval to {interval:?}");
-                builder.tcp_keepalive_interval(interval)
-            } else {
-                builder
-            }
-        })
-        .pipe(|builder| {
-            if let Some(translation_map) = config.cql_uri_translation_map.as_ref() {
-                info!("Setting CQL translation map to {translation_map:?}");
-                builder.address_translator(Arc::new(translation_map.clone()))
-            } else {
-                builder
-            }
-        })
-        .pipe(
-            |builder| match (&config.cql_preferred_datacenter, &config.cql_preferred_rack) {
-                (Some(dc), Some(rack)) => {
-                    info!("Setting preferred CQL datacenter/rack to {dc}/{rack}");
-                    builder.prefer_datacenter_and_rack(dc.clone(), rack.clone())
-                }
-                (Some(dc), None) => {
-                    info!("Setting preferred CQL datacenter to {dc}");
-                    builder.prefer_datacenter(dc.clone())
-                }
-                (None, _) => builder,
-            },
-        );
-
-    if let Some(Credentials {
-        username,
-        password,
-        certificate_path,
-    }) = &config.credentials
-    {
-        // Configure username/password authentication if provided
-        if let (Some(username), Some(password)) = (username, password) {
-            builder = builder.user(username, password.expose_secret());
-            debug!("Username/password authentication configured");
-        }
-
-        // Configure TLS if certificate path is provided
-        if let Some(cert_path) = certificate_path {
-            // Load the CA certificates from the PEM file using async tokio fs
-            let cert_pem = tokio::fs::read(&cert_path)
-                .await
-                .with_context(|| format!("Failed to read certificate file at {cert_path:?}"))?;
-
-            let ca_der = CertificateDer::pem_slice_iter(&cert_pem)
-                .collect::<Result<Vec<_>, _>>()
-                .context("Failed to parse certificate PEM")?;
-
-            let mut root_store = RootCertStore::empty();
-            root_store.add_parsable_certificates(ca_der);
-
-            let client_cfg = ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            let tls_context = TlsContext::from(Arc::new(client_cfg));
-            builder = builder.tls_context(Some(tls_context));
-
-            debug!("TLS (rustls) enabled with certificate from {:?}", cert_path);
-        }
-    }
-
-    let session = if let Some(timeout) = config.cql_connection_timeout {
-        info!("Setting CQL connection timeout to {timeout:?}");
-        let session = tokio::time::timeout(timeout, builder.build())
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "Connection to ScyllaDB at {} timed out after {timeout:?}",
-                    config.scylladb_uri
-                )
-            })??;
-        Arc::new(session)
-    } else {
-        Arc::new(builder.build().await?)
-    };
-
-    let cluster_state = session.get_cluster_state();
-
-    let node = &cluster_state.get_nodes_info()[0];
-
-    if !node.is_enabled() {
-        return Err(anyhow::anyhow!("Node is not enabled"));
-    }
-    // From docs: If the node is enabled and does not have a sharder, this means it's not a ScyllaDB node.
-    let connected_to_scylla = node.sharder().is_some();
-
-    if connected_to_scylla {
-        let version: (String,) = session
-            .query_unpaged(
-                "SELECT version FROM system.versions WHERE key = 'local'",
-                &[],
-            )
-            .await?
-            .into_rows_result()?
-            .single_row()?;
-        info!(
-            "Connected to ScyllaDB {} at {}",
-            version.0, config.scylladb_uri
-        );
-    } else {
-        warn!(
-            "No ScyllaDB node at {}, please verify the URI",
-            config.scylladb_uri
-        );
-    }
-
-    Ok(session)
+    db_driver.connect(config).await
 }
 
-impl Statements {
+impl<T: DbDriver> Statements<T> {
     async fn new(
+        session: T::Session,
         config_rx: watch::Receiver<Arc<Config>>,
-        session_rx: watch::Receiver<Option<Arc<Session>>>,
+        db_driver: T,
+        session_rx: watch::Receiver<Option<T::Session>>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        let session = session_rx.borrow().clone().ok_or_else(|| {
-            anyhow::anyhow!("No session available during Statements initialization")
-        })?;
-
         Ok(Self {
             config_rx,
             metrics,
 
-            st_latest_schema_version: session
-                .prepare(Self::ST_LATEST_SCHEMA_VERSION)
-                .await
-                .context("ST_LATEST_SCHEMA_VERSION")?,
+            st_latest_schema_version: db_driver.prepare_latest_schema_version(&session).await?,
 
-            st_get_indexes: session
-                .prepare(Self::ST_GET_INDEXES)
-                .await
-                .context("ST_GET_INDEXES")?,
+            st_get_indexes: db_driver.prepare_get_indexes(&session).await?,
 
-            st_get_index_target_type: session
-                .prepare(Self::ST_GET_INDEX_TARGET_TYPE)
-                .await
-                .context("ST_GET_INDEX_TARGET_TYPE")?,
+            st_get_index_target_type: db_driver.prepare_get_index_target_type(&session).await?,
 
-            st_get_index_options: session
-                .prepare(Self::ST_GET_INDEX_OPTIONS)
-                .await
-                .context("ST_GET_INDEX_OPTIONS")?,
+            st_get_index_options: db_driver.prepare_get_index_options(&session).await?,
 
-            re_get_index_target_type: Regex::new(Self::RE_GET_INDEX_TARGET_TYPE)
-                .context("RE_GET_INDEX_TARGET_TYPE")?,
+            re_get_index_target_dimensions: Regex::new(Self::RE_GET_INDEX_TARGET_DIMENSIONS)
+                .context(format!(
+                    "regex: {regex}",
+                    regex = Self::RE_GET_INDEX_TARGET_DIMENSIONS
+                ))?,
 
+            db_driver,
             session_rx,
         })
     }
@@ -704,12 +714,13 @@ impl Statements {
     async fn get_db_index(
         &self,
         metadata: IndexMetadata,
-        node_state: Sender<NodeState>,
-        internals: Sender<Internals>,
+        node_state: mpsc::Sender<NodeState>,
+        internals: mpsc::Sender<Internals>,
         cdc_error_notify: Arc<Notify>,
     ) -> GetDbIndexR {
         db_index::new(
             self.config_rx.clone(),
+            self.db_driver.clone(),
             self.session_rx.clone(),
             metadata,
             node_state,
@@ -720,35 +731,16 @@ impl Statements {
         .await
     }
 
-    const ST_LATEST_SCHEMA_VERSION: &str = "
-        SELECT state_id
-        FROM system.group0_history
-        WHERE key = 'history'
-        ORDER BY state_id DESC
-        LIMIT 1
-        ";
-
     async fn latest_schema_version(&self) -> LatestSchemaVersionR {
         let session = self
             .session_rx
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-        Ok(session
-            .execute_iter(self.st_latest_schema_version.clone(), &[])
-            .await?
-            .rows_stream::<(CqlTimeuuid,)>()?
-            .try_next()
-            .await?
-            .map(|(timeuuid,)| timeuuid))
+        self.db_driver
+            .execute_latest_schema_version(&session, &self.st_latest_schema_version)
+            .await
     }
-
-    const ST_GET_INDEXES: &str = "
-        SELECT keyspace_name, index_name, table_name, options
-        FROM system_schema.indexes
-        WHERE kind = 'CUSTOM'
-        ALLOW FILTERING
-        ";
 
     async fn get_indexes(&self) -> GetIndexesR {
         let session = self
@@ -760,64 +752,89 @@ impl Statements {
         #[derive(Debug, derive_more::Display)]
         struct InvalidMetadata;
 
-        let result = session
-            .execute_iter(self.st_get_indexes.clone(), &[])
+        let result = self
+            .db_driver
+            .execute_get_indexes(&session, &self.st_get_indexes)
             .await?
-            .rows_stream::<(String, String, String, BTreeMap<String, String>)>()?
-            .map_err(|err| anyhow::anyhow!("Failed to fetch indexes: {}", err))
-            .try_filter_map(|(keyspace_name, index_name, table_name, mut options)| {
-                let session = session.clone();
-                async move {
-                    let cluster_state = session.get_cluster_state();
-                    let table = cluster_state
-                        .get_keyspace(&keyspace_name)
-                        .ok_or_else(|| {
-                            anyhow!("keyspace {keyspace_name} does not exist")
-                                .context(InvalidMetadata)
-                        })?
-                        .tables
-                        .get(&table_name)
-                        .ok_or_else(|| {
-                            anyhow!("table {table_name} does not exist").context(InvalidMetadata)
-                        })?;
-                    let primary_key_columns = table
-                        .partition_key
-                        .iter()
-                        .chain(table.clustering_key.iter())
-                        .map(ColumnName::from)
-                        .collect_nonempty_arc()
-                        .ok_or_else(|| {
-                            anyhow!("table {table_name} has no primary key columns")
-                                .context(InvalidMetadata)
-                        })?;
-                    let partition_key_count = NonZeroUsize::new(table.partition_key.len()).unwrap();
-                    Ok(options.remove("target").and_then(|target| {
-                        let kind = db_index_kind_from_options(&mut options)?;
-                        from_target_option(table, target, kind)
-                            .map(
-                                |(partitioning, target_column, filtering_columns)| DbCustomIndex {
-                                    keyspace: keyspace_name.into(),
-                                    index: index_name.clone().into(),
-                                    table: table_name.into(),
-                                    primary_key_columns,
-                                    partition_key_count,
-                                    target_columns: NonemptyArc::new([target_column])
-                                        .expect("target column should be non-empty"),
-                                    partitioning,
-                                    filtering_columns,
-                                    kind,
-                                },
+            .try_filter_map(
+                |DbIndexInfo {
+                     keyspace_name,
+                     index_name,
+                     table_name,
+                     mut options,
+                 }| {
+                    let session = session.clone();
+                    async move {
+                        let cluster = self.db_driver.cluster(&session);
+                        let Some(table) =
+                            self.db_driver.table(&cluster, &keyspace_name, &table_name)
+                        else {
+                            return Err(anyhow!(
+                                "table {keyspace_name}.{table_name} does not exist"
                             )
-                            .inspect_err(|err| {
-                                warn!(
-                                    "Skipping index {index_name} \
-                                    due to invalid target option: {err}"
-                                );
+                            .context(InvalidMetadata));
+                        };
+                        let mut partition_key_count = 0;
+                        let primary_key_columns = self
+                            .db_driver
+                            .partition_key(table)
+                            .inspect(|_| {
+                                partition_key_count += 1;
                             })
-                            .ok()
-                    }))
-                }
-            })
+                            .chain(self.db_driver.clustering_key(table))
+                            .collect_nonempty_arc()
+                            .ok_or_else(|| {
+                                anyhow!("table {table_name} has no primary key columns")
+                                    .context(InvalidMetadata)
+                            })?;
+                        let Some(partition_key_count) = NonZeroUsize::new(partition_key_count)
+                        else {
+                            return Err(anyhow!("table {table_name} has no partition key columns")
+                                .context(InvalidMetadata));
+                        };
+                        let is_alternator = keyspace_name.is_alternator();
+                        let alternator_attribute_types = Arc::new(if is_alternator {
+                            options
+                                .remove("alternator_attribute_types")
+                                .map(|v| parse_alternator_attribute_types(&v))
+                                .unwrap_or_default()
+                        } else {
+                            BTreeMap::new()
+                        });
+                        Ok(options.remove("target").and_then(|target| {
+                            let kind = db_index_kind_from_options(&mut options)?;
+                            validate_primary_key_columns(&self.db_driver, table)
+                                .inspect_err(|err| {
+                                    warn!("Skipping index {index_name}: {err}");
+                                })
+                                .ok()?;
+                            from_target_option(&self.db_driver, table, target, kind, is_alternator)
+                                .map(|(partitioning, target_column, filtering_columns)| {
+                                    DbCustomIndex {
+                                        keyspace: keyspace_name,
+                                        index: index_name.clone(),
+                                        table: table_name,
+                                        primary_key_columns,
+                                        partition_key_count,
+                                        target_columns: NonemptyArc::new([target_column])
+                                            .expect("target column should be non-empty"),
+                                        partitioning,
+                                        filtering_columns,
+                                        alternator_attribute_types,
+                                        kind,
+                                    }
+                                })
+                                .inspect_err(|err| {
+                                    warn!(
+                                        "Skipping index {index_name} \
+                                    due to invalid target option: {err}"
+                                    );
+                                })
+                                .ok()
+                        }))
+                    }
+                },
+            )
             .try_collect()
             .await;
         if let Err(err) = &result
@@ -825,51 +842,105 @@ impl Statements {
         {
             // If we encountered invalid metadata, it's likely due to a concurrent schema change.
             // Refresh metadata and return an error to trigger a retry.
-            session.refresh_metadata().await.unwrap_or(());
+            self.db_driver.refresh_metadata(&session).await;
         }
         result
     }
 
-    const ST_GET_INDEX_TARGET_TYPE: &str = "
-        SELECT type
-        FROM system_schema.columns
-        WHERE keyspace_name = ? AND table_name = ? AND column_name = ?
-        ";
-    const RE_GET_INDEX_TARGET_TYPE: &str = r"^vector<float, (?<dimensions>\d+)>$";
+    const RE_GET_INDEX_TARGET_DIMENSIONS: &str = r"^vector<float, (?<dimensions>\d+)>$";
 
-    async fn get_index_target_type(
+    async fn get_index_target_dimensions(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
-        target_column: ColumnName,
         index: IndexName,
-    ) -> GetIndexTargetTypeR {
+        target_column: ColumnName,
+    ) -> GetIndexTargetDimensionsR {
         let session = self
             .session_rx
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
 
-        db_index_backend::get_dimensions(
-            &target_column,
-            &session,
-            &self.st_get_index_target_type,
-            &self.re_get_index_target_type,
-            &self.st_get_index_options,
-            db_index_backend::IndexLocation {
-                keyspace,
-                table,
-                index,
-            },
-        )
-        .await
+        if keyspace.is_alternator() {
+            self.get_dimensions_from_index_options(&session, &keyspace, &table, &index)
+                .await
+        } else {
+            self.get_dimensions_from_column_type(
+                &session,
+                &keyspace,
+                &table,
+                &index,
+                &target_column,
+            )
+            .await
+        }
     }
 
-    const ST_GET_INDEX_OPTIONS: &str = "
-        SELECT options
-        FROM system_schema.indexes
-        WHERE keyspace_name = ? AND table_name = ? AND index_name = ?
-        ";
+    /// Retrieves the vector dimensions for a CQL-native table by parsing the column type.
+    async fn get_dimensions_from_column_type(
+        &self,
+        session: &T::Session,
+        keyspace: &KeyspaceName,
+        table: &TableName,
+        index: &IndexName,
+        target_column: &ColumnName,
+    ) -> GetIndexTargetDimensionsR {
+        let column_type = self
+            .db_driver
+            .execute_get_index_target_type(
+                session,
+                &self.st_get_index_target_type,
+                keyspace,
+                table,
+                target_column,
+            )
+            .await?;
+
+        // A missing row means the node that served the read has not applied the schema change yet.
+        let Some(column_type) = column_type else {
+            bail!(
+                "no type of the column {target_column} for the table {keyspace}.{table} \
+                of the index {index}"
+            );
+        };
+        let dimensions = self
+            .re_get_index_target_dimensions
+            .captures(&column_type)
+            .and_then(|captures| captures["dimensions"].parse::<usize>().ok())
+            .and_then(|dimensions| {
+                NonZeroUsize::new(dimensions).map(|dimensions| dimensions.into())
+            });
+        Ok(dimensions)
+    }
+
+    /// Retrieves the vector dimensions for an Alternator table from the index options.
+    ///
+    /// In Alternator, the schema has no native `VECTOR` type, so the dimension
+    /// is stored in the index option `"dimensions"`.
+    async fn get_dimensions_from_index_options(
+        &self,
+        session: &T::Session,
+        keyspace: &KeyspaceName,
+        table: &TableName,
+        index: &IndexName,
+    ) -> GetIndexTargetDimensionsR {
+        let index_options = self
+            .db_driver
+            .execute_get_index_options(session, &self.st_get_index_options, keyspace, table, index)
+            .await?;
+
+        let Some(mut index_options) = index_options else {
+            bail!("no options for the index {index}");
+        };
+        let dimensions = index_options
+            .remove("dimensions")
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|dimensions| {
+                NonZeroUsize::new(dimensions).map(|dimensions| dimensions.into())
+            });
+        Ok(dimensions)
+    }
 
     async fn get_index_version(
         &self,
@@ -882,13 +953,16 @@ impl Statements {
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-        let options = session
-            .execute_iter(self.st_get_index_options.clone(), (keyspace, table, index))
-            .await?
-            .rows_stream::<(BTreeMap<String, String>,)>()?
-            .try_next()
-            .await?
-            .map(|(options,)| options);
+        let options = self
+            .db_driver
+            .execute_get_index_options(
+                &session,
+                &self.st_get_index_options,
+                &keyspace,
+                &table,
+                &index,
+            )
+            .await?;
         Ok(options.map(|mut options| {
             IndexVersion(
                 options
@@ -899,48 +973,44 @@ impl Statements {
         }))
     }
 
-    async fn get_index_params(
+    async fn get_index_options(
         &self,
         keyspace: KeyspaceName,
         table: TableName,
         index: IndexName,
-    ) -> GetIndexParamsR {
+    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
         let session = self
             .session_rx
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-        let options = session
-            .execute_iter(self.st_get_index_options.clone(), (keyspace, table, index))
-            .await?
-            .rows_stream::<(BTreeMap<String, String>,)>()?
-            .try_next()
-            .await?
-            .map(|(options,)| options);
-        Ok(options.map(|mut options| {
-            let connectivity = options
-                .remove("maximum_node_connections")
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(Connectivity)
-                .unwrap_or_default();
-            let expansion_add = options
-                .remove("construction_beam_width")
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(ExpansionAdd)
-                .unwrap_or_default();
-            let expansion_search = options
-                .remove("search_beam_width")
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(ExpansionSearch)
-                .unwrap_or_default();
-            let space_type = options
-                .remove("similarity_function")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_default();
-            let quantization = options
-                .remove("quantization")
-                .and_then(|s| s.parse::<Quantization>().ok())
-                .unwrap_or_default();
+        self.db_driver
+            .execute_get_index_options(
+                &session,
+                &self.st_get_index_options,
+                &keyspace,
+                &table,
+                &index,
+            )
+            .await
+    }
+
+    async fn get_vs_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetVsIndexParamsR {
+        let options = self.get_index_options(keyspace, table, index).await?;
+        Ok(options.map(|options| {
+            let connectivity: Connectivity =
+                parse_index_option(&options, "maximum_node_connections");
+            let expansion_add: ExpansionAdd =
+                parse_index_option(&options, "construction_beam_width");
+            let expansion_search: ExpansionSearch =
+                parse_index_option(&options, "search_beam_width");
+            let space_type: SpaceType = parse_index_option(&options, "similarity_function");
+            let quantization: Quantization = parse_index_option(&options, "quantization");
             (
                 connectivity,
                 expansion_add,
@@ -951,56 +1021,90 @@ impl Statements {
         }))
     }
 
+    async fn get_fts_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetFtsIndexParamsR {
+        let options = self.get_index_options(keyspace, table, index).await?;
+        Ok(options.map(|options| {
+            let analyzer: Analyzer = parse_index_option(&options, "analyzer");
+            let positions: Positions = parse_index_option(&options, "positions");
+            IndexOptionsFts {
+                analyzer,
+                positions,
+            }
+        }))
+    }
+
+    async fn get_pattern_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetPatternIndexParamsR {
+        let options = self.get_index_options(keyspace, table, index).await?;
+        Ok(options.map(|_| IndexOptionsPattern {}))
+    }
+
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR {
         let Some(session) = self.session_rx.borrow().clone() else {
             debug!("is_valid_index: no active session for {}", metadata.key());
             return false;
         };
-        let Ok(version_begin) = session.await_schema_agreement().await else {
-            debug!("is_valid_index: schema not agreed for {}", metadata.key());
-            return false;
-        };
-        let cluster_state = session.get_cluster_state();
+
+        let cluster = self.db_driver.cluster(&session);
 
         // check a keyspace
-        let Some(keyspace) = cluster_state.get_keyspace(metadata.keyspace_name.as_ref()) else {
+        if !self
+            .db_driver
+            .is_keyspace(&cluster, &metadata.keyspace_name)
+        {
             debug!(
                 "is_valid_index: no keyspace in a cluster state for {}",
                 metadata.key()
             );
             // missing the keyspace in the cluster_state, metadata should be refreshed
-            session.refresh_metadata().await.unwrap_or(());
+            self.db_driver.refresh_metadata(&session).await;
             return false;
         };
 
         // check a table
-        if !keyspace.tables.contains_key(metadata.table_name.as_ref()) {
+        if !self
+            .db_driver
+            .is_table(&cluster, &metadata.keyspace_name, &metadata.table_name)
+        {
             debug!("is_valid_index: no table for {}", metadata.key());
             // missing the table in the cluster_state, metadata should be refreshed
-            session.refresh_metadata().await.unwrap_or(());
+            self.db_driver.refresh_metadata(&session).await;
             return false;
         }
 
         // check a cdc log table
-        if !keyspace
-            .tables
-            .contains_key(&format!("{}_scylla_cdc_log", metadata.table_name))
+        if !self
+            .db_driver
+            .is_cdc(&cluster, &metadata.keyspace_name, &metadata.table_name)
         {
             debug!("is_valid_index: no cdc log for {}", metadata.key());
             // missing the cdc log in the cluster_state, metadata should be refreshed
-            session.refresh_metadata().await.unwrap_or(());
+            self.db_driver.refresh_metadata(&session).await;
             return false;
         }
 
-        // check if schema version changed
-        let Ok(Some(version_end)) = session.check_schema_agreement().await else {
-            debug!(
-                "is_valid_index: schema not agreed for {} finally",
-                metadata.key()
-            );
+        true
+    }
+
+    async fn is_valid_schema(&self, schema_version: Uuid) -> IsValidSchemaR {
+        let Some(session) = self.session_rx.borrow().clone() else {
+            debug!("is_valid_schema: no active session");
             return false;
         };
-        version_begin == version_end
+        let Ok(Some(agreed_version)) = self.db_driver.check_schema_agreement(&session).await else {
+            debug!("is_valid_schema: schema not agreed");
+            return false;
+        };
+        agreed_version == schema_version
     }
 }
 
@@ -1020,24 +1124,65 @@ struct LegacyTargetOption {
     ck: Vec<String>,
 }
 
-fn parse_target_option(table: &Table, value: &str) -> anyhow::Result<Option<TargetOption>> {
+fn parse_target_option<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
+    value: &str,
+) -> anyhow::Result<Option<TargetOption>> {
     if let Ok(target) = serde_json::from_str::<TargetOption>(value) {
         return Ok(Some(target));
     }
     if let Ok(legacy) = serde_json::from_str::<LegacyTargetOption>(value) {
-        return Ok(Some(convert_legacy_target_option(table, legacy)?));
+        return Ok(Some(convert_legacy_target_option(
+            db_driver, table, legacy,
+        )?));
     };
     Ok(None)
 }
 
-fn convert_legacy_target_option(
-    table: &Table,
+/// Parses an Alternator index's "alternator_attribute_types" option: a JSON
+/// map from attribute name to declared DynamoDB type ("S"/"N"/"B"). While
+/// in Alternator in general attributes do not have a declared type, those
+/// used in SearchSchema (i.e. filtering and hash columns) do have a declared
+/// type, and Alternator stores it here, in alternator_attribute_types.
+fn parse_alternator_attribute_types(value: &str) -> BTreeMap<ColumnName, NativeType> {
+    serde_json::from_str::<BTreeMap<String, String>>(value)
+        .unwrap_or_else(|err| {
+            warn!(
+                "unsupported value '{value}' of the index option 'alternator_attribute_types': {err}, \
+                using the default"
+            );
+            BTreeMap::new()
+        })
+        .into_iter()
+        .filter_map(|(name, dynamodb_type)| {
+            let native_type = match dynamodb_type.as_str() {
+                "S" => NativeType::Text,
+                "N" => NativeType::Decimal,
+                "B" => NativeType::Blob,
+                _ => {
+                    warn!(
+                        "unsupported declared type '{dynamodb_type}' for attribute '{name}' \
+                        in the index option 'alternator_attribute_types', ignoring"
+                    );
+                    return None;
+                }
+            };
+            Some((ColumnName::from(name), native_type))
+        })
+        .collect()
+}
+
+fn convert_legacy_target_option<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
     mut target_option: LegacyTargetOption,
 ) -> anyhow::Result<TargetOption> {
-    let is_local = target_option
-        .pk
-        .iter()
-        .all(|pk_col| table.partition_key.contains(pk_col));
+    let is_local = target_option.pk.iter().all(|pk_col| {
+        db_driver
+            .partition_key(table)
+            .any(|col| col.as_ref() == pk_col)
+    });
 
     if is_local {
         let Some(target_column) = target_option.ck.first().cloned() else {
@@ -1066,6 +1211,7 @@ fn db_index_kind_from_options(options: &mut BTreeMap<String, String>) -> Option<
     match options.remove("class_name").as_deref() {
         Some("vector_index") | None => Some(DbIndexKind::VectorSearch),
         Some("fulltext_index") => Some(DbIndexKind::FullTextSearch),
+        Some("pattern_index") => Some(DbIndexKind::Pattern),
         Some(unknown) => {
             debug!("unrecognized index class_name: {unknown:?}, skipping index");
             None
@@ -1073,25 +1219,31 @@ fn db_index_kind_from_options(options: &mut BTreeMap<String, String>) -> Option<
     }
 }
 
-fn from_target_option(
-    table: &Table,
+fn from_target_option<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
     value: String,
     kind: DbIndexKind,
+    is_alternator: bool,
 ) -> anyhow::Result<(DbIndexPartitioning, ColumnName, Arc<[ColumnName]>)> {
-    let Some(target) = parse_target_option(table, &value)? else {
+    let Some(target) = parse_target_option(db_driver, table, &value)? else {
         // Global index with a single target column
         return Ok((DbIndexPartitioning::Global, value.into(), Arc::new([])));
     };
 
-    validate_target_column(table, &target.target_column, kind)?;
+    // Alternator's tc/pk columns may not be real columns in the table.
+    if !is_alternator {
+        validate_target_column(db_driver, table, &target.target_column, kind)?;
+    }
 
     let partitioning = if target.partition_key_columns.is_empty() {
         DbIndexPartitioning::Global
     } else {
-        if let Some(invalid) = target
-            .partition_key_columns
-            .iter()
-            .find(|pk_col| !table.columns.contains_key(*pk_col))
+        if !is_alternator
+            && let Some(invalid) = target
+                .partition_key_columns
+                .iter()
+                .find(|pk_col| db_driver.column(table, &(*pk_col).into()).is_none())
         {
             bail!("invalid target option: pk column {invalid} is not in the table's columns");
         }
@@ -1118,15 +1270,40 @@ fn from_target_option(
     ))
 }
 
-fn validate_target_column(
-    table: &Table,
+fn validate_target_column<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
     target_name: &str,
     kind: DbIndexKind,
 ) -> anyhow::Result<()> {
-    let column = table.columns.get(target_name).ok_or_else(|| {
-        anyhow!("invalid target option: column {target_name} does not exist in a table")
-    })?;
+    let column = db_driver
+        .column(table, &target_name.into())
+        .ok_or_else(|| {
+            anyhow!("invalid target option: column {target_name} does not exist in a table")
+        })?;
     validate_column_type_for_kind(target_name, &column.typ, kind)
+}
+
+fn validate_primary_key_columns<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
+) -> anyhow::Result<()> {
+    for name in db_driver
+        .partition_key(table)
+        .chain(db_driver.clustering_key(table))
+    {
+        let column = db_driver.column(table, &name).ok_or(anyhow!(
+            "primary key column {name} does not exist in a table"
+        ))?;
+        if !cql_types::is_supported(&column.typ) {
+            bail!(
+                "unsupported primary key column type: column {name} has type {:?}, \
+                which cannot be represented in an index primary key",
+                column.typ
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_column_type_for_kind(
@@ -1142,7 +1319,7 @@ fn validate_column_type_for_kind(
                 );
             }
         }
-        DbIndexKind::FullTextSearch => {
+        DbIndexKind::FullTextSearch | DbIndexKind::Pattern => {
             if !matches!(
                 column_type,
                 ColumnType::Native(NativeType::Text) | ColumnType::Native(NativeType::Ascii)
@@ -1190,27 +1367,49 @@ pub(crate) mod tests {
             tx: oneshot::Sender<GetIndexVersionR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
-        fn get_index_target_type(
+        fn get_index_target_dimensions(
             &self,
             keyspace: KeyspaceName,
             table: TableName,
             target_column: ColumnName,
             index: IndexName,
-            tx: oneshot::Sender<GetIndexTargetTypeR>,
+            tx: oneshot::Sender<GetIndexTargetDimensionsR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
-        fn get_index_params(
+        fn get_vs_index_params(
             &self,
             keyspace: KeyspaceName,
             table: TableName,
             index: IndexName,
-            tx: oneshot::Sender<GetIndexParamsR>,
+            tx: oneshot::Sender<GetVsIndexParamsR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn get_fts_index_params(
+            &self,
+            keyspace: KeyspaceName,
+            table: TableName,
+            index: IndexName,
+            tx: oneshot::Sender<GetFtsIndexParamsR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn get_pattern_index_params(
+            &self,
+            keyspace: KeyspaceName,
+            table: TableName,
+            index: IndexName,
+            tx: oneshot::Sender<GetPatternIndexParamsR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
         fn is_valid_index(
             &self,
             metadata: IndexMetadata,
             tx: oneshot::Sender<IsValidIndexR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn is_valid_schema(
+            &self,
+            schema_version: Uuid,
+            tx: oneshot::Sender<IsValidSchemaR>,
         ) -> impl Future<Output = ()> + Send + 'static;
     }
 
@@ -1240,25 +1439,52 @@ pub(crate) mod tests {
                             tx,
                         } => sim.get_index_version(keyspace, table, index, tx).await,
 
-                        Db::GetIndexTargetType {
+                        Db::GetIndexTargetDimensions {
                             keyspace,
                             table,
                             target_column,
                             index,
                             tx,
                         } => {
-                            sim.get_index_target_type(keyspace, table, target_column, index, tx)
-                                .await
+                            sim.get_index_target_dimensions(
+                                keyspace,
+                                table,
+                                target_column,
+                                index,
+                                tx,
+                            )
+                            .await
                         }
 
-                        Db::GetIndexParams {
+                        Db::GetVsIndexParams {
                             keyspace,
                             table,
                             index,
                             tx,
-                        } => sim.get_index_params(keyspace, table, index, tx).await,
+                        } => sim.get_vs_index_params(keyspace, table, index, tx).await,
+
+                        Db::GetFtsIndexParams {
+                            keyspace,
+                            table,
+                            index,
+                            tx,
+                        } => sim.get_fts_index_params(keyspace, table, index, tx).await,
+
+                        Db::GetPatternIndexParams {
+                            keyspace,
+                            table,
+                            index,
+                            tx,
+                        } => {
+                            sim.get_pattern_index_params(keyspace, table, index, tx)
+                                .await
+                        }
 
                         Db::IsValidIndex { metadata, tx } => sim.is_valid_index(metadata, tx).await,
+
+                        Db::IsValidSchema { schema_version, tx } => {
+                            sim.is_valid_schema(schema_version, tx).await
+                        }
                     }
                 }
 
@@ -1268,6 +1494,34 @@ pub(crate) mod tests {
         );
 
         tx
+    }
+
+    #[test]
+    fn index_option_is_parsed_when_supported() {
+        let options = BTreeMap::from([("maximum_node_connections".to_string(), "48".to_string())]);
+
+        assert_eq!(
+            parse_index_option::<Connectivity>(&options, "maximum_node_connections"),
+            Connectivity::from(48)
+        );
+    }
+
+    #[test]
+    fn index_option_falls_back_to_default_when_unsupported() {
+        let options = BTreeMap::from([("search_beam_width".to_string(), "many".to_string())]);
+
+        assert_eq!(
+            parse_index_option::<ExpansionSearch>(&options, "search_beam_width"),
+            ExpansionSearch::default()
+        );
+    }
+
+    #[test]
+    fn index_option_falls_back_to_default_when_missing() {
+        assert_eq!(
+            parse_index_option::<Connectivity>(&BTreeMap::new(), "maximum_node_connections"),
+            Connectivity::default()
+        );
     }
 
     #[test]
@@ -1381,6 +1635,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn db_index_kind_from_options_pattern() {
+        let mut options = BTreeMap::from([("class_name".to_string(), "pattern_index".to_string())]);
+        assert_eq!(
+            db_index_kind_from_options(&mut options),
+            Some(DbIndexKind::Pattern)
+        );
+        assert!(!options.contains_key("class_name"));
+    }
+
+    #[test]
     fn db_index_kind_from_options_absent() {
         let mut options = BTreeMap::new();
         assert_eq!(
@@ -1393,6 +1657,43 @@ pub(crate) mod tests {
     fn db_index_kind_from_options_unknown_returns_none() {
         let mut options = BTreeMap::from([("class_name".to_string(), "unknown_kind".to_string())]);
         assert_eq!(db_index_kind_from_options(&mut options), None);
+    }
+
+    #[test]
+    fn parse_alternator_attribute_types_valid() {
+        let types =
+            parse_alternator_attribute_types(r#"{"color": "S", "price": "N", "thumbnail": "B"}"#);
+        assert_eq!(
+            types,
+            BTreeMap::from([
+                (ColumnName::from("color"), NativeType::Text),
+                (ColumnName::from("price"), NativeType::Decimal),
+                (ColumnName::from("thumbnail"), NativeType::Blob),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_alternator_attribute_types_empty_object() {
+        assert!(parse_alternator_attribute_types("{}").is_empty());
+    }
+
+    #[test]
+    fn parse_alternator_attribute_types_malformed_json_defaults_to_empty() {
+        assert!(parse_alternator_attribute_types("not json").is_empty());
+        assert!(parse_alternator_attribute_types(r#"{"color": 5}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_alternator_attribute_types_unrecognized_type_is_omitted() {
+        // "BOOL" isn't one of the DynamoDB types we synthesize a NativeType
+        // for - the column is omitted rather than kept with a placeholder,
+        // so it's indistinguishable from a column with no declared type.
+        let types = parse_alternator_attribute_types(r#"{"flag": "BOOL", "color": "S"}"#);
+        assert_eq!(
+            types,
+            BTreeMap::from([(ColumnName::from("color"), NativeType::Text)])
+        );
     }
 
     #[test]
@@ -1453,6 +1754,47 @@ pub(crate) mod tests {
             dimensions: 3,
         };
         let result = validate_column_type_for_kind("col", &col_type, DbIndexKind::FullTextSearch);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a text column")
+        );
+    }
+
+    #[test]
+    fn validate_pattern_accepts_text_column() {
+        let col_type = ColumnType::Native(NativeType::Text);
+        assert!(validate_column_type_for_kind("doc", &col_type, DbIndexKind::Pattern).is_ok());
+    }
+
+    #[test]
+    fn validate_pattern_accepts_ascii_column() {
+        let col_type = ColumnType::Native(NativeType::Ascii);
+        assert!(validate_column_type_for_kind("doc", &col_type, DbIndexKind::Pattern).is_ok());
+    }
+
+    #[test]
+    fn validate_pattern_rejects_non_text_column() {
+        let col_type = ColumnType::Native(NativeType::Int);
+        let result = validate_column_type_for_kind("col", &col_type, DbIndexKind::Pattern);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a text column")
+        );
+    }
+
+    #[test]
+    fn validate_pattern_rejects_vector_column() {
+        let col_type = ColumnType::Vector {
+            typ: Box::new(ColumnType::Native(NativeType::Float)),
+            dimensions: 3,
+        };
+        let result = validate_column_type_for_kind("col", &col_type, DbIndexKind::Pattern);
         assert!(result.is_err());
         assert!(
             result

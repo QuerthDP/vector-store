@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::Metrics;
@@ -107,7 +107,7 @@ impl CDCCheckpointSaver for MetricsCheckpointSaver {
     async fn load_last_checkpoint(
         &self,
         _stream_id: &StreamID,
-    ) -> anyhow::Result<Option<chrono::Duration>> {
+    ) -> anyhow::Result<Option<Duration>> {
         Ok(None)
     }
 }

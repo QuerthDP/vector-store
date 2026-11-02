@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::ColumnName;
@@ -18,6 +18,7 @@ use crate::db_index::DbIndexExt;
 use crate::fts_index::FtsIndex;
 use crate::monitor_items::MonitorItems;
 use crate::node_state::IndexStatus;
+use crate::pattern_index::PatternIndex;
 use crate::vs_index::VsIndexSearch;
 use scylla::cluster::metadata::NativeType;
 use std::collections::HashMap;
@@ -99,6 +100,7 @@ impl<I, D: std::fmt::Debug> std::fmt::Debug for IndexEntry<I, D> {
 
 pub(crate) type VsIndexEntry = IndexEntry<VsIndexSearch, VsIndexData>;
 pub(crate) type FtsIndexEntry = IndexEntry<FtsIndex, FtsIndexData>;
+pub(crate) type PatternIndexEntry = IndexEntry<PatternIndex, PatternIndexData>;
 
 #[derive(Debug)]
 pub(crate) struct VsIndexData {
@@ -113,6 +115,11 @@ pub(crate) struct VsIndexData {
 #[derive(Debug)]
 pub(crate) struct FtsIndexData {
     options: crate::IndexOptionsFts,
+}
+
+#[derive(Debug)]
+pub(crate) struct PatternIndexData {
+    options: crate::IndexOptionsPattern,
 }
 
 impl<I, D> IndexEntry<I, D> {
@@ -245,12 +252,9 @@ impl FtsIndexEntry {
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
     ) -> anyhow::Result<Self> {
-        let options = metadata
-            .fts()
-            .ok_or_else(|| {
-                anyhow::anyhow!("add_index_fts must be called with a fulltext-search index")
-            })?
-            .clone();
+        let options = *metadata.fts().ok_or_else(|| {
+            anyhow::anyhow!("add_index_fts must be called with a fulltext-search index")
+        })?;
         let progress = db_index.full_scan_progress().await;
         Ok(Self {
             index,
@@ -268,15 +272,41 @@ impl FtsIndexEntry {
     }
 }
 
+impl PatternIndexEntry {
+    pub(crate) async fn new(
+        metadata: IndexMetadata,
+        index: mpsc::Sender<PatternIndex>,
+        monitor: mpsc::Sender<MonitorItems>,
+        db_index: mpsc::Sender<DbIndex>,
+    ) -> anyhow::Result<Self> {
+        let options = *metadata.pattern().ok_or_else(|| {
+            anyhow::anyhow!("PatternIndexEntry::new must be called with a pattern index")
+        })?;
+        let progress = db_index.full_scan_progress().await;
+        Ok(Self {
+            index,
+            _monitor: monitor,
+            db_index,
+            status: IndexStatus::Initializing,
+            progress,
+            primary_key_columns: metadata.primary_key_columns,
+            data: PatternIndexData { options },
+        })
+    }
+
+    pub(crate) fn options(&self) -> &crate::IndexOptionsPattern {
+        &self.data.options
+    }
+}
+
 /// Result of routing an ANN query to the best matching VS index.
 pub(crate) enum BestIndexState {
     /// The requested index does not exist at all.
     NotFound,
     /// The requested index exists but no serving candidate was found.
     NotServing(Progress),
-    /// Serving candidates exist but none can handle a global query
-    /// (all are local-only and the query lacks partition key restrictions).
-    NoGlobalIndex,
+    /// Serving candidates exist but none can handle a query with the given restrictions
+    NoMatchingIndex,
     /// A serving candidate was found.
     Serving {
         key: IndexKey,
@@ -294,6 +324,7 @@ pub(crate) struct Indexes {
     vs_entries: HashMap<IndexKey, VsIndexEntry>,
     vs_routing: HashMap<RoutingGroupKey, Vec<IndexKey>>,
     fts_entries: HashMap<IndexKey, FtsIndexEntry>,
+    pattern_entries: HashMap<IndexKey, PatternIndexEntry>,
 }
 
 impl Indexes {
@@ -302,6 +333,7 @@ impl Indexes {
             vs_entries: HashMap::new(),
             vs_routing: HashMap::new(),
             fts_entries: HashMap::new(),
+            pattern_entries: HashMap::new(),
         }
     }
 
@@ -321,8 +353,18 @@ impl Indexes {
         self.fts_entries.get_mut(key)
     }
 
+    pub(crate) fn get_pattern(&self, key: &IndexKey) -> Option<&PatternIndexEntry> {
+        self.pattern_entries.get(key)
+    }
+
+    pub(crate) fn get_pattern_mut(&mut self, key: &IndexKey) -> Option<&mut PatternIndexEntry> {
+        self.pattern_entries.get_mut(key)
+    }
+
     pub(crate) fn contains_key(&self, key: &IndexKey) -> bool {
-        self.vs_entries.contains_key(key) || self.fts_entries.contains_key(key)
+        self.vs_entries.contains_key(key)
+            || self.fts_entries.contains_key(key)
+            || self.pattern_entries.contains_key(key)
     }
 
     pub(crate) fn insert_vs(&mut self, key: IndexKey, entry: VsIndexEntry) {
@@ -335,6 +377,10 @@ impl Indexes {
         self.fts_entries.insert(key, entry);
     }
 
+    pub(crate) fn insert_pattern(&mut self, key: IndexKey, entry: PatternIndexEntry) {
+        self.pattern_entries.insert(key, entry);
+    }
+
     pub(crate) fn remove(&mut self, key: &IndexKey) -> bool {
         if let Some(entry) = self.vs_entries.remove(key) {
             if let Entry::Occupied(mut e) = self.vs_routing.entry(entry.data.routing_group) {
@@ -344,8 +390,10 @@ impl Indexes {
                 }
             }
             true
+        } else if self.fts_entries.remove(key).is_some() {
+            true
         } else {
-            self.fts_entries.remove(key).is_some()
+            self.pattern_entries.remove(key).is_some()
         }
     }
 
@@ -357,10 +405,14 @@ impl Indexes {
         self.fts_entries.iter()
     }
 
+    pub(crate) fn iter_pattern(&self) -> impl Iterator<Item = (&IndexKey, &PatternIndexEntry)> {
+        self.pattern_entries.iter()
+    }
+
     /// Determines the index to route a query to, given a requested `IndexKey`.
     ///
-    /// To ensure queries are routed to the most up-to-date and best-matching index,
-    /// this function applies the following routing logic:
+    /// When `routing` is `true`, ensures queries are routed to the most
+    /// up-to-date and best-matching index by applying the following logic:
     ///
     /// 1. Returns `NotFound` if the requested index key does not exist.
     /// 2. Identifies all candidate indexes within the same routing group
@@ -370,19 +422,27 @@ impl Indexes {
     /// 5. Picks the candidate with the highest score, breaking ties by
     ///    the newest `IndexVersion`.
     /// 6. Returns `NotServing` if no candidate meets the criteria.
+    ///
+    /// When `routing` is `false`, the only candidate considered is the
+    /// requested index itself - the query is served by exactly the named
+    /// index, or not at all.
     pub(crate) fn best_index(
         &self,
         key: &IndexKey,
         equality_columns: &[ColumnName],
         range_columns: &[ColumnName],
+        routing: bool,
     ) -> BestIndexState {
         let Some(requested_entry) = self.vs_entries.get(key) else {
             return BestIndexState::NotFound;
         };
-        let candidates = self
-            .vs_routing
-            .get(&requested_entry.data.routing_group)
-            .expect("routing_map must contain group for every index in indexes");
+        let candidates: &[IndexKey] = if routing {
+            self.vs_routing
+                .get(&requested_entry.data.routing_group)
+                .expect("routing_map must contain group for every index in indexes")
+        } else {
+            std::slice::from_ref(key)
+        };
 
         let routed_key = candidates
             .iter()
@@ -422,7 +482,7 @@ impl Indexes {
                     .filter_map(|key| self.vs_entries.get(key))
                     .any(|entry| entry.status == IndexStatus::Serving);
                 if has_serving {
-                    BestIndexState::NoGlobalIndex
+                    BestIndexState::NoMatchingIndex
                 } else {
                     BestIndexState::NotServing(requested_entry.progress)
                 }

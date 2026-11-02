@@ -7,11 +7,13 @@ mod device;
 mod index;
 mod params;
 
+use crate::ColumnName;
 use crate::Config;
 use crate::IndexKey;
 use crate::Limit;
 use crate::Vector;
 use crate::VsIndexFactory;
+use crate::db_index::DbIndex;
 use crate::perf;
 use crate::table::Table;
 use crate::table::TableSearch;
@@ -20,6 +22,7 @@ use crate::vs_index::Message;
 use crate::vs_index::VsIndexModify;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::actor::AnnR;
+use crate::vs_index::actor::empty_column_values;
 use crate::vs_index::factory::VsIndexConfiguration;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -50,6 +53,7 @@ impl VsIndexFactory for CuvsIndexFactory {
         &self,
         index: VsIndexConfiguration,
         table: Arc<RwLock<Table>>,
+        _db_index: mpsc::Sender<DbIndex>,
     ) -> anyhow::Result<(mpsc::Sender<VsIndexModify>, mpsc::Sender<VsIndexSearch>)> {
         let is_global = table
             .read()
@@ -231,9 +235,17 @@ fn handle(
             index_key,
             embedding,
             limit,
+            return_columns,
             tx,
         })) => {
-            _ = tx.send(ann(index, table, &index_key, &embedding, limit));
+            _ = tx.send(ann(
+                index,
+                table,
+                &index_key,
+                &embedding,
+                limit,
+                &return_columns,
+            ));
         }
         Request::Message(Message::Search(VsIndexSearch::FilteredAnn { tx, .. })) => {
             _ = tx.send(Err(anyhow!(
@@ -249,21 +261,41 @@ fn ann(
     index_key: &IndexKey,
     embedding: &Vector,
     limit: Limit,
+    return_columns: &[ColumnName],
 ) -> AnnR {
     let Some((partition_id, _)) = table.read().unwrap().partition_id(index_key, None) else {
         warn!("partition id not found for index key {index_key} during ann");
-        return Ok((vec![], vec![]));
+        return Ok((vec![], vec![], empty_column_values(return_columns)));
     };
+
+    // The graph keeps the vectors on the GPU only, so the indexed column
+    // cannot be returned.
+    if let Some(target_column) = table
+        .read()
+        .unwrap()
+        .target_column(partition_id.index_id())
+        .filter(|target_column| return_columns.contains(target_column))
+    {
+        bail!("returning the indexed column '{target_column}' is not supported by cuVS");
+    }
 
     let matches = index.search(embedding, limit)?;
 
     let table = table.read().unwrap();
-    Ok(matches
-        .into_iter()
-        .filter_map(|(primary_id, distance)| {
-            Some((table.primary_key(partition_id, primary_id)?, distance))
-        })
-        .unzip())
+    let mut primary_keys = Vec::new();
+    let mut distances = Vec::new();
+    let mut column_values = empty_column_values(return_columns);
+    for (primary_id, distance) in matches {
+        let Some(primary_key) = table.primary_key(partition_id, primary_id) else {
+            continue;
+        };
+        primary_keys.push(primary_key);
+        distances.push(distance);
+        for (column, values) in &mut column_values {
+            values.push(table.column_value_for(partition_id, primary_id, column));
+        }
+    }
+    Ok((primary_keys, distances, column_values))
 }
 
 #[cfg(test)]
@@ -302,7 +334,7 @@ mod tests {
                 NonemptyArc::new(["pk"]).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 Some(NonemptyArc::new(["pk"]).unwrap()),
-                NonZeroUsize::new(1).unwrap(),
+                NonemptyArc::new(["embedding"]).unwrap(),
                 Arc::new([]),
                 Arc::new(HashMap::from([("pk".into(), NativeType::Int)])),
             )
@@ -324,6 +356,7 @@ mod tests {
                     quantization: Quantization::default(),
                 },
                 table,
+                mpsc::channel(1).0,
             )
             .unwrap_err();
         assert!(err.to_string().contains("local indexes"));

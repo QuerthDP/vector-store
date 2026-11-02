@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::TestActors;
@@ -29,10 +29,9 @@ struct Fixture {
 }
 
 impl e2etest::Fixture for Fixture {
-    async fn setup(setup: &mut impl e2etest::Setup) -> Self {
-        setup.setup::<TestActors>().await;
-        let actors = setup.get::<TestActors>().await.unwrap();
-        Self { actors }
+    async fn setup(setup: &mut impl e2etest::Setup) -> Option<Self> {
+        let actors = setup.setup::<TestActors>().await?;
+        Some(Self { actors })
     }
 
     async fn teardown(self) {
@@ -108,7 +107,7 @@ async fn reloads_tls_identity_after_cert_file_rotation(actors: Arc<TestActors>) 
         );
     }
 
-    init_with_config(&actors, scylla_configs, vs_configs).await;
+    init_with_config(&actors, scylla_configs, vs_configs, true).await;
 
     wait_for(
         || async { https_status_ok(&vs_ips, &cert_v1).await },

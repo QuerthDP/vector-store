@@ -9,7 +9,10 @@ cd $repo
 
 vector_store_version=$(./scripts/run-with-release-toolchain cargo info vector-store | grep ^version: | cut -d ' ' -f 2)
 
-archs="amd64 arm64"
+# architectures to build could be given as arguments (a subset of the default
+# list), e.g. `./scripts/build-dockers arm64`; defaults to all release
+# architectures
+archs="${*:-amd64 arm64}"
 
 dockerfile=$(cat <<EOF
 FROM redhat/ubi9-minimal
@@ -28,13 +31,9 @@ $dockerfile
 EOF
 done
 
-for arch in $archs ; do
-    [[ -z $platform ]] && platform="linux/$arch" || platform="$platform,linux/$arch"
-done
-
-echo Build the multi-arch docker image for $platform
-docker build --platform $platform --tag $docker_tag -f- . <<EOF
-$dockerfile
-EOF
+# the multi-arch image is not built here: the default docker driver cannot
+# store a multi-platform image in the classic image store, so the combined
+# tag is assembled from the pushed per-arch images at upload time (see
+# scripts/upload-dockers and the release workflow)
 
 docker images -f "reference=$docker_tag*"

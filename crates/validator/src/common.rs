@@ -1,11 +1,12 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::TestActors;
 use async_backtrace::framed;
 use e2etest_dns::DnsExt;
+use e2etest_firewall::FirewallExt;
 use e2etest_scylla_cluster::ScyllaClusterExt;
 use e2etest_scylla_cluster::ScyllaNodeConfig;
 use e2etest_scylla_proxy_cluster::ScyllaProxyClusterExt;
@@ -16,19 +17,23 @@ use e2etest_vector_store_cluster::VectorStoreNodeConfig;
 use httpapi::IndexInfo;
 use httpapi::IndexName;
 use httpapi::IndexStatus;
-use httpapi::IndexStatusResponse;
 use httpapi::KeyspaceName;
 use httpclient::HttpClient;
 use itertools::Itertools;
 use scylla::client::session::Session;
 use scylla::client::session::TlsContext;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::deserialize::row::DeserializeRow;
+use scylla::policies::host_filter::AllowListHostFilter;
 use scylla::response::query_result::QueryRowsResult;
+use scylla::serialize::row::SerializeRow;
 use scylla::statement::Statement;
 use std::collections::HashMap;
 use std::iter;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -36,6 +41,7 @@ use std::time::Instant;
 use tap::Pipe;
 use tokio::time;
 use tracing::info;
+use uuid::Uuid;
 
 pub const DEFAULT_TEST_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,6 +50,7 @@ pub const VS_NAMES: [&str; 3] = ["vs1", "vs2", "vs3"];
 
 pub const VS_PORT: u16 = 6080;
 pub const DB_PORT: u16 = 9042;
+pub const ALTERNATOR_PORT: u16 = 8000;
 
 pub const DB_OCTET_1: u8 = 1;
 pub const DB_OCTET_2: u8 = 2;
@@ -54,6 +61,115 @@ pub const DB_PROXY_OCTET_3: u8 = 13;
 pub const VS_OCTET_1: u8 = 21;
 pub const VS_OCTET_2: u8 = 22;
 pub const VS_OCTET_3: u8 = 23;
+
+const INDEX_STATUS_UPDATE_INTERVAL: &str = "100ms";
+
+// Credentials for the default, reduced-privilege role that the Vector Store
+// uses to connect to ScyllaDB, mirroring the setup used in production deployments.
+pub const DEFAULT_DB_USER: &str = "vector_store";
+pub const DEFAULT_DB_PASSWORD: &str = "vector_store_password";
+
+/// Fine-grained indexing permissions granted to `DEFAULT_DB_USER`, mirroring
+/// the reduced-privilege role used in production deployments rather than full `SELECT` access.
+const DEFAULT_ROLE_PERMISSIONS: &[&str] = &["VECTOR_SEARCH_INDEXING", "TEXT_SEARCH_INDEXING"];
+
+pub(crate) static SUPERUSER_NAME: LazyLock<String> =
+    LazyLock::new(|| Uuid::new_v4().simple().to_string());
+pub(crate) static SUPERUSER_PASSWORD: LazyLock<String> =
+    LazyLock::new(|| Uuid::new_v4().simple().to_string());
+static SUPERUSER_SALTED_PASSWORD: LazyLock<String> = LazyLock::new(|| {
+    bcrypt::hash(&*SUPERUSER_PASSWORD, bcrypt::DEFAULT_COST)
+        .expect("failed to hash superuser password")
+});
+
+/// Builds the ScyllaDB config YAML with authentication enabled and superuser credentials set.
+pub fn scylla_auth_config() -> Vec<u8> {
+    let name = &*SUPERUSER_NAME;
+    let salted = &*SUPERUSER_SALTED_PASSWORD;
+    format!(
+        "authenticator: PasswordAuthenticator\n\
+         authorizer: CassandraAuthorizer\n\
+         auth_superuser_name: '{name}'\n\
+         auth_superuser_salted_password: '{salted}'"
+    )
+    .into_bytes()
+}
+
+/// Connects to ScyllaDB as the superuser and creates `DEFAULT_DB_USER`,
+/// granting it the reduced-privilege indexing permissions
+/// (`DEFAULT_ROLE_PERMISSIONS`) that the Vector Store uses by default.
+#[framed]
+async fn setup_default_role(actors: &TestActors, tls: bool) {
+    info!("Setting up default role '{DEFAULT_DB_USER}' with indexing permissions");
+
+    let session = if tls {
+        prepare_connection_with_auth(actors, &SUPERUSER_NAME, &SUPERUSER_PASSWORD)
+            .await
+            .0
+    } else {
+        prepare_connection_with_auth_no_tls(actors, &SUPERUSER_NAME, &SUPERUSER_PASSWORD)
+            .await
+            .0
+    };
+
+    session
+        .query_unpaged(
+            format!(
+                "CREATE ROLE {DEFAULT_DB_USER} WITH PASSWORD = '{DEFAULT_DB_PASSWORD}' AND LOGIN = true"
+            ),
+            (),
+        )
+        .await
+        .expect("failed to create default role");
+
+    for permission in DEFAULT_ROLE_PERMISSIONS {
+        let query = format!("GRANT {permission} ON ALL KEYSPACES TO {DEFAULT_DB_USER}");
+        session
+            .query_unpaged(query, ())
+            .await
+            .unwrap_or_else(|err| {
+                panic!("failed to grant {permission} to {DEFAULT_DB_USER}: {err}")
+            });
+    }
+
+    for ip in get_default_db_ips(actors) {
+        wait_for_role_login(actors, ip, tls).await;
+    }
+}
+
+#[framed]
+async fn wait_for_role_login(actors: &TestActors, ip: Ipv4Addr, tls: bool) {
+    let tls_context = if tls {
+        Some(TlsContext::from(actors.tls.client_tls_config().await))
+    } else {
+        None
+    };
+
+    // Without a host filter the driver discovers the whole cluster and opens
+    // DEFAULT_DB_USER connections to every node, so probing one node authenticates
+    // against nodes that have not been verified yet.
+    // To avoid this, we use a host filter that only allows the specific node we're probing.
+    let addr = SocketAddr::from((ip, DB_PORT));
+    let host_filter = Arc::new(
+        AllowListHostFilter::new([addr]).expect("failed to build the allow list host filter"),
+    );
+
+    wait_for(
+        || async {
+            SessionBuilder::new()
+                .known_node_addr(addr)
+                .user(DEFAULT_DB_USER, DEFAULT_DB_PASSWORD)
+                .tls_context(tls_context.clone())
+                .host_filter(host_filter.clone())
+                .build()
+                .await
+                .is_ok()
+        },
+        format!("node {ip} must accept '{DEFAULT_DB_USER}' credentials"),
+        DEFAULT_OPERATION_TIMEOUT,
+    )
+    .await;
+}
 
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, derive_more::From, derive_more::AsRef, derive_more::Display,
@@ -103,6 +219,19 @@ pub fn get_default_db_proxy_ips(actors: &TestActors) -> Vec<Ipv4Addr> {
     ]
 }
 
+/// Arguments enabling the Alternator (DynamoDB-compatible) endpoint on a node.
+///
+/// NOTE: `--alternator-ttl-period-in-seconds` is already set in the default
+/// scylla args (0.5s). ScyllaDB rejects duplicate flags.
+pub fn default_alternator_args(node_ip: Ipv4Addr) -> Vec<String> {
+    vec![
+        format!("--alternator-port={ALTERNATOR_PORT}"),
+        format!("--alternator-address={node_ip}"),
+        "--alternator-write-isolation=only_rmw_uses_lwt".to_string(),
+        "--alternator-enforce-authorization=false".to_string(),
+    ]
+}
+
 #[framed]
 pub async fn get_default_scylla_node_configs(actors: &TestActors) -> Vec<ScyllaNodeConfig> {
     let default_vs_urls = get_default_vs_urls(actors).await;
@@ -113,14 +242,16 @@ pub async fn get_default_scylla_node_configs(actors: &TestActors) -> Vec<ScyllaN
         .enumerate()
         .map(|(i, &ip)| {
             let mut vs_urls = default_vs_urls.clone();
+            let mut args = e2etest_scylla_cluster::default_scylla_args();
+            args.extend(default_alternator_args(ip));
             ScyllaNodeConfig {
                 db_ip: ip,
                 primary_vs_uris: vec![vs_urls.remove(i)],
                 secondary_vs_uris: vs_urls,
-                args: e2etest_scylla_cluster::default_scylla_args(),
+                args,
                 cert_path: Some(cert_path.clone()),
                 key_path: Some(key_path.clone()),
-                extra_config: None,
+                extra_config: Some(scylla_auth_config()),
             }
         })
         .collect()
@@ -157,8 +288,8 @@ pub async fn get_default_vs_node_configs(actors: &TestActors) -> Vec<VectorStore
         .map(|(&vs_ip, &db_ip)| VectorStoreNodeConfig {
             vs_ip,
             db_ip,
-            user: None,
-            password: None,
+            user: Some(DEFAULT_DB_USER.to_string()),
+            password: Some(DEFAULT_DB_PASSWORD.to_string()),
             envs: [(
                 "VECTOR_STORE_SCYLLADB_CERTIFICATE_FILE".to_string(),
                 cert_path.clone(),
@@ -178,9 +309,14 @@ pub fn get_proxy_vs_node_configs(actors: &TestActors) -> Vec<VectorStoreNodeConf
         .map(|(&vs_ip, &db_ip)| VectorStoreNodeConfig {
             vs_ip,
             db_ip,
-            user: None,
-            password: None,
-            envs: Default::default(),
+            user: Some(DEFAULT_DB_USER.to_string()),
+            password: Some(DEFAULT_DB_PASSWORD.to_string()),
+            envs: [(
+                "VECTOR_STORE_INDEX_STATUS_UPDATE_INTERVAL".to_string(),
+                INDEX_STATUS_UPDATE_INTERVAL.to_string(),
+            )]
+            .into_iter()
+            .collect(),
         })
         .collect()
 }
@@ -211,7 +347,7 @@ pub async fn init(actors: &TestActors) {
 
     let scylla_configs = get_default_scylla_node_configs(actors).await;
     let vs_configs = get_default_vs_node_configs(actors).await;
-    init_with_config(actors, scylla_configs, vs_configs).await;
+    init_with_config(actors, scylla_configs, vs_configs, true).await;
 
     info!("finished");
 }
@@ -248,6 +384,9 @@ pub async fn init_with_proxy(actors: &TestActors) {
     vs_configs.iter_mut().for_each(|cfg| {
         cfg.envs.extend(envs.clone());
     });
+
+    setup_default_role(actors, false).await;
+
     actors.vs.start(vs_configs).await;
     assert!(actors.vs.wait_for_ready().await);
 
@@ -301,6 +440,9 @@ pub async fn init_with_proxy_single_vs(actors: &TestActors) {
     vs_configs.iter_mut().for_each(|cfg| {
         cfg.envs.extend(envs.clone());
     });
+
+    setup_default_role(actors, false).await;
+
     actors.vs.start(vs_configs).await;
     assert!(actors.vs.wait_for_ready().await);
 
@@ -320,11 +462,17 @@ pub async fn init_with_config(
     actors: &TestActors,
     scylla_configs: Vec<ScyllaNodeConfig>,
     vs_configs: Vec<VectorStoreNodeConfig>,
+    use_default_auth: bool,
 ) {
     init_dns(actors).await;
 
     actors.db.start(scylla_configs).await;
     assert!(actors.db.wait_for_ready().await);
+
+    if use_default_auth {
+        setup_default_role(actors, true).await;
+    }
+
     actors.vs.start(vs_configs).await;
     assert!(actors.vs.wait_for_ready().await);
 }
@@ -332,6 +480,7 @@ pub async fn init_with_config(
 #[framed]
 pub async fn cleanup(actors: &TestActors) {
     info!("started");
+    actors.firewall.turn_off_rules().await;
     for name in VS_NAMES.iter() {
         actors.dns.remove(name.to_string()).await;
     }
@@ -350,6 +499,7 @@ pub async fn prepare_connection_with_custom_vs_ips(
     let session = Arc::new(
         SessionBuilder::new()
             .known_node(actors.services_subnet.ip(DB_OCTET_1).to_string())
+            .user(&*SUPERUSER_NAME, &*SUPERUSER_PASSWORD)
             .tls_context(Some(TlsContext::from(tls_config)))
             .build()
             .await
@@ -374,6 +524,28 @@ pub async fn prepare_connection_with_auth(
             .known_node(actors.services_subnet.ip(DB_OCTET_1).to_string())
             .user(user, password)
             .tls_context(Some(TlsContext::from(tls_config)))
+            .build()
+            .await
+            .expect("failed to create session"),
+    );
+    let vs_ips = get_default_vs_ips(actors);
+    let clients = vs_ips
+        .iter()
+        .map(|&ip| HttpClient::new((ip, VS_PORT).into()))
+        .collect();
+    (session, clients)
+}
+
+#[framed]
+pub async fn prepare_connection_with_auth_no_tls(
+    actors: &TestActors,
+    user: &str,
+    password: &str,
+) -> (Arc<Session>, Vec<HttpClient>) {
+    let session = Arc::new(
+        SessionBuilder::new()
+            .known_node(actors.services_subnet.ip(DB_OCTET_1).to_string())
+            .user(user, password)
             .build()
             .await
             .expect("failed to create session"),
@@ -425,9 +597,12 @@ pub async fn prepare_connection_with_custom_vs_ips_no_tls(
     actors: &TestActors,
     vs_ips: Vec<Ipv4Addr>,
 ) -> (Arc<Session>, Vec<HttpClient>) {
+    actors.db_proxy.turn_off_rules().await;
+
     let session = Arc::new(
         SessionBuilder::new()
             .known_node(actors.services_subnet.ip(DB_OCTET_1).to_string())
+            .user(&*SUPERUSER_NAME, &*SUPERUSER_PASSWORD)
             .build()
             .await
             .expect("failed to create session"),
@@ -487,7 +662,7 @@ where
 }
 
 #[framed]
-pub async fn wait_for_index(client: &HttpClient, index: &IndexInfo) -> IndexStatusResponse {
+pub async fn wait_for_index(client: &HttpClient, index: &IndexInfo) -> IndexInfo {
     wait_for_value(
         || async {
             match client.index_status(&index.keyspace, &index.index).await {
@@ -502,6 +677,13 @@ pub async fn wait_for_index(client: &HttpClient, index: &IndexInfo) -> IndexStat
         Duration::from_secs(60),
     )
     .await
+}
+
+#[framed]
+pub async fn wait_for_index_on_all_nodes(clients: &[HttpClient], index: &IndexInfo) {
+    for client in clients {
+        wait_for_index(client, index).await;
+    }
 }
 
 #[framed]
@@ -566,6 +748,29 @@ pub async fn get_query_results(query: impl Into<String>, session: &Session) -> Q
 }
 
 #[framed]
+pub async fn get_query_rows<R>(
+    query: impl Into<String>,
+    values: impl SerializeRow,
+    session: &Session,
+) -> Vec<R>
+where
+    R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
+{
+    let mut stmt = Statement::new(query);
+    stmt.set_is_idempotent(true);
+    session
+        .query_unpaged(stmt, values)
+        .await
+        .expect("failed to run query")
+        .into_rows_result()
+        .expect("failed to get rows")
+        .rows::<R>()
+        .expect("failed to get rows")
+        .map(|row| row.expect("failed to get row"))
+        .collect()
+}
+
+#[framed]
 pub async fn get_opt_query_results(
     query: impl Into<String>,
     session: &Session,
@@ -578,6 +783,14 @@ pub async fn get_opt_query_results(
         .ok()?
         .into_rows_result()
         .ok()
+}
+
+pub fn extract_pks(result: &QueryRowsResult) -> Vec<i32> {
+    result
+        .rows::<(i32,)>()
+        .expect("failed to get rows")
+        .map(|row| row.expect("failed to get row").0)
+        .collect()
 }
 
 static KEYSPACE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -603,15 +816,47 @@ pub fn unique_index_name() -> IndexName {
     unique_name("idx", &INDEX_COUNTER).into()
 }
 
+/// Runs a schema-changing statement, retrying while ScyllaDB rejects it with
+/// "concurrent modification" because another schema change is in flight.
+///
+/// The statement must be idempotent, because a rejected attempt may still have applied.
+#[framed]
+pub async fn apply_schema_change(session: &Session, query: impl Into<String>) {
+    let query = query.into();
+    wait_for(
+        || async {
+            match session.query_unpaged(query.clone(), ()).await {
+                Ok(_) => true,
+                Err(err) if is_concurrent_schema_change(&err) => {
+                    info!("Retrying schema change rejected by a concurrent one: {query}");
+                    false
+                }
+                Err(err) => panic!("failed to apply schema change '{query}': {err}"),
+            }
+        },
+        format!("schema change to be applied: {query}"),
+        DEFAULT_OPERATION_TIMEOUT,
+    )
+    .await;
+}
+
+fn is_concurrent_schema_change(err: &impl std::fmt::Display) -> bool {
+    err.to_string().contains("concurrent modification")
+}
+
 #[framed]
 pub async fn create_keyspace(session: &Session) -> KeyspaceName {
     let keyspace = unique_keyspace_name();
 
     // Create keyspace with replication factor of 3 for the 3-node cluster
-    session.query_unpaged(
-        format!("CREATE KEYSPACE {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 3}}"),
-        (),
-    ).await.expect("failed to create a keyspace");
+    apply_schema_change(
+        session,
+        format!(
+            "CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'replication_factor': 3}}"
+        ),
+    )
+    .await;
 
     // Use keyspace
     session
@@ -620,6 +865,11 @@ pub async fn create_keyspace(session: &Session) -> KeyspaceName {
         .expect("failed to use a keyspace");
 
     keyspace
+}
+
+#[framed]
+pub async fn drop_keyspace(session: &Session, keyspace: &KeyspaceName) {
+    apply_schema_change(session, format!("DROP KEYSPACE IF EXISTS {keyspace}")).await;
 }
 
 #[framed]
@@ -633,10 +883,11 @@ pub async fn create_table(session: &Session, columns: &str, options: Option<&str
     };
 
     // Create table
-    session
-        .query_unpaged(format!("CREATE TABLE {table} ({columns}) {extra}"), ())
-        .await
-        .expect("failed to create a table");
+    apply_schema_change(
+        session,
+        format!("CREATE TABLE IF NOT EXISTS {table} ({columns}) {extra}"),
+    )
+    .await;
 
     table
 }
@@ -649,7 +900,7 @@ pub async fn create_index(query: CreateIndexQuery<'_>) -> IndexInfo {
         format!(" WITH OPTIONS = {{{}}}", query.options)
     };
     let cql_query = format!(
-        "CREATE CUSTOM INDEX {index} ON {table}({partition_columns}{target_column}{filter_columns}) USING '{index_type}'{options_clause}",
+        "CREATE CUSTOM INDEX IF NOT EXISTS {index} ON {table}({partition_columns}{target_column}{filter_columns}) USING '{index_type}'{options_clause}",
         index = query.index,
         table = query.table,
         partition_columns = query.partition_columns,
@@ -658,11 +909,7 @@ pub async fn create_index(query: CreateIndexQuery<'_>) -> IndexInfo {
         index_type = query.index_type,
     );
     info!("Create index: '{cql_query}'");
-    query
-        .session
-        .query_unpaged(cql_query, ())
-        .await
-        .expect("failed to create an index");
+    apply_schema_change(query.session, cql_query).await;
 
     for client in query.clients {
         wait_for(

@@ -1,6 +1,6 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #[global_allocator]
@@ -9,13 +9,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::anyhow;
 use clap::Parser;
 use rustls::crypto::aws_lc_rs;
-use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use vector_store::ConfigManager;
 use vector_store::HttpServerExt;
 use vector_store::Info;
+use vector_store::TracingOutput;
 
 #[derive(Parser)]
 #[clap(version)]
@@ -25,7 +25,9 @@ fn dotenvy_to_std_var(key: &str) -> anyhow::Result<String> {
     Ok(dotenvy::var(key)?)
 }
 
-// Index creating/querying is CPU bound task, so that vector-store uses rayon ThreadPool for them.
+// Index creation and querying are CPU-bound tasks, so they are dispatched through the worker
+// actors. A blocking task is moved to a dedicated thread only when every worker actor is
+// already busy — so that the runtime does not get starved.
 // From the start there was no need (network traffic seems to be not so high) to support more than
 // one thread per network IO bound tasks.
 fn main() -> anyhow::Result<()> {
@@ -38,13 +40,24 @@ fn main() -> anyhow::Result<()> {
             "Unable to parse VECTOR_STORE_DISABLE_COLORS env (true/false)"
         )))?;
 
+    // When stdout is connected to the journal (e.g. running as a systemd service), prefix each
+    // line with the syslog priority of its level, so that journald stores it at that priority.
     // Disable ANSI colors when explicitly requested or when stdout is not a terminal
     // (e.g. output is redirected to a file)
-    let use_ansi = !disable_colors && std::io::stdout().is_terminal();
+    let output = if vector_store::stdout_is_journal() {
+        TracingOutput::Journald
+    } else if !disable_colors && vector_store::stdout_is_terminal() {
+        TracingOutput::StdOutWithAnsi
+    } else {
+        TracingOutput::StdOut
+    };
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?)
-        .with(fmt::layer().with_target(false).with_ansi(use_ansi))
+        .with(vector_store::tracing_layer(
+            output,
+            fmt::format().with_target(false),
+        ))
         .init();
 
     aws_lc_rs::default_provider()

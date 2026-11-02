@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::common::add_table;
@@ -12,6 +12,7 @@ use crate::common::single_row_scan;
 use crate::wait_for;
 use httpapi::IndexStatus;
 use httpapi::PostIndexAnnFilter;
+use httpapi::PostIndexAnnRequest;
 use httpapi::PostIndexAnnRestriction;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use vector_store::DbIndexPartitioning;
 use vector_store::IndexMetadata;
 use vector_store::NonemptyArc;
+use vector_store::Timestamp;
 
 const ANN_LIMIT: usize = 5;
 
@@ -66,6 +68,47 @@ async fn post_ann(client: &HttpClient, index: &IndexMetadata) -> reqwest::Respon
             vec![0.0_f32, 0.0, 0.0].into(),
             None,
             NonZeroUsize::new(ANN_LIMIT).unwrap().into(),
+        )
+        .await
+}
+
+async fn post_ann_without_routing(client: &HttpClient, index: &IndexMetadata) -> reqwest::Response {
+    let keyspace_name = index.keyspace_name.as_ref().into();
+    let index_name = index.index_name.as_ref().into();
+    client
+        .post_ann_data(
+            &keyspace_name,
+            &index_name,
+            &PostIndexAnnRequest {
+                vector: vec![0.0_f32, 0.0, 0.0].into(),
+                filter: None,
+                limit: NonZeroUsize::new(ANN_LIMIT).unwrap().into(),
+                routing: false,
+                return_columns: vec![],
+            },
+        )
+        .await
+}
+
+/// Posts an ANN request whose JSON body has no "routing" key at all, as an
+/// older client that predates the "routing" field would send. This must
+/// still be accepted and must still preserve the default (routing-enabled)
+/// behavior, exercising the `#[serde(default = "default_routing")]` path
+/// rather than relying on `PostIndexAnnRequest`'s Rust-level default.
+async fn post_ann_without_routing_field(
+    client: &HttpClient,
+    index: &IndexMetadata,
+) -> reqwest::Response {
+    let keyspace_name = index.keyspace_name.as_ref().into();
+    let index_name = index.index_name.as_ref().into();
+    client
+        .post_ann_data(
+            &keyspace_name,
+            &index_name,
+            &serde_json::json!({
+                "vector": [0.0_f32, 0.0, 0.0],
+                "limit": ANN_LIMIT,
+            }),
         )
         .await
 }
@@ -180,13 +223,12 @@ async fn ann_routes_to_serving_index_while_replacement_is_bootstrapping() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[tokio::test]
-#[cfg_attr(not(feature = "slow-test-hooks"), ignore = "requires slow-test-hooks")]
-async fn ann_routes_to_newest_serving_index() {
-    crate::enable_tracing();
-    let (client, db, _keep) = setup().await;
+/// Sets up a table with two globally-partitioned, fully-serving indexes on
+/// the same column, "oldest" and "replacement" (the newer of the two) -
+/// the shared fixture for the "which of two equally-matching indexes
+/// serves the query" tests below.
+async fn setup_oldest_and_replacement() -> (HttpClient, impl Sized, IndexMetadata, IndexMetadata) {
+    let (client, db, keep) = setup().await;
 
     add_table(
         &db,
@@ -230,7 +272,156 @@ async fn ann_routes_to_newest_serving_index() {
     .unwrap();
     wait_for_serving(&client, &replacement).await;
 
+    (client, (db, keep), oldest, replacement)
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[cfg_attr(not(feature = "slow-test-hooks"), ignore = "requires slow-test-hooks")]
+async fn ann_routes_to_newest_serving_index() {
+    crate::enable_tracing();
+    let (client, _keep, oldest, replacement) = setup_oldest_and_replacement().await;
+
     let response = assert_ann_served_by(&client, &replacement, post_ann(&client, &oldest)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn post_ann_with_return_columns(
+    client: &HttpClient,
+    index: &IndexMetadata,
+    return_columns: Vec<httpapi::ColumnName>,
+) -> reqwest::Response {
+    let keyspace_name = index.keyspace_name.as_ref().into();
+    let index_name = index.index_name.as_ref().into();
+    client
+        .post_ann_data(
+            &keyspace_name,
+            &index_name,
+            &PostIndexAnnRequest {
+                vector: vec![0.0_f32, 0.0, 0.0].into(),
+                filter: None,
+                limit: NonZeroUsize::new(ANN_LIMIT).unwrap().into(),
+                routing: true,
+                return_columns,
+            },
+        )
+        .await
+}
+
+/// return_columns must never influence routing: a request for a column
+/// that only an older index in the routing group projects must still be
+/// routed to the newest serving index, not fall back to the older one
+/// just because it happens to still track that column. The newer index
+/// simply reports the column as null, the same as any other column it
+/// doesn't track.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[cfg_attr(not(feature = "slow-test-hooks"), ignore = "requires slow-test-hooks")]
+async fn ann_return_columns_does_not_affect_routing() {
+    crate::enable_tracing();
+    let (client, db, _keep) = setup().await;
+
+    add_table(
+        &db,
+        ["pk".into()],
+        1,
+        [
+            ("pk".into(), NativeType::Int),
+            ("color".into(), NativeType::Text),
+        ],
+        ["embedding".into()],
+    );
+
+    let oldest = make_vs_index(
+        "oldest",
+        &["pk"],
+        1,
+        "embedding",
+        DbIndexPartitioning::Global,
+        &["color"],
+        ordered_timeuuid(1),
+    );
+    db.add_index(
+        oldest.clone(),
+        Some(crate::db_basic::scan_fn_vectors([(
+            [CqlValue::Int(1)].into(),
+            Some(vec![1.0, 2.0, 3.0].into()),
+            [Some(CqlValue::Text("red".to_string()))].into(),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+    )
+    .unwrap();
+    wait_for_serving(&client, &oldest).await;
+
+    let replacement = make_vs_index(
+        "replacement",
+        &["pk"],
+        1,
+        "embedding",
+        DbIndexPartitioning::Global,
+        &[],
+        ordered_timeuuid(2),
+    );
+    db.add_index(
+        replacement.clone(),
+        Some(single_row_scan([CqlValue::Int(1)])),
+        None,
+    )
+    .unwrap();
+    wait_for_serving(&client, &replacement).await;
+
+    let response = assert_ann_served_by(
+        &client,
+        &replacement,
+        post_ann_with_return_columns(&client, &oldest, vec!["color".into()]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: httpapi::PostIndexAnnResponse = response.json().await.unwrap();
+    assert_eq!(
+        response.column_values.get(&"color".into()),
+        Some(&vec![None])
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[cfg_attr(not(feature = "slow-test-hooks"), ignore = "requires slow-test-hooks")]
+async fn ann_with_routing_disabled_is_not_rerouted() {
+    crate::enable_tracing();
+    let (client, _keep, oldest, _replacement) = setup_oldest_and_replacement().await;
+
+    // With routing enabled (the default, exercised by
+    // ann_routes_to_newest_serving_index above), a query addressed to
+    // "oldest" would be routed to "replacement". With routing disabled, it
+    // must stay pinned to the index it was addressed to.
+    let response =
+        assert_ann_served_by(&client, &oldest, post_ann_without_routing(&client, &oldest)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[cfg_attr(not(feature = "slow-test-hooks"), ignore = "requires slow-test-hooks")]
+async fn ann_with_routing_field_omitted_routes_to_newest_serving_index() {
+    crate::enable_tracing();
+    let (client, _keep, oldest, replacement) = setup_oldest_and_replacement().await;
+
+    // A request whose body never mentions "routing" at all - as sent by a
+    // client written before this field existed - must still get the
+    // default (routing-enabled) behavior via serde's field default, not
+    // just via PostIndexAnnRequest's Rust-level Default.
+    let response = assert_ann_served_by(
+        &client,
+        &replacement,
+        post_ann_without_routing_field(&client, &oldest),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 

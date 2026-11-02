@@ -1,11 +1,12 @@
 /*
  * Copyright 2025-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
+use crate::DbDriver;
 use crate::DbIndexedOperation;
 use crate::DbIndexedRow;
 use crate::DbIndexedValue;
@@ -13,18 +14,17 @@ use crate::IndexKind;
 use crate::IndexMetadata;
 use crate::KeyspaceIdentifier;
 use crate::Metrics;
+use crate::NonRetryable;
 use crate::NonemptyArc;
 use crate::NonemptyBox;
-use crate::NonemptyIteratorExt;
 use crate::Percentage;
 use crate::PrimaryKey;
 use crate::Progress;
-use crate::TableIdentifier;
 use crate::Timestamp;
 use crate::Vector;
 use crate::db_cdc;
 use crate::db_cdc::CdcReaderConfig;
-use crate::db_index_backend;
+use crate::db_value::DbValue;
 use crate::internals::Internals;
 use crate::invariant_key::InvariantKey;
 use crate::node_state::Event;
@@ -40,29 +40,25 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use itertools::Itertools;
-use scylla::client::session::Session;
 use scylla::cluster::metadata::ColumnType;
 use scylla::cluster::metadata::NativeType;
-use scylla::errors::PagerExecutionError;
 use scylla::routing::Token;
-use scylla::statement::prepared::PreparedStatement;
 use scylla::value::CqlValue;
-use scylla::value::Row;
-use scylla_cdc::CqlIdentifier;
 use std::collections::HashMap;
 use std::iter;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tap::Pipe;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
@@ -102,11 +98,16 @@ pub enum DbIndex {
     FullScanProgress {
         tx: oneshot::Sender<Progress>,
     },
+    GetVectors {
+        keys: Vec<PrimaryKey>,
+        tx: oneshot::Sender<anyhow::Result<Vec<Option<Vector>>>>,
+    },
 }
 
 pub(crate) trait DbIndexExt {
     async fn get_table_columns(&self) -> GetTableColumnsR;
     async fn full_scan_progress(&self) -> Progress;
+    async fn get_vectors(&self, keys: Vec<PrimaryKey>) -> anyhow::Result<Vec<Option<Vector>>>;
 }
 
 impl DbIndexExt for mpsc::Sender<DbIndex> {
@@ -125,14 +126,106 @@ impl DbIndexExt for mpsc::Sender<DbIndex> {
             .expect("internal actor should receive request");
         rx.await.expect("internal actor should send response")
     }
+
+    async fn get_vectors(&self, keys: Vec<PrimaryKey>) -> anyhow::Result<Vec<Option<Vector>>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(DbIndex::GetVectors { keys, tx })
+            .await
+            .map_err(|e| anyhow!("get_vectors: db_index actor is not available: {}", e))?;
+        rx.await
+            .map_err(|e| anyhow!("get_vectors: db_index actor dropped the request: {}", e))?
+    }
 }
 
-pub(crate) async fn new(
+/// A wrapper around a Session watch.
+#[derive(Clone)]
+pub(crate) struct DbIndexSession<T: DbDriver> {
+    session_rx: watch::Receiver<Option<T::Session>>,
+    alive_rx: watch::Receiver<bool>,
+}
+
+impl<T: DbDriver> DbIndexSession<T> {
+    fn new(session_rx: watch::Receiver<Option<T::Session>>) -> (Self, SessionGuard) {
+        let (alive_tx, alive_rx) = watch::channel(true);
+        (
+            Self {
+                session_rx,
+                alive_rx,
+            },
+            SessionGuard(alive_tx),
+        )
+    }
+
+    /// Waits for a session to be available, or returns an error if the index is no longer alive.
+    pub(crate) async fn wait_for_session(&self) -> anyhow::Result<T::Session> {
+        let mut session_rx = self.session_rx.clone();
+        let mut alive_rx = self.alive_rx.clone();
+        tokio::select! {
+            biased;
+
+            _ = alive_rx.wait_for(|alive| !alive) => {
+                bail!("DbIndexSession is no longer alive");
+            }
+
+            session = session_rx.wait_for(|session| session.is_some()) => {
+                session.map(|session| session.as_ref().unwrap().clone())
+                    .map_err(|err| anyhow!("DbIndexSession: session stream is no longer alive: {err}"))
+            }
+        }
+    }
+
+    /// Waits for a session change, or returns None if the index is no longer alive.
+    pub(crate) async fn wait_for_changed(&mut self) -> Option<Option<T::Session>> {
+        tokio::select! {
+            biased;
+
+            _ = self.alive_rx.wait_for(|alive| !alive) => {
+                None
+            }
+
+            result = self.session_rx.changed() => {
+                if result.is_err() {
+                    return None;
+                }
+                Some(self.session_rx.borrow_and_update().clone())
+            }
+        }
+    }
+
+    /// Returns current session or returns None if the index is no longer alive.
+    pub(crate) fn current(&self) -> Option<Option<T::Session>> {
+        self.alive_rx
+            .borrow()
+            .then(|| self.session_rx.borrow().clone())
+    }
+
+    /// Marks the session as changed, so that wait_for_changed() will return immediately.
+    pub(crate) fn mark_changed(&mut self) {
+        self.session_rx.mark_changed();
+    }
+
+    /// Waits until index is no longer alive.
+    pub(crate) async fn wait_for_dead(&mut self) {
+        _ = self.alive_rx.wait_for(|alive| !alive).await;
+    }
+}
+
+struct SessionGuard(watch::Sender<bool>);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(false);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn new<T: DbDriver>(
     config_rx: watch::Receiver<Arc<Config>>,
-    session_rx: watch::Receiver<Option<Arc<Session>>>,
+    db_driver: T,
+    session_rx: watch::Receiver<Option<T::Session>>,
     metadata: IndexMetadata,
-    node_state: Sender<NodeState>,
-    internals: Sender<Internals>,
+    node_state: mpsc::Sender<NodeState>,
+    internals: mpsc::Sender<Internals>,
     metrics: Arc<Metrics>,
     cdc_error_notify: Arc<Notify>,
 ) -> anyhow::Result<(
@@ -144,24 +237,20 @@ pub(crate) async fn new(
     let (tx_index, mut rx_index) = mpsc::channel(perf::channel_size().into());
     let (tx_embeddings, rx_embeddings) = mpsc::channel(perf::channel_size().into());
 
-    // Wait for initial session to create statements.
-    let mut statements_session_rx = session_rx.clone();
-    while statements_session_rx.borrow().is_none() {
-        if statements_session_rx.changed().await.is_err() {
-            return Err(anyhow::anyhow!(
-                "Session sender dropped before initialization"
-            ));
-        }
-    }
+    let (db_session, session_guard) = DbIndexSession::new(session_rx);
 
-    let statements = Arc::new(Statements::new(statements_session_rx, metadata.clone()).await?);
+    let statements =
+        Arc::new(Statements::new(db_driver.clone(), db_session.clone(), metadata.clone()).await?);
 
     let semaphore = Arc::new(Semaphore::new(concurrency_limit()));
+
+    let fetch_permits = Arc::new(Semaphore::new(concurrency_limit()));
 
     // Create wide-framed CDC actor
     let cdc_wide = db_cdc::new(
         config_rx.clone(),
-        session_rx.clone(),
+        db_driver.clone(),
+        db_session.clone(),
         metadata.clone(),
         internals.clone(),
         metrics.clone(),
@@ -173,7 +262,8 @@ pub(crate) async fn new(
     // Create fine-grained CDC actor
     let cdc_fine = db_cdc::new(
         config_rx,
-        session_rx.clone(),
+        db_driver,
+        db_session.clone(),
         metadata.clone(),
         internals,
         metrics,
@@ -182,21 +272,15 @@ pub(crate) async fn new(
         CdcReaderConfig::Fine,
     );
 
-    // Signal from the main db_index task to the CDC monitor task that
-    // this db_index is shutting down. Without it, the monitor would keep
-    // the CDC senders alive across a db_index replacement, leaving
-    // orphaned CDC actors running (VECTOR-653).
-    let db_index_stopped = Arc::new(Notify::new());
-
     // Monitor CDC actor channels for closure to notify about errors, or
     // exit when the main db_index task signals shutdown.
     tokio::spawn({
-        let db_index_stopped = Arc::clone(&db_index_stopped);
+        let mut db_session = db_session.clone();
         async move {
             tokio::select! {
                 _ = cdc_wide.closed() => cdc_error_notify.notify_one(),
                 _ = cdc_fine.closed() => cdc_error_notify.notify_one(),
-                _ = db_index_stopped.notified() => {}
+                _ = db_session.wait_for_dead() => {}
             }
         }
     });
@@ -212,47 +296,67 @@ pub(crate) async fn new(
 
             info!("starting full scan on {}", metadata.key());
 
-            let mut initial_scan = Box::pin(statements.initial_scan(
-                tx_embeddings.clone(),
-                completed_scan_length.clone(),
-            ));
+            let mut initial_scan = Box::pin(
+                Arc::clone(&statements)
+                    .initial_scan(tx_embeddings.clone(), completed_scan_length.clone()),
+            );
 
             // Initial scan and message processing loop
-            loop {
+            let cancel = loop {
                 tokio::select! {
-                    _ = &mut initial_scan => {
-                        node_state
-                            .send_event(Event::FullScanFinished(metadata.clone()))
-                            .await;
-                        break;
+                    result = &mut initial_scan => {
+                        if let Err(err) = result {
+                            error!(
+                                "error during full scan of index {key}: {err}",
+                                key = metadata.key()
+                            );
+                            break true;
+                        }
+                        break false;
                     }
 
                     msg = rx_index.recv() => {
                         match msg {
                             Some(msg) => {
-                                tokio::spawn(process(Arc::clone(&statements), msg, completed_scan_length.clone()));
+                                tokio::spawn(process(
+                                        Arc::clone(&statements),
+                                        msg,
+                                        completed_scan_length.clone(),
+                                        Arc::clone(&fetch_permits)
+                                ));
                             }
                             None => {
-                                // Index was dropped, stop fullscan.
-                                break;
+                                info!(
+                                    "shutdown during full scan of index {key}",
+                                    key = metadata.key()
+                                );
+                                break true;
                             }
                         }
                     }
-
-                    else => {
-                        break;
-                    }
                 }
-            }
+            };
 
-            info!("finished full scan on {}", metadata.key());
+            if cancel {
+                info!("cancelling full scan of index {key}", key = metadata.key());
+            } else {
+                info!("finished full scan on {key}", key = metadata.key());
+                node_state
+                    .send_event(Event::FullScanFinished(metadata.clone()))
+                    .await;
+            }
 
             // Continue processing messages after scan completes
             while let Some(msg) = rx_index.recv().await {
-                tokio::spawn(process(Arc::clone(&statements), msg, completed_scan_length.clone()));
+                tokio::spawn(process(
+                    Arc::clone(&statements),
+                    msg,
+                    completed_scan_length.clone(),
+                    Arc::clone(&fetch_permits),
+                ));
             }
 
-            db_index_stopped.notify_one();
+            drop(session_guard);
             debug!("finished");
         }
         .instrument(error_span!("db_index", "{}", key)),
@@ -261,7 +365,12 @@ pub(crate) async fn new(
     Ok((tx_index, rx_embeddings))
 }
 
-async fn process(statements: Arc<Statements>, msg: DbIndex, completed_scan_length: Arc<AtomicU64>) {
+async fn process<T: DbDriver>(
+    statements: Arc<Statements<T>>,
+    msg: DbIndex,
+    completed_scan_length: Arc<AtomicU64>,
+    fetch_permits: Arc<Semaphore>,
+) {
     match msg {
         DbIndex::GetTableColumns { tx } => tx
             .send(statements.get_table_columns())
@@ -274,53 +383,57 @@ async fn process(statements: Arc<Statements>, msg: DbIndex, completed_scan_lengt
                 trace!("process: Db::FullScanProgress: unable to send response");
             }
         }
+
+        DbIndex::GetVectors { keys, tx } => {
+            if tx
+                .send(statements.fetch_vectors(keys, fetch_permits).await)
+                .is_err()
+            {
+                trace!("process: DbIndex::GetVectors: unable to send response");
+            }
+        }
     }
 }
 
-struct Statements {
-    session_rx: tokio::sync::watch::Receiver<Option<Arc<Session>>>,
+struct Statements<T: DbDriver> {
+    db_driver: T,
+    db_session: DbIndexSession<T>,
     primary_key_columns: NonemptyArc<ColumnName>,
     target_columns: NonemptyArc<ColumnName>,
     nonpk_partition_key_columns: Box<[ColumnName]>,
     filtering_columns: Arc<[ColumnName]>,
     table_columns: GetTableColumnsR,
-    st_range_scan: PreparedStatement,
+    /// Aligned with nonpk_partition_key_columns + filtering_columns: the
+    /// NativeType to decode each one's raw ":attrs" value as, or None for a
+    /// real CQL column. See parse_values().
+    alternator_decode_types: Box<[Option<NativeType>]>,
+    st_range_scan: T::Statement,
+    st_fetch_vector: T::Statement,
     kind: IndexKind,
 }
 
-impl Statements {
+impl<T: DbDriver> Statements<T> {
     async fn new(
-        session_rx: tokio::sync::watch::Receiver<Option<Arc<Session>>>,
+        db_driver: T,
+        db_session: DbIndexSession<T>,
         metadata: IndexMetadata,
     ) -> anyhow::Result<Self> {
-        let session = session_rx
-            .borrow()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("No session available for Statements initialization"))?;
-        session.await_schema_agreement().await?;
+        let session = db_session.wait_for_session().await?;
 
-        let cluster_state = session.get_cluster_state();
-        let table = cluster_state
-            .get_keyspace(&metadata.keyspace_name)
-            .ok_or_else(|| anyhow!("keyspace {} does not exist", metadata.keyspace_name))?
-            .tables
-            .get(metadata.table_name.as_ref())
-            .ok_or_else(|| anyhow!("table {} does not exist", metadata.table_name))?;
+        db_driver.await_schema_agreement(&session).await?;
 
-        let primary_key_columns = table
-            .partition_key
-            .iter()
-            .chain(table.clustering_key.iter())
-            .cloned()
-            .map(ColumnName::from)
-            .collect_nonempty_arc()
+        let cluster = db_driver.cluster(&session);
+        let table = db_driver
+            .table(&cluster, &metadata.keyspace_name, &metadata.table_name)
             .ok_or_else(|| {
                 anyhow!(
-                    "table {}.{} has no primary key",
+                    "table {}.{} does not exist",
                     metadata.keyspace_name,
                     metadata.table_name
                 )
             })?;
+
+        let primary_key_columns = metadata.primary_key_columns.clone();
         let nonpk_partition_key_columns: Box<[_]> = metadata
             .nonpk_partition_key_columns()
             .into_iter()
@@ -338,55 +451,37 @@ impl Statements {
         );
 
         let target_columns = metadata.target_columns.clone();
-        let filtering_columns: Arc<[_]> = metadata
-            .filtering_columns
-            .iter()
-            .filter(|column| !primary_key_columns.contains(column))
-            .cloned()
-            .collect();
+        let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
 
-        let table_columns = Arc::new(
-            table
-                .columns
+        let is_alternator = KeyspaceIdentifier::from(&metadata.keyspace_name).is_alternator();
+        let real_columns: HashMap<ColumnName, NativeType> = db_driver
+            .columns(table)
+            .filter_map(|(name, coltype)| {
+                if let ColumnType::Native(typ) = &coltype.typ {
+                    Some((name, typ.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let table_columns = Arc::new(merge_table_columns(
+            &metadata,
+            &filtering_columns,
+            real_columns
                 .iter()
-                .filter_map(|(name, coltype)| {
-                    if let ColumnType::Native(typ) = &coltype.typ {
-                        Some((ColumnName::from(name.clone()), typ.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        );
-        let st_partition_key_list = table
-            .partition_key
-            .iter()
-            .map(|c| CqlIdentifier::new(c.as_str()))
-            .join(", ");
-        let st_primary_key_list = primary_key_columns
-            .iter()
-            .map(|c| CqlIdentifier::new(c.as_ref()))
-            .join(", ");
-        let keyspace_identifier = KeyspaceIdentifier::from(&metadata.keyspace_name);
-        let table_identifier = TableIdentifier::from(&metadata.table_name);
-        let query = db_index_backend::range_scan_query(
-            &keyspace_identifier,
-            &table_identifier,
-            target_columns
+                .map(|(name, typ)| (name.clone(), typ.clone())),
+            is_alternator,
+        ));
+        let alternator_decode_types = alternator_decode_types(
+            nonpk_partition_key_columns
                 .iter()
-                .chain(nonpk_partition_key_columns.iter())
                 .chain(filtering_columns.iter()),
-            &st_primary_key_list,
-            &st_partition_key_list,
+            &metadata,
+            &real_columns,
         );
-        let st_range_scan = session
-            .prepare(query)
-            .await
-            .context("range_scan_query")?
-            .pipe(|mut stmt| {
-                stmt.set_is_idempotent(true);
-                stmt
-            });
+        let st_range_scan = db_driver.prepare_range_scan(&session, &metadata).await?;
+
+        let st_fetch_vector = db_driver.prepare_fetch_vector(&session, &metadata).await?;
 
         Ok(Self {
             primary_key_columns,
@@ -394,8 +489,11 @@ impl Statements {
             target_columns,
             filtering_columns,
             table_columns,
+            alternator_decode_types,
             st_range_scan,
-            session_rx,
+            st_fetch_vector,
+            db_driver,
+            db_session,
             kind: metadata.kind.clone(),
         })
     }
@@ -404,21 +502,76 @@ impl Statements {
         self.table_columns.clone()
     }
 
+    async fn fetch_vectors(
+        &self,
+        keys: Vec<PrimaryKey>,
+        fetch_permits: Arc<Semaphore>,
+    ) -> anyhow::Result<Vec<Option<Vector>>> {
+        let session = self
+            .db_session
+            .current()
+            .ok_or_else(|| anyhow!("fetch_vectors: index dead"))?
+            .ok_or_else(|| anyhow!("fetch_vectors: no active session"))?;
+
+        let requested = keys.len();
+        let mut failures = 0;
+        let mut last_err = None;
+
+        let vectors: Vec<Option<Vector>> = futures::stream::iter(keys)
+            .map(|key| {
+                let session = session.clone();
+                let permits = Arc::clone(&fetch_permits);
+                async move {
+                    let _permit = permits
+                        .acquire_owned()
+                        .await
+                        .context("fetch_vectors: permit semaphore closed")?;
+                    self.fetch_vector(session, key).await
+                }
+            })
+            .buffered(concurrency_limit())
+            .map(|result| match result {
+                Ok(vector) => vector,
+                Err(err) => {
+                    failures += 1;
+                    last_err = Some(err);
+                    None
+                }
+            })
+            .collect()
+            .await;
+
+        if failures == requested {
+            return Err(last_err.unwrap())
+                .with_context(|| format!("fetch_vectors: all {requested} point reads failed"));
+        }
+
+        Ok(vectors)
+    }
+
+    async fn fetch_vector(
+        &self,
+        session: T::Session,
+        key: PrimaryKey,
+    ) -> anyhow::Result<Option<Vector>> {
+        self.db_driver
+            .execute_fetch_vector(&session, &self.st_fetch_vector, &key)
+            .await
+    }
+
     async fn preform_range_scan(&self, begin: Token, end: Token) -> RangeScanResult {
         let mut range_scan = self.range_scan_stream(begin, end).await;
         let mut retry_timeout = START_RETRY_TIMEOUT;
         while let Err(err) = &range_scan {
-            let connection_error = err.downcast_ref::<PagerExecutionError>();
-            if connection_error.is_none()
-                || !matches!(
-                    connection_error.unwrap(),
-                    PagerExecutionError::NextPageError(_)
-                )
-            {
-                error!("Fatal error during scan of the range ({begin:?}, {end:?}): {err}");
+            if err.downcast_ref::<NonRetryable>().is_some() {
+                error!(
+                    "Non-retryable error during scan of the range ({begin:?}, {end:?}): {err:#}"
+                );
                 break;
             }
-            warn!("Lost connection during scan of the range ({begin:?}, {end:?}), retrying");
+            warn!(
+                "Retryable error during scan of the range ({begin:?}, {end:?}): {err:#}, retrying"
+            );
             tokio::time::sleep(retry_timeout).await;
             range_scan = self.range_scan_stream(begin, end).await;
 
@@ -437,83 +590,45 @@ impl Statements {
     /// using semaphore, and runs each scan in separate concurrent task using cloned mpsc channel
     /// to send read embeddings into the pipeline.
     async fn initial_scan(
-        &self,
+        self: Arc<Self>,
         tx: mpsc::Sender<(DbIndexedRow, AsyncInProgress)>,
         completed_scan_length: Arc<AtomicU64>,
-    ) {
-        let semaphore_capacity = self.nr_parallel_queries().get();
-        let semaphore = Arc::new(Semaphore::new(semaphore_capacity));
-
-        for (begin, end) in self.fullscan_ranges() {
-            let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-
-            let range_scan = self.preform_range_scan(begin, end).await;
-            if let Ok(embeddings) = range_scan {
-                let tx = tx.clone();
-                let scan_length = completed_scan_length.clone();
-                tokio::spawn(async move {
-                    let (tx_in_progress, mut rx_in_progress) = mpsc::channel(1);
-                    embeddings
-                        .for_each(move |embedding| {
-                            let tx = tx.clone();
-                            let tx_in_progress = tx_in_progress.clone();
-                            async move {
-                                _ = tx
-                                    .send((embedding, AsyncInProgress::Fullscan(tx_in_progress)))
-                                    .await;
-                            }
-                        })
-                        .await;
-
-                    // wait until all in-progress markers are dropped
-                    while rx_in_progress.recv().await.is_some() {
-                        rx_in_progress.len();
-                    }
-
-                    //Safety: end > begin, and the range fits into u64
-                    scan_length.fetch_add(
-                        end.value().abs_diff(begin.value() - 1),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    drop(permit);
-                });
-            } else {
-                drop(permit);
-            }
-        }
-
-        // Acquire all permits to wait until all spawned tasks have finished and released their permits.
-        let _permits = semaphore
-            .acquire_many(semaphore_capacity as u32)
-            .await
-            .unwrap();
+    ) -> anyhow::Result<()> {
+        let ranges = self.fullscan_ranges().await?;
+        let concurrency = self.nr_parallel_queries().await?;
+        scan_ranges(
+            ranges,
+            concurrency,
+            async move |begin, end| {
+                self.preform_range_scan(begin, end)
+                    .await
+                    .inspect_err(|err| {
+                        error!("Error during scan of the range ({begin:?}, {end:?}): {err}",);
+                    })
+            },
+            tx,
+            completed_scan_length,
+        )
+        .await
     }
 
-    fn nr_shards_in_cluster(&self) -> NonZeroUsize {
-        self.session_rx
-            .borrow()
-            .as_ref()
-            .and_then(|session| {
-                NonZeroUsize::try_from(
-                    session
-                        .get_cluster_state()
-                        .get_nodes_info()
-                        .iter()
-                        .filter_map(|node| node.sharder())
-                        .map(|sharder| sharder.nr_shards.get() as usize)
-                        .sum::<usize>(),
-                )
-                .ok()
-            })
-            .unwrap_or(NonZeroUsize::new(1).unwrap())
+    async fn nr_shards_in_cluster(&self) -> anyhow::Result<NonZeroUsize> {
+        Ok(self
+            .db_session
+            .wait_for_session()
+            .await?
+            .pipe(|session| self.db_driver.cluster(&session))
+            .pipe(|cluster| self.db_driver.nr_shards(&cluster)))
     }
 
     // Parallel queries = (cores in cluster) * (smuge factor)
-    fn nr_parallel_queries(&self) -> NonZeroUsize {
+    async fn nr_parallel_queries(&self) -> anyhow::Result<NonZeroUsize> {
         const SMUGE_FACTOR: NonZeroUsize = NonZeroUsize::new(3).unwrap();
-        self.nr_shards_in_cluster()
+        Ok(self
+            .nr_shards_in_cluster()
+            .await?
             .checked_mul(SMUGE_FACTOR)
-            .unwrap()
+            .unwrap())
     }
 
     /// Creates an iterator over all tokens ranges available in a cluster. A token ring is taken
@@ -524,29 +639,22 @@ impl Statements {
     /// highest possible token - for support the specific token range after the highest token to
     /// the lowest token. The highest possible token value is not decremented, because it doesn't
     /// start a new range.
-    fn fullscan_ranges(&self) -> impl Iterator<Item = (Token, Token)> {
+    async fn fullscan_ranges(
+        &self,
+    ) -> anyhow::Result<impl Iterator<Item = (Token, Token)> + use<T>> {
+        let cluster = self
+            .db_session
+            .wait_for_session()
+            .await?
+            .pipe(|session| self.db_driver.cluster(&session));
+
         const TOKEN_MAX: i64 = i64::MAX; // the highest possible token value in the ScyllaDB
         const TOKEN_MIN: i64 = -TOKEN_MAX; // the lowest possible token value in the ScyllaDB
 
         let tokens = iter::once(Token::new(TOKEN_MIN))
-            .chain(
-                self.session_rx
-                    .borrow()
-                    .as_ref()
-                    .map(|session| {
-                        session
-                            .get_cluster_state()
-                            .replica_locator()
-                            .ring()
-                            .iter()
-                            .map(|(token, _)| token)
-                            .copied()
-                            .collect_vec()
-                    })
-                    .unwrap_or_default(),
-            )
+            .chain(self.db_driver.token_ring(&cluster))
             .collect_vec();
-        tokens
+        Ok(tokens
             .into_iter()
             .circular_tuple_windows()
             .map(|(begin, end)| {
@@ -557,7 +665,7 @@ impl Statements {
                     // prepare a range without the last token
                     (begin, Token::new(end.value() - 1))
                 }
-            })
+            }))
     }
 
     async fn range_scan_stream(
@@ -574,26 +682,18 @@ impl Statements {
         let target_columns_offset = self.primary_key_columns.len().get();
         let target_columns_len = self.target_columns.len();
         let kind = self.kind.clone();
+        let alternator_decode_types = self.alternator_decode_types.clone();
 
-        // wait for an active session
-        let session = {
-            let mut session_rx = self.session_rx.clone();
-            loop {
-                if let Some(session) = session_rx.borrow_and_update().clone() {
-                    break session;
-                }
-                session_rx
-                    .changed()
-                    .await
-                    .map_err(|err| anyhow::anyhow!("No active session for range scan: {err}"))?;
-            }
-        };
+        let session = self
+            .db_session
+            .wait_for_session()
+            .await
+            .context(NonRetryable)?;
 
-        Ok(session
-            .execute_iter(self.st_range_scan.clone(), (begin.value(), end.value()))
+        Ok(self
+            .db_driver
+            .execute_range_scan(&session, &self.st_range_scan, begin, end)
             .await?
-            .rows_stream::<Row>()?
-            .map_err(anyhow::Error::from)
             .map_ok(move |mut row| {
                 if row.columns.len() != columns_len_expected {
                     debug!(
@@ -609,6 +709,7 @@ impl Statements {
                     None,
                     target_columns_len,
                     &kind,
+                    &alternator_decode_types,
                 )
                 .inspect_err(|err| error!("Error while parsing values: {err}"))
                 .ok()?;
@@ -630,11 +731,144 @@ impl Statements {
     }
 }
 
+/// Streams the rows of every range into `tx`, limiting the number of concurrently scanned ranges
+/// to `concurrency`. Each row is tagged with an `AsyncInProgress::Fullscan` guard; a range
+/// contributes its number of tokens to `completed_scan_length` once the pipeline has dropped all
+/// of its guards. The future resolves only after every range has been acknowledged this way.
+/// Dropping the returned future aborts in-flight range tasks.
+async fn scan_ranges(
+    ranges: impl IntoIterator<Item = (Token, Token)>,
+    concurrency: NonZeroUsize,
+    rows: impl AsyncFn(Token, Token) -> RangeScanResult,
+    tx: mpsc::Sender<(DbIndexedRow, AsyncInProgress)>,
+    completed_scan_length: Arc<AtomicU64>,
+) -> anyhow::Result<()> {
+    let semaphore_capacity = concurrency.get();
+    let semaphore = Arc::new(Semaphore::new(semaphore_capacity));
+    let mut range_tasks = JoinSet::new();
+
+    for (begin, end) in ranges {
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+
+        let length = range_length(begin, end);
+        let range_rows = rows(begin, end).await?;
+        let tx = tx.clone();
+        let scan_length = completed_scan_length.clone();
+        range_tasks.spawn(async move {
+            let (tx_in_progress, mut rx_in_progress) = mpsc::channel(1);
+            range_rows
+                .for_each(move |row| {
+                    let tx = tx.clone();
+                    let tx_in_progress = tx_in_progress.clone();
+                    async move {
+                        _ = tx
+                            .send((row, AsyncInProgress::Fullscan(tx_in_progress)))
+                            .await;
+                    }
+                })
+                .await;
+
+            // All rows of this range have been sent. Let the next range start now by dropping
+            // the permit, then wait for their acknowledgements.
+            drop(permit);
+
+            // wait until all in-progress markers are dropped
+            while rx_in_progress.recv().await.is_some() {
+                rx_in_progress.len();
+            }
+
+            scan_length.fetch_add(length, Ordering::Relaxed);
+        });
+    }
+
+    while let Some(result) = range_tasks.join_next().await {
+        if let Err(err) = result {
+            error!("full scan range task failed: {err}");
+        }
+    }
+
+    Ok(())
+}
+
+fn range_length(begin: Token, end: Token) -> u64 {
+    //Safety: end > begin, and the range fits into u64
+    end.value().abs_diff(begin.value() - 1)
+}
+
+/// Builds the `table_columns` lookup Table::new() uses to size and type
+/// in-memory column storage: the table's genuine, natively-typed CQL
+/// columns (`real_columns`), plus synthesized types for Alternator's
+/// virtual SearchSchema attributes (see
+/// IndexMetadata::alternator_attribute_types) and, only for an Alternator
+/// table, a raw-Blob entry for any other filtering column with no real
+/// column (see Alternator's compute_extra_fc_attributes()) so it can still
+/// be stored for projection/return purposes. Real columns win on any name
+/// collision with a synthesized one.
+///
+/// For a CQL-native table (`is_alternator` false), a filtering column with
+/// no real `real_columns` entry gets no entry here either: that's a
+/// genuine misconfiguration (e.g. schema drift), and must still fail
+/// through Table::new()'s "Column {name} not found in table columns"
+/// check rather than be papered over.
+pub(crate) fn merge_table_columns(
+    metadata: &IndexMetadata,
+    filtering_columns: &[ColumnName],
+    real_columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
+    is_alternator: bool,
+) -> HashMap<ColumnName, NativeType> {
+    let real_columns: HashMap<ColumnName, NativeType> = real_columns.into_iter().collect();
+    metadata
+        .alternator_attribute_types
+        .keys()
+        .filter_map(|name| Some((name.clone(), metadata.alternator_native_type(name)?)))
+        .chain(
+            real_columns
+                .iter()
+                .map(|(name, typ)| (name.clone(), typ.clone())),
+        )
+        .chain(
+            filtering_columns
+                .iter()
+                .filter(|name| {
+                    is_alternator
+                        && !metadata.alternator_attribute_types.contains_key(*name)
+                        && !real_columns.contains_key(*name)
+                })
+                .map(|name| (name.clone(), NativeType::Blob)),
+        )
+        .collect()
+}
+
+/// Builds parse_values()'s alternator_decode_types parameter: for each of
+/// `columns`, its NativeType from `metadata.alternator_native_type()` - or
+/// None if `column` is a real table column, even if it also has a declared
+/// Alternator type (see merge_table_columns(), which gives real columns the
+/// same precedence for table_columns). A real column's raw value is
+/// whatever the CQL driver decoded it as, never a tagged Alternator blob,
+/// so it must never be run through parse_alternator_scalar().
+pub(crate) fn alternator_decode_types<'a>(
+    columns: impl IntoIterator<Item = &'a ColumnName>,
+    metadata: &IndexMetadata,
+    real_columns: &HashMap<ColumnName, NativeType>,
+) -> Box<[Option<NativeType>]> {
+    columns
+        .into_iter()
+        .map(|column| {
+            if real_columns.contains_key(column) {
+                None
+            } else {
+                metadata.alternator_native_type(column)
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn parse_values(
-    columns: impl IntoIterator<Item = Option<CqlValue>>,
+    columns: impl IntoIterator<Item = Option<DbValue>>,
     default_timestamp: Option<Timestamp>,
     target_columns_len: NonZeroUsize,
     kind: &IndexKind,
+    alternator_decode_types: &[Option<NativeType>],
 ) -> anyhow::Result<NonemptyBox<Timestamped<DbIndexedValue>>> {
     let default_timestamp = default_timestamp.unwrap_or(Timestamp::MIN);
     let values = columns
@@ -654,7 +888,20 @@ pub(crate) fn parse_values(
                     None
                 }
             } else {
-                // filtering columns
+                // filtering columns: a virtual Alternator attribute's raw
+                // value is a tagged blob that needs decoding first.
+                let native_type = alternator_decode_types
+                    .get(idx - target_columns_len.get())
+                    .cloned()
+                    .flatten();
+                let value = value
+                    .map(|value| match (filtering_value(value)?, native_type) {
+                        (CqlValue::Blob(bytes), Some(native_type)) => {
+                            crate::alternator::parse_alternator_scalar(&bytes, &native_type)
+                        }
+                        (value, _) => Ok(value),
+                    })
+                    .transpose()?;
                 value.map(DbIndexedValue::Filtering)
             };
 
@@ -664,7 +911,7 @@ pub(crate) fn parse_values(
                     "parse_values: unable to get timestamp value from chunk"
                 ))?
                 .map(|timestamp| {
-                    if let CqlValue::BigInt(timestamp) = timestamp {
+                    if let DbValue::Value(CqlValue::BigInt(timestamp)) = timestamp {
                         Ok(Timestamp::from_micros(timestamp as u64))
                     } else {
                         bail!("parse_values: bad type of a writetime")
@@ -686,25 +933,53 @@ pub(crate) fn parse_values(
     Ok(NonemptyBox::try_from(values).unwrap())
 }
 
-fn parse_primary_key(columns: impl IntoIterator<Item = Option<CqlValue>>) -> Option<PrimaryKey> {
+fn parse_primary_key(columns: impl IntoIterator<Item = Option<DbValue>>) -> Option<PrimaryKey> {
     columns
         .into_iter()
-        .inspect(|value| {
-            if value.is_none() {
+        .map(|value| match value {
+            Some(DbValue::Value(value)) => Some(value),
+            // A primary key column is never of a vector type.
+            Some(DbValue::Vector(_)) => {
+                debug!("parse_primary_key: unexpected vector primary key column");
+                None
+            }
+            None => {
                 debug!("parse_primary_key: missing a primary key column");
-            };
+                None
+            }
         })
         .collect::<Option<_>>()
 }
 
-fn parse_indexed_value(value: CqlValue, kind: &IndexKind) -> anyhow::Result<DbIndexedValue> {
+fn filtering_value(value: DbValue) -> anyhow::Result<CqlValue> {
+    match value {
+        DbValue::Value(value) => Ok(value),
+        DbValue::Vector(_) => {
+            bail!("parse_values: unexpected vector value of a filtering column")
+        }
+    }
+}
+
+fn parse_indexed_value(value: DbValue, kind: &IndexKind) -> anyhow::Result<DbIndexedValue> {
     match kind {
-        IndexKind::Vs(_) => Vector::try_from(value)
-            .map_err(|err| anyhow!("parse_indexed_value: {err}"))
-            .map(DbIndexedValue::Vector),
+        IndexKind::Vs(_) => match value {
+            DbValue::Vector(vector) => Ok(DbIndexedValue::Vector(vector)),
+            DbValue::Value(value) => Vector::try_from(value)
+                .map_err(|err| anyhow!("parse_indexed_value: {err}"))
+                .map(DbIndexedValue::Vector),
+        },
         IndexKind::Fts(_) => match value {
-            CqlValue::Text(s) => Ok(DbIndexedValue::Document(s)),
-            CqlValue::Ascii(s) => Ok(DbIndexedValue::Document(s)),
+            DbValue::Value(CqlValue::Text(s) | CqlValue::Ascii(s)) => {
+                Ok(DbIndexedValue::Document(s))
+            }
+            other => {
+                bail!("parse_indexed_value: expected text column, got {:?}", other);
+            }
+        },
+        IndexKind::Pattern(_) => match value {
+            DbValue::Value(CqlValue::Text(s) | CqlValue::Ascii(s)) => {
+                Ok(DbIndexedValue::Document(s))
+            }
             other => {
                 bail!("parse_indexed_value: expected text column, got {:?}", other);
             }
@@ -722,6 +997,7 @@ mod tests {
 
     use super::*;
     use crate::Connectivity;
+    use crate::DbIndexPartitioning;
     use crate::Dimensions;
     use crate::ExpansionAdd;
     use crate::ExpansionSearch;
@@ -729,7 +1005,11 @@ mod tests {
     use crate::IndexOptionsVs;
     use crate::Quantization;
     use crate::SpaceType;
+    use futures::stream;
+    use rstest::rstest;
     use std::assert_matches;
+    use tokio::task;
+    use uuid::Uuid;
 
     fn vs_kind() -> IndexKind {
         IndexKind::Vs(IndexOptionsVs {
@@ -743,7 +1023,7 @@ mod tests {
     }
 
     fn fts_kind() -> IndexKind {
-        IndexKind::Fts(IndexOptionsFts {})
+        IndexKind::Fts(IndexOptionsFts::default())
     }
 
     #[test]
@@ -767,13 +1047,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_indexed_value_vector_from_cql_vector() {
-        let cql = CqlValue::Vector(vec![
-            CqlValue::Float(1.0),
-            CqlValue::Float(2.0),
-            CqlValue::Float(3.0),
-        ]);
-        let result = parse_indexed_value(cql, &vs_kind());
+    fn parse_indexed_value_vector_from_vector_column() {
+        let column = DbValue::Vector(Vector::from(vec![1.0, 2.0, 3.0]));
+        let result = parse_indexed_value(column, &vs_kind());
         assert_eq!(
             result.unwrap(),
             DbIndexedValue::Vector(Vector::from(vec![1.0, 2.0, 3.0]))
@@ -781,16 +1057,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_indexed_value_vector_from_alternator_blob() {
+        // Tag 5 = ALTERNATOR_TYPE_FLOAT32VECTOR, followed by big-endian
+        // floats: an Alternator embedding is still decoded from a blob.
+        let mut tagged_vector = vec![5u8];
+        tagged_vector.extend_from_slice(&1.0f32.to_be_bytes());
+        tagged_vector.extend_from_slice(&2.0f32.to_be_bytes());
+
+        let column = DbValue::Value(CqlValue::Blob(tagged_vector));
+        let result = parse_indexed_value(column, &vs_kind());
+        assert_eq!(
+            result.unwrap(),
+            DbIndexedValue::Vector(Vector::from(vec![1.0, 2.0]))
+        );
+    }
+
+    #[test]
     fn parse_indexed_value_vector_rejects_invalid_type() {
-        let cql = CqlValue::Text("not a vector".to_string());
-        let result = parse_indexed_value(cql, &vs_kind());
+        let column = DbValue::Value(CqlValue::Text("not a vector".to_string()));
+        let result = parse_indexed_value(column, &vs_kind());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_indexed_value_fts_rejects_a_vector_column() {
+        let column = DbValue::Vector(Vector::from(vec![1.0]));
+        let result = parse_indexed_value(column, &fts_kind());
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_indexed_value_fts_from_text() {
-        let cql = CqlValue::Text("hello world".to_string());
-        let result = parse_indexed_value(cql, &fts_kind());
+        let column = DbValue::Value(CqlValue::Text("hello world".to_string()));
+        let result = parse_indexed_value(column, &fts_kind());
         assert_eq!(
             result.unwrap(),
             DbIndexedValue::Document("hello world".to_string())
@@ -799,8 +1098,8 @@ mod tests {
 
     #[test]
     fn parse_indexed_value_fts_from_ascii() {
-        let cql = CqlValue::Ascii("ascii doc".to_string());
-        let result = parse_indexed_value(cql, &fts_kind());
+        let column = DbValue::Value(CqlValue::Ascii("ascii doc".to_string()));
+        let result = parse_indexed_value(column, &fts_kind());
         assert_eq!(
             result.unwrap(),
             DbIndexedValue::Document("ascii doc".to_string())
@@ -809,17 +1108,17 @@ mod tests {
 
     #[test]
     fn parse_indexed_value_fts_rejects_invalid_type() {
-        let cql = CqlValue::Int(42);
-        let result = parse_indexed_value(cql, &fts_kind());
+        let column = DbValue::Value(CqlValue::Int(42));
+        let result = parse_indexed_value(column, &fts_kind());
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_values_with_missing_timestamp() {
         let columns = vec![
-            Some(CqlValue::Vector(vec![CqlValue::Float(1.0)])),
-            Some(CqlValue::BigInt(1234567890)),
-            Some(CqlValue::Int(1)),
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Value(CqlValue::Int(1))),
             None, // missing timestamp
         ];
 
@@ -828,6 +1127,7 @@ mod tests {
             None,
             NonZeroUsize::new(1).unwrap(),
             &vs_kind(),
+            &[],
         )
         .unwrap();
         let result = result.as_slice();
@@ -853,6 +1153,7 @@ mod tests {
             Some(Timestamp::from_millis(1)),
             NonZeroUsize::new(1).unwrap(),
             &vs_kind(),
+            &[],
         )
         .unwrap();
         let result = result.as_slice();
@@ -865,14 +1166,15 @@ mod tests {
     #[test]
     fn parse_values_with_wrong_timestamp() {
         let columns = vec![
-            Some(CqlValue::Vector(vec![CqlValue::Float(1.0)])),
-            Some(CqlValue::Int(1234567890)),
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::Int(1234567890))),
         ];
         let result = parse_values(
             columns.clone(),
             None,
             NonZeroUsize::new(1).unwrap(),
             &vs_kind(),
+            &[],
         );
         assert_matches!(
             result
@@ -884,12 +1186,16 @@ mod tests {
 
     #[test]
     fn parse_values_with_wrong_value() {
-        let columns = vec![Some(CqlValue::Int(1)), Some(CqlValue::BigInt(1234567890))];
+        let columns = vec![
+            Some(DbValue::Value(CqlValue::Int(1))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+        ];
         let result = parse_values(
             columns.clone(),
             None,
             NonZeroUsize::new(1).unwrap(),
             &vs_kind(),
+            &[],
         );
         assert_matches!(
             result
@@ -901,16 +1207,18 @@ mod tests {
 
     #[test]
     fn parse_values_with_wrong_columns_len() {
+        // A dangling filtering column, with no writetime to pair it with.
         let columns = vec![
-            Some(CqlValue::Vector(vec![CqlValue::Float(1.0)])),
-            Some(CqlValue::BigInt(1234567890)),
-            Some(CqlValue::Vector(vec![CqlValue::Float(1.0)])),
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Value(CqlValue::Int(42))),
         ];
         let result = parse_values(
             columns.clone(),
             None,
             NonZeroUsize::new(1).unwrap(),
             &vs_kind(),
+            &[],
         );
         assert_matches!(
             result
@@ -923,16 +1231,17 @@ mod tests {
     #[test]
     fn parse_values_with_wrong_target_len() {
         let columns = vec![
-            Some(CqlValue::Vector(vec![CqlValue::Float(1.0)])),
-            Some(CqlValue::BigInt(1234567890)),
-            Some(CqlValue::Vector(vec![CqlValue::Float(2.0)])),
-            Some(CqlValue::BigInt(1234567891)),
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Vector(Vector::from(vec![2.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567891))),
         ];
         let result = parse_values(
             columns.clone(),
             None,
             NonZeroUsize::new(3).unwrap(),
             &vs_kind(),
+            &[],
         );
         assert_matches!(
             result
@@ -940,5 +1249,325 @@ mod tests {
                 .to_string(),
                 err if err.contains("target len (3) is greater than values len (2)")
         );
+    }
+
+    #[test]
+    fn parse_values_rejects_a_vector_filtering_column() {
+        let columns = vec![
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Vector(Vector::from(vec![2.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+        ];
+        let result = parse_values(
+            columns,
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            &vs_kind(),
+            &[],
+        );
+        assert_matches!(
+            result.unwrap_err().to_string(),
+            err if err.contains("unexpected vector value of a filtering column")
+        );
+    }
+
+    #[test]
+    fn parse_values_decodes_alternator_filtering_column() {
+        // Tag 0 = ALTERNATOR_TYPE_S (string), per vector.rs.
+        let mut tagged_name = vec![0u8];
+        tagged_name.extend_from_slice(b"red");
+
+        let columns = vec![
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Value(CqlValue::Blob(tagged_name))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+        ];
+        let result = parse_values(
+            columns,
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            &vs_kind(),
+            &[Some(NativeType::Text)],
+        )
+        .unwrap();
+        let result = result.as_slice();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get(1).unwrap().value().unwrap(),
+            &DbIndexedValue::Filtering(CqlValue::Text("red".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_values_leaves_real_column_undecoded() {
+        // alternator_decode_types has no entry (None) for this column,
+        // because it's a real CQL column, not a virtual Alternator
+        // attribute - its raw value must pass through unchanged.
+        let columns = vec![
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Value(CqlValue::Int(42))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+        ];
+        let result = parse_values(
+            columns,
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            &vs_kind(),
+            &[None],
+        )
+        .unwrap();
+        let result = result.as_slice();
+        assert_eq!(
+            result.get(1).unwrap().value().unwrap(),
+            &DbIndexedValue::Filtering(CqlValue::Int(42))
+        );
+    }
+
+    #[test]
+    fn parse_values_rejects_mismatched_alternator_tag() {
+        // Tag 1 = ALTERNATOR_TYPE_B (bytes), but the column is declared
+        // "S" (Text) - parse_alternator_scalar() must reject this rather
+        // than silently misinterpreting the payload.
+        let columns = vec![
+            Some(DbValue::Vector(Vector::from(vec![1.0]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+            Some(DbValue::Value(CqlValue::Blob(vec![1u8, 0xDE, 0xAD]))),
+            Some(DbValue::Value(CqlValue::BigInt(1234567890))),
+        ];
+        let result = parse_values(
+            columns,
+            None,
+            NonZeroUsize::new(1).unwrap(),
+            &vs_kind(),
+            &[Some(NativeType::Text)],
+        );
+        assert!(result.is_err());
+    }
+
+    fn metadata_with_alternator_types(
+        types: impl IntoIterator<Item = (&'static str, NativeType)>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            keyspace_name: "ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["embedding"]).unwrap(),
+            partitioning: DbIndexPartitioning::Global,
+            filtering_columns: Arc::new([]),
+            alternator_attribute_types: Arc::new(
+                types
+                    .into_iter()
+                    .map(|(name, typ)| (ColumnName::from(name), typ))
+                    .collect(),
+            ),
+            version: Uuid::new_v4().into(),
+            kind: vs_kind(),
+        }
+    }
+
+    #[test]
+    fn merge_table_columns_cql_missing_filtering_column_is_not_papered_over() {
+        // A filtering column with no real table_columns entry, on a
+        // CQL-native table (is_alternator = false), is a genuine
+        // misconfiguration (e.g. schema drift) - it must NOT get a
+        // synthesized entry, so Table::new() still rejects it with
+        // "Column {name} not found in table columns" instead of silently
+        // treating it as an opaque, always-empty Blob column.
+        let metadata = metadata_with_alternator_types([]);
+        let table_columns =
+            merge_table_columns(&metadata, &["missing".into()], std::iter::empty(), false);
+        assert!(!table_columns.contains_key(&ColumnName::from("missing")));
+    }
+
+    #[test]
+    fn merge_table_columns_alternator_untyped_filtering_column_gets_blob() {
+        // Same missing-column scenario, but on an Alternator table: a
+        // filtering column added purely for a Projection's sake (no
+        // declared type) must still get a table_columns entry, as a raw
+        // Blob, so Table::new() can store it.
+        let metadata = metadata_with_alternator_types([]);
+        let table_columns =
+            merge_table_columns(&metadata, &["photo".into()], std::iter::empty(), true);
+        assert_eq!(
+            table_columns.get(&ColumnName::from("photo")),
+            Some(&NativeType::Blob)
+        );
+    }
+
+    #[test]
+    fn merge_table_columns_real_column_wins_over_synthesized_type() {
+        // "color" is both a declared SearchSchema attribute (typed "S")
+        // and a genuine real column in the table - the real column's type
+        // must win.
+        let metadata = metadata_with_alternator_types([("color", NativeType::Text)]);
+        let table_columns = merge_table_columns(
+            &metadata,
+            &["color".into()],
+            [(ColumnName::from("color"), NativeType::Ascii)],
+            true,
+        );
+        assert_eq!(
+            table_columns.get(&ColumnName::from("color")),
+            Some(&NativeType::Ascii)
+        );
+    }
+
+    #[test]
+    fn alternator_decode_types_excludes_real_columns() {
+        // "color" is both a declared SearchSchema attribute (typed "S") and
+        // a genuine real column in the table (e.g. it's also the base
+        // table's own hash key). Its raw value is whatever the CQL driver
+        // decoded it as, not a tagged Alternator blob, so it must not be
+        // run through parse_alternator_scalar() - unlike merge_table_columns()
+        // above, which only decides the *storage* type, this decides
+        // whether parse_values() attempts to decode the value at all.
+        let metadata = metadata_with_alternator_types([
+            ("color", NativeType::Text),
+            ("size", NativeType::Decimal),
+        ]);
+        let real_columns = HashMap::from([(ColumnName::from("color"), NativeType::Blob)]);
+        let decode_types = alternator_decode_types(
+            [&ColumnName::from("color"), &ColumnName::from("size")],
+            &metadata,
+            &real_columns,
+        );
+        assert_eq!(&*decode_types, &[None, Some(NativeType::Decimal)]);
+    }
+
+    type Rx = mpsc::Receiver<(DbIndexedRow, AsyncInProgress)>;
+
+    fn row(i: i64) -> DbIndexedRow {
+        DbIndexedRow {
+            primary_key: PrimaryKey::from(vec![CqlValue::Int(i as i32)]),
+            operation: DbIndexedOperation::Delete(Timestamp::from_millis(0)),
+        }
+    }
+
+    fn token_range(begin: i64, end: i64) -> (Token, Token) {
+        (Token::new(begin), Token::new(end))
+    }
+
+    fn single_token_ranges(count: usize) -> impl Iterator<Item = (Token, Token)> {
+        (0..count as i64).map(|i| token_range(i, i))
+    }
+
+    fn single_row_range(begin: Token) -> RangeScanResult {
+        Ok(stream::iter([row(begin.value())]).boxed())
+    }
+
+    fn concurrency(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    fn spawn_consumer_acking_immediately(mut rx: Rx) -> task::JoinHandle<usize> {
+        tokio::spawn(async move {
+            let mut received = 0;
+            while let Some((_row, guard)) = rx.recv().await {
+                drop(guard);
+                received += 1;
+            }
+            received
+        })
+    }
+
+    /// Keeps every row unacknowledged: the next ranges must still be scanned, since a range
+    /// releases its permit once its rows are sent, not once they are acknowledged. If a range held
+    /// its permit until the acknowledgement, the `AsyncInProgress` guards of the next ranges would
+    /// never arrive and the test would fail on the timeout.
+    #[rstest]
+    #[timeout(Duration::from_secs(5))]
+    #[tokio::test]
+    async fn opens_next_ranges_while_rows_of_open_ranges_are_unacknowledged() {
+        const RANGES: usize = 8;
+        let (tx, mut rx) = mpsc::channel(1);
+        let completed = Arc::new(AtomicU64::new(0));
+        tokio::spawn(scan_ranges(
+            single_token_ranges(RANGES),
+            concurrency(2),
+            async |begin, _| single_row_range(begin),
+            tx,
+            Arc::clone(&completed),
+        ));
+
+        let mut unacknowledged = Vec::new();
+        for _ in 0..RANGES {
+            let (_row, in_progress) = rx.recv().await.unwrap();
+            unacknowledged.push(in_progress);
+        }
+
+        assert_eq!(unacknowledged.len(), RANGES);
+        // No row has been acknowledged yet, so no range contributes to the progress.
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(5))]
+    #[tokio::test]
+    async fn progress_reaches_sum_of_range_lengths_once_rows_are_acknowledged() {
+        let ranges = [
+            token_range(0, 9),
+            token_range(10, 29),
+            token_range(30, 59),
+            token_range(60, 99),
+            token_range(100, 149),
+        ];
+        let (tx, rx) = mpsc::channel(1);
+        let completed = Arc::new(AtomicU64::new(0));
+        let consumer = spawn_consumer_acking_immediately(rx);
+
+        scan_ranges(
+            ranges,
+            concurrency(2),
+            async |begin, _| single_row_range(begin),
+            tx,
+            Arc::clone(&completed),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(consumer.await.unwrap(), ranges.len());
+        assert_eq!(completed.load(Ordering::Relaxed), 10 + 20 + 30 + 40 + 50);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(5))]
+    #[tokio::test]
+    async fn range_failing_to_open_fails_the_scan() {
+        let (tx, rx) = mpsc::channel(1);
+        let consumer = spawn_consumer_acking_immediately(rx);
+
+        let result = scan_ranges(
+            single_token_ranges(3),
+            concurrency(1),
+            async |begin, _| {
+                if begin.value() == 1 {
+                    Err(anyhow!("range unavailable"))
+                } else {
+                    single_row_range(begin)
+                }
+            },
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(consumer.await.unwrap(), 1);
+    }
+    #[rstest]
+    #[case::single_token(token_range(7, 7), 1)]
+    #[case::positive(token_range(0, 9), 10)]
+    #[case::negative(token_range(-10, -1), 10)]
+    #[case::whole_ring(token_range(-i64::MAX, i64::MAX), u64::MAX)]
+    fn range_length_counts_tokens_including_both_ends(
+        #[case] (begin, end): (Token, Token),
+        #[case] expected: u64,
+    ) {
+        assert_eq!(range_length(begin, end), expected);
     }
 }

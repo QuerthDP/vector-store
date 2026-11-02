@@ -1,6 +1,6 @@
 /*
  * Copyright 2026-present ScyllaDB
- * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 mod chunk_timestamps;
@@ -21,27 +21,24 @@ use crate::PrimaryKey;
 use crate::Restriction;
 use crate::Timestamp;
 use crate::Vector;
+use crate::cql_types;
 use crate::primary_key::normalize;
 use crate::table::chunk_timestamps::ChunkTimestampsExclusive;
 use crate::timestamp::Timestamped;
 use anyhow::anyhow;
 use anyhow::bail;
-use bigdecimal::BigDecimal;
 use chunk_timestamps::ChunkTimestamps;
 use column::Column;
 use column_vec::ColumnVec;
 use column_vec_chunks::ColumnVecChunks;
 use itertools::Itertools;
-use num_bigint::BigInt;
 pub(crate) use partition_id::IndexId;
 pub(crate) use partition_id::IndexIdGenerator;
 pub use partition_id::PartitionId;
 use primary_id::Epoch;
 pub use primary_id::PrimaryId;
 use scylla::cluster::metadata::NativeType;
-use scylla::value::CqlDecimalBorrowed;
 use scylla::value::CqlValue;
-use scylla::value::CqlVarintBorrowed;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -292,6 +289,13 @@ struct Index {
 
     data: IndexData,
 
+    /// The columns this index indexes - for a vector index, the single
+    /// column holding the vector. Unlike the filtering columns below, no
+    /// value for them is stored in the table: a target column's value lives
+    /// in the index itself, which can reconstruct it when an ANN request
+    /// asks for that column.
+    target_columns: NonemptyArc<ColumnName>,
+
     filtering_columns: Arc<[ColumnName]>,
 
     /// Timestamps of the last vector update
@@ -326,14 +330,15 @@ impl Index {
 
     fn new_global(
         index_id: IndexId,
-        column_targets_count: NonZeroUsize,
+        target_columns: NonemptyArc<ColumnName>,
         filtering_columns: Arc<[ColumnName]>,
     ) -> Self {
         Self {
             index_id,
             data: IndexData::Global,
+            values_timestamps: ColumnVecChunks::new(ChunkTimestamps::new(target_columns.len())),
+            target_columns,
             filtering_columns,
-            values_timestamps: ColumnVecChunks::new(ChunkTimestamps::new(column_targets_count)),
         }
     }
 
@@ -341,13 +346,14 @@ impl Index {
         index_id: IndexId,
         primary_key_columns: &[ColumnName],
         partition_key_columns: NonemptyArc<ColumnName>,
-        column_targets_count: NonZeroUsize,
+        target_columns: NonemptyArc<ColumnName>,
         filtering_columns: Arc<[ColumnName]>,
     ) -> Self {
         Self {
             index_id,
+            values_timestamps: ColumnVecChunks::new(ChunkTimestamps::new(target_columns.len())),
+            target_columns,
             filtering_columns,
-            values_timestamps: ColumnVecChunks::new(ChunkTimestamps::new(column_targets_count)),
             data: IndexData::Local {
                 nonpk_partition_key_columns: partition_key_columns
                     .iter()
@@ -450,7 +456,7 @@ impl Table {
         primary_key_columns: NonemptyArc<ColumnName>,
         partition_primary_key_count: NonZeroUsize,
         partition_key_columns: Option<NonemptyArc<ColumnName>>,
-        column_targets_count: NonZeroUsize,
+        target_columns: NonemptyArc<ColumnName>,
         filtering_columns: Arc<[ColumnName]>,
         table_columns: Arc<HashMap<ColumnName, NativeType>>,
     ) -> anyhow::Result<Self> {
@@ -471,15 +477,11 @@ impl Table {
                 index_id,
                 primary_key_columns.as_slice(),
                 partition_key_columns.clone(),
-                column_targets_count,
+                target_columns,
                 Arc::clone(&filtering_columns),
             )
         } else {
-            Index::new_global(
-                index_id,
-                column_targets_count,
-                Arc::clone(&filtering_columns),
-            )
+            Index::new_global(index_id, target_columns, Arc::clone(&filtering_columns))
         };
         indexes.insert(index_id, index);
         index_ids.insert(index_key, index_id);
@@ -1076,6 +1078,11 @@ impl TableModify for Table {
         primary_key: PrimaryKey,
         timestamp: Timestamp,
     ) -> anyhow::Result<Vec<Operation>> {
+        // A delete can arrive for a row not seen yet, and then it takes a new primary id
+        // to keep the tombstone.
+        self.reserve_primary_ids()?;
+        self.reserve_partition_ids()?;
+
         let index_id = self
             .index_ids
             .get(index_key)
@@ -1137,6 +1144,22 @@ pub(crate) trait TableSearch {
         primary_id: PrimaryId,
         restriction: &Restriction,
     ) -> bool;
+
+    /// Return the stored value of `column` for a single row identified by
+    /// `primary_id`, or `None` if it has no stored value (e.g. the
+    /// attribute was absent when the row was indexed) or `primary_id` is
+    /// invalid.
+    fn column_value_for(
+        &self,
+        partition_id: PartitionId,
+        primary_id: PrimaryId,
+        column: &ColumnName,
+    ) -> Option<CqlValue>;
+
+    /// The column indexed by the given index - the one holding the vector.
+    /// No value for it is stored in the table (column_value_for() always
+    /// returns None for it): it lives in the index itself.
+    fn target_column(&self, index_id: IndexId) -> Option<ColumnName>;
 }
 
 impl TableSearch for Table {
@@ -1201,7 +1224,7 @@ impl TableSearch for Table {
                 .and_then(|column| column.get(primary_id, &self.primary_keys))
                 .and_then(|value| {
                     rhs.iter()
-                        .filter_map(|rhs| cql_cmp(&value, rhs))
+                        .filter_map(|rhs| cql_types::cmp(&value, rhs))
                         .any(|ord| ord.is_eq())
                         .then_some(())
                 })
@@ -1244,9 +1267,9 @@ impl TableSearch for Table {
                 lhs.and_then(|lhs| {
                     rhs.iter()
                         .any(|rhs| {
-                            lhs.iter()
-                                .zip(rhs.iter())
-                                .all(|(lhs, rhs)| cql_cmp(lhs, rhs).is_some_and(|ord| ord.is_eq()))
+                            lhs.iter().zip(rhs.iter()).all(|(lhs, rhs)| {
+                                cql_types::cmp(lhs, rhs).is_some_and(|ord| ord.is_eq())
+                            })
                         })
                         .then_some(())
                 })
@@ -1273,6 +1296,29 @@ impl TableSearch for Table {
                     .is_some_and(|ord| ord.is_ge())
             }
         }
+    }
+
+    #[hotpath::measure]
+    fn column_value_for(
+        &self,
+        partition_id: PartitionId,
+        primary_id: PrimaryId,
+        column: &ColumnName,
+    ) -> Option<CqlValue> {
+        if !self.is_valid_primary_id(partition_id, primary_id) {
+            return None;
+        }
+        self.columns
+            .get(column)
+            .and_then(|col| col.get(primary_id, &self.primary_keys))
+    }
+
+    fn target_column(&self, index_id: IndexId) -> Option<ColumnName> {
+        // A vector index has exactly one target column, so its first target
+        // column is its only one.
+        self.indexes
+            .get(&index_id)
+            .map(|index| index.target_columns.first().clone())
     }
 }
 
@@ -1315,51 +1361,6 @@ fn partition_key_from_restrictions(
         })
 }
 
-/// Compare two CqlValues, returning an Ordering if they are comparable.
-/// Only Numeric, Text, Date, Time, and Timestamp types support comparison operators.
-fn cql_cmp(lhs: &CqlValue, rhs: &CqlValue) -> Option<Ordering> {
-    match (lhs, rhs) {
-        // Numeric types
-        (CqlValue::TinyInt(a), CqlValue::TinyInt(b)) => Some(a.cmp(b)),
-        (CqlValue::SmallInt(a), CqlValue::SmallInt(b)) => Some(a.cmp(b)),
-        (CqlValue::Int(a), CqlValue::Int(b)) => Some(a.cmp(b)),
-        (CqlValue::BigInt(a), CqlValue::BigInt(b)) => Some(a.cmp(b)),
-        (CqlValue::Float(a), CqlValue::Float(b)) => a.partial_cmp(b),
-        (CqlValue::Double(a), CqlValue::Double(b)) => a.partial_cmp(b),
-        (CqlValue::Counter(a), CqlValue::Counter(b)) => Some(a.0.cmp(&b.0)),
-        // Varint: semantic comparison via num-bigint
-        (CqlValue::Varint(a), CqlValue::Varint(b)) => {
-            let a_bi = BigInt::from(CqlVarintBorrowed::from_signed_bytes_be_slice(
-                a.as_signed_bytes_be_slice(),
-            ));
-            let b_bi = BigInt::from(CqlVarintBorrowed::from_signed_bytes_be_slice(
-                b.as_signed_bytes_be_slice(),
-            ));
-            Some(a_bi.cmp(&b_bi))
-        }
-        (CqlValue::Decimal(a), CqlValue::Decimal(b)) => {
-            let (a_bytes, a_scale) = a.as_signed_be_bytes_slice_and_exponent();
-            let (b_bytes, b_scale) = b.as_signed_be_bytes_slice_and_exponent();
-            let a_bd = BigDecimal::from(
-                CqlDecimalBorrowed::from_signed_be_bytes_slice_and_exponent(a_bytes, a_scale),
-            );
-            let b_bd = BigDecimal::from(
-                CqlDecimalBorrowed::from_signed_be_bytes_slice_and_exponent(b_bytes, b_scale),
-            );
-            Some(a_bd.cmp(&b_bd))
-        }
-        // Text types
-        (CqlValue::Text(a), CqlValue::Text(b)) => Some(a.cmp(b)),
-        (CqlValue::Ascii(a), CqlValue::Ascii(b)) => Some(a.cmp(b)),
-        // Date and Time types (access inner values directly)
-        (CqlValue::Date(a), CqlValue::Date(b)) => Some(a.0.cmp(&b.0)),
-        (CqlValue::Time(a), CqlValue::Time(b)) => Some(a.0.cmp(&b.0)),
-        (CqlValue::Timestamp(a), CqlValue::Timestamp(b)) => Some(a.0.cmp(&b.0)),
-        // Unsupported or mismatched types
-        _ => None,
-    }
-}
-
 /// Compare a column value for a given primary_id with a CqlValue.
 fn cql_cmp_single(
     columns: &BTreeMap<ColumnName, Column>,
@@ -1371,7 +1372,7 @@ fn cql_cmp_single(
     columns
         .get(lhs)
         .and_then(|column| column.get(primary_id, primary_keys))
-        .and_then(|value| cql_cmp(&value, rhs))
+        .and_then(|value| cql_types::cmp(&value, rhs))
 }
 
 /// Returns the ordering of the first non-equal pair, or None if all pairs are equal.
@@ -1420,7 +1421,6 @@ pub(crate) enum Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scylla::value::CqlDecimal;
 
     #[test]
     fn flow() {
@@ -1477,7 +1477,7 @@ mod tests {
                 NonemptyArc::new(["pk", "c1", "c2"]).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 partition_key_columns.clone(),
-                NonZeroUsize::new(1).unwrap(),
+                NonemptyArc::new(["embedding"]).unwrap(),
                 filtering_columns,
                 Arc::new(
                     [
@@ -1687,6 +1687,119 @@ mod tests {
     }
 
     #[test]
+    fn column_value_for_returns_stored_value() {
+        let index_key = IndexKey::new(&"ks".into(), &"idx".into());
+        let filtering_columns: Arc<[_]> = Arc::new(["color".into(), "size".into()]);
+        let mut table = Table::new(
+            index_key.clone(),
+            NonemptyArc::new(["pk"]).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            None,
+            NonemptyArc::new(["embedding"]).unwrap(),
+            filtering_columns,
+            Arc::new(
+                [
+                    ("pk".into(), NativeType::Int),
+                    ("color".into(), NativeType::Text),
+                    ("size".into(), NativeType::Int),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )
+        .unwrap();
+
+        let values = |color: Option<CqlValue>, size: Option<CqlValue>| {
+            NonemptyBox::<Timestamped<DbIndexedValue>>::new([
+                Timestamped::new(
+                    Timestamp::from_millis(100),
+                    Some(DbIndexedValue::Vector(vec![0.1, 0.2, 0.3].into())),
+                ),
+                Timestamped::new(
+                    Timestamp::from_millis(100),
+                    color.map(DbIndexedValue::Filtering),
+                ),
+                Timestamped::new(
+                    Timestamp::from_millis(100),
+                    size.map(DbIndexedValue::Filtering),
+                ),
+            ])
+            .unwrap()
+        };
+
+        let operations = table
+            .upsert(
+                &index_key,
+                [CqlValue::Int(1)].into(),
+                values(
+                    Some(CqlValue::Text("red".to_string())),
+                    Some(CqlValue::Int(42)),
+                ),
+            )
+            .unwrap();
+        let (primary_id1, partition_id1) = match operations.first().unwrap() {
+            Operation::AddVector {
+                primary_id,
+                partition_id,
+                ..
+            } => (*primary_id, *partition_id),
+            _ => panic!("Expected AddVector operation"),
+        };
+
+        // "color" has no stored value for this row (e.g. it was absent when
+        // the row was indexed), "size" does.
+        let operations = table
+            .upsert(
+                &index_key,
+                [CqlValue::Int(2)].into(),
+                values(None, Some(CqlValue::Int(7))),
+            )
+            .unwrap();
+        let (primary_id2, partition_id2) = match operations.first().unwrap() {
+            Operation::AddVector {
+                primary_id,
+                partition_id,
+                ..
+            } => (*primary_id, *partition_id),
+            _ => panic!("Expected AddVector operation"),
+        };
+
+        // A stored column value is returned.
+        assert_eq!(
+            table.column_value_for(partition_id1, primary_id1, &"color".into()),
+            Some(CqlValue::Text("red".to_string()))
+        );
+        assert_eq!(
+            table.column_value_for(partition_id1, primary_id1, &"size".into()),
+            Some(CqlValue::Int(42))
+        );
+
+        // A column with no stored value for this row is reported as `None`,
+        // not a placeholder value.
+        assert_eq!(
+            table.column_value_for(partition_id2, primary_id2, &"color".into()),
+            None
+        );
+        assert_eq!(
+            table.column_value_for(partition_id2, primary_id2, &"size".into()),
+            Some(CqlValue::Int(7))
+        );
+
+        // A primary-key column resolves through the same method.
+        assert_eq!(
+            table.column_value_for(partition_id1, primary_id1, &"pk".into()),
+            Some(CqlValue::Int(1))
+        );
+
+        // An invalid (never allocated) primary_id returns `None` rather
+        // than stale or default values.
+        assert_eq!(
+            table.column_value_for(partition_id1, PrimaryId::from(9999), &"color".into()),
+            None
+        );
+    }
+
+    #[test]
     fn global_add_remove_multiple_add() {
         let pk1 = PrimaryKey::from([CqlValue::Int(1)]);
         let pk2 = PrimaryKey::from([CqlValue::Int(2)]);
@@ -1705,7 +1818,7 @@ mod tests {
             NonemptyArc::new(["p"]).unwrap(),
             NonZeroUsize::new(1).unwrap(),
             None,
-            NonZeroUsize::new(1).unwrap(),
+            NonemptyArc::new(["embedding"]).unwrap(),
             Arc::new([]),
             Arc::new([("p".into(), NativeType::Int)].into_iter().collect()),
         )
@@ -1869,7 +1982,7 @@ mod tests {
                 primary_key_columns,
                 NonZeroUsize::new(1).unwrap(),
                 partition_key_columns,
-                NonZeroUsize::new(1).unwrap(),
+                NonemptyArc::new(["embedding"]).unwrap(),
                 Arc::new(["f".into()]),
                 Arc::new(
                     [
@@ -1969,7 +2082,7 @@ mod tests {
                 primary_key_columns,
                 NonZeroUsize::new(1).unwrap(),
                 partition_key_columns,
-                NonZeroUsize::new(1).unwrap(),
+                NonemptyArc::new(["embedding"]).unwrap(),
                 Arc::new([]),
                 Arc::new(
                     [("p".into(), NativeType::Int), ("c".into(), NativeType::Int)]
@@ -2014,6 +2127,61 @@ mod tests {
     }
 
     #[test]
+    fn delete_unseen_keys_beyond_reserved_ids() {
+        let values = |ts| {
+            NonemptyBox::new([Timestamped::new(
+                Timestamp::from_millis(ts),
+                Some(DbIndexedValue::Vector(vec![1.0].into())),
+            )])
+            .unwrap()
+        };
+
+        for (pk, primary_key_columns, partition_key_columns) in [
+            (
+                (|i| PrimaryKey::from([CqlValue::Int(i)])) as fn(i32) -> PrimaryKey,
+                NonemptyArc::new([ColumnName::from("p")]).unwrap(),
+                None,
+            ),
+            (
+                |i| PrimaryKey::from([CqlValue::Int(i), CqlValue::Int(i)]),
+                NonemptyArc::new([ColumnName::from("p"), ColumnName::from("c")]).unwrap(),
+                Some(NonemptyArc::new([ColumnName::from("p")]).unwrap()),
+            ),
+        ] {
+            dbg!(&primary_key_columns);
+            let index_key = IndexKey::new(&"ks".into(), &"idx".into());
+            let mut table = Table::new(
+                index_key.clone(),
+                primary_key_columns,
+                NonZeroUsize::new(1).unwrap(),
+                partition_key_columns,
+                NonemptyArc::new(["embedding"]).unwrap(),
+                Arc::new([]),
+                Arc::new(
+                    [("p".into(), NativeType::Int), ("c".into(), NativeType::Int)]
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+            .unwrap();
+
+            // CDC deletes of rows the full scan hasn't read yet: each one takes a new primary
+            // id, so they use up the ids reserved at creation and must reserve more
+            let last = Table::INCREMENT_SIZE as i32;
+            for i in 0..=last {
+                let operations = table
+                    .delete(&index_key, pk(i), Timestamp::from_millis(20))
+                    .unwrap();
+                assert_eq!(operations.len(), 0);
+            }
+
+            // the full scan read the last row before it was deleted - the delete must still win
+            let operations = table.upsert(&index_key, pk(last), values(10)).unwrap();
+            assert_eq!(operations.len(), 0);
+        }
+    }
+
+    #[test]
     fn change_nonpk_partition_key_column() {
         let vector_orig: Vector = vec![1.0].into();
         let values = |ts1, ts2, rc: Option<_>| {
@@ -2042,7 +2210,7 @@ mod tests {
             primary_key_columns,
             NonZeroUsize::new(1).unwrap(),
             partition_key_columns,
-            NonZeroUsize::new(1).unwrap(),
+            NonemptyArc::new(["embedding"]).unwrap(),
             Arc::new([]),
             Arc::new(
                 [
@@ -2383,206 +2551,6 @@ mod tests {
         );
         let values = NonemptyBox::new([value1, value2]).unwrap();
         assert!(split_values_filtering(values).is_err());
-    }
-
-    #[test]
-    fn cql_cmp_integers() {
-        assert_eq!(
-            cql_cmp(&CqlValue::Int(1), &CqlValue::Int(2)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::Int(2), &CqlValue::Int(2)),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::Int(3), &CqlValue::Int(2)),
-            Some(Ordering::Greater)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_bigints() {
-        assert_eq!(
-            cql_cmp(&CqlValue::BigInt(100), &CqlValue::BigInt(200)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::BigInt(-50), &CqlValue::BigInt(-50)),
-            Some(Ordering::Equal)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_floats() {
-        assert_eq!(
-            cql_cmp(&CqlValue::Float(1.0), &CqlValue::Float(2.0)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::Float(2.5), &CqlValue::Float(2.5)),
-            Some(Ordering::Equal)
-        );
-        // NaN comparison returns None
-        assert_eq!(
-            cql_cmp(&CqlValue::Float(f32::NAN), &CqlValue::Float(1.0)),
-            None
-        );
-    }
-
-    #[test]
-    fn cql_cmp_doubles() {
-        assert_eq!(
-            cql_cmp(&CqlValue::Double(1.0), &CqlValue::Double(2.0)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::Double(f64::NAN), &CqlValue::Double(1.0)),
-            None
-        );
-    }
-
-    #[test]
-    fn cql_cmp_text() {
-        assert_eq!(
-            cql_cmp(
-                &CqlValue::Text("apple".to_string()),
-                &CqlValue::Text("banana".to_string())
-            ),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(
-                &CqlValue::Text("same".to_string()),
-                &CqlValue::Text("same".to_string())
-            ),
-            Some(Ordering::Equal)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_ascii() {
-        assert_eq!(
-            cql_cmp(
-                &CqlValue::Ascii("aaa".to_string()),
-                &CqlValue::Ascii("bbb".to_string())
-            ),
-            Some(Ordering::Less)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_smallint_and_tinyint() {
-        assert_eq!(
-            cql_cmp(&CqlValue::SmallInt(10), &CqlValue::SmallInt(20)),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::TinyInt(5), &CqlValue::TinyInt(3)),
-            Some(Ordering::Greater)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_mismatched_types_return_none() {
-        assert_eq!(cql_cmp(&CqlValue::Int(1), &CqlValue::BigInt(1)), None);
-        assert_eq!(
-            cql_cmp(&CqlValue::Int(1), &CqlValue::Text("1".to_string())),
-            None
-        );
-        assert_eq!(cql_cmp(&CqlValue::Float(1.0), &CqlValue::Double(1.0)), None);
-    }
-
-    #[test]
-    fn cql_cmp_varint() {
-        use num_bigint::BigInt;
-        use scylla::value::CqlVarint;
-        let make = |s: &str| CqlValue::Varint(CqlVarint::from(s.parse::<BigInt>().unwrap()));
-
-        assert_eq!(
-            cql_cmp(&make("-1000000000000000000000"), &make("0")),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&make("99999999999999999999"), &make("99999999999999999999")),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(
-            cql_cmp(
-                &make("100000000000000000001"),
-                &make("99999999999999999999")
-            ),
-            Some(Ordering::Greater)
-        );
-        // negative values
-        assert_eq!(
-            cql_cmp(
-                &make("-98765432109876543210"),
-                &make("-12345678901234567890")
-            ),
-            Some(Ordering::Less)
-        );
-        assert_eq!(cql_cmp(&make("-1"), &make("1")), Some(Ordering::Less));
-        // large positive vs large negative
-        assert_eq!(
-            cql_cmp(
-                &make("98765432109876543210987654321098765432109876543210"),
-                &make("-98765432109876543210987654321098765432109876543210")
-            ),
-            Some(Ordering::Greater)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_decimal() {
-        let make = |s: &str| {
-            CqlValue::Decimal(CqlDecimal::try_from(s.parse::<BigDecimal>().unwrap()).unwrap())
-        };
-
-        assert_eq!(
-            cql_cmp(&make("-98765432109876543210.123456789"), &make("0")),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(
-                &make("3.14159265358979323846"),
-                &make("3.14159265358979323846")
-            ),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(
-            cql_cmp(
-                &make("1000000000000000000.000000001"),
-                &make("999999999999999999.999999999")
-            ),
-            Some(Ordering::Greater)
-        );
-        // different scales for semantically equal value: 1.50 == 1.5
-        assert_eq!(cql_cmp(&make("1.50"), &make("1.5")), Some(Ordering::Equal));
-        // negative comparisons
-        assert_eq!(
-            cql_cmp(&make("-0.000000001"), &make("0.000000001")),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            cql_cmp(&make("-1.25"), &make("-1.125")),
-            Some(Ordering::Less)
-        );
-    }
-
-    #[test]
-    fn cql_cmp_unsupported_types_return_none() {
-        assert_eq!(
-            cql_cmp(
-                &CqlValue::Blob(vec![1, 2, 3]),
-                &CqlValue::Blob(vec![1, 2, 3])
-            ),
-            None
-        );
-        assert_eq!(
-            cql_cmp(&CqlValue::Boolean(true), &CqlValue::Boolean(false)),
-            None
-        );
     }
 
     #[test]
