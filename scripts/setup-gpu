@@ -1,7 +1,13 @@
 #!/bin/bash
 #
 # Sets up a local conda env with `libcuvs` for building vector-store with `--features gpu`.
-# Usage: sudo ./scripts/setup-gpu [--verify]
+# Usage: [sudo] ./scripts/setup-gpu [--verify | --github-env]
+#
+# `--github-env` exports the build environment to the following GitHub
+# Actions steps instead of pointing `.cargo/config.toml` at the prefix.
+#
+# `sudo` is only needed when the prefix (`VECTOR_STORE_CUVS_GPU_PREFIX`,
+# default `/opt/vector-store-cuvs-gpu`) is not writable by the current user.
 
 set -euo pipefail
 
@@ -12,13 +18,42 @@ filter_conda_noise() {
     sed -e '/^#/d' -e '/To enable CUDA support, UCX requires/,/have been installed for you\.$/d' -e '/^$/d'
 }
 
+verify=false
+github_env=false
+for arg in "$@"; do
+    case "$arg" in
+        --verify) verify=true ;;
+        --github-env) github_env=true ;;
+        *)
+            err "unknown argument: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+if $github_env; then
+    if $verify; then
+        err "--verify checks the build set up by the cargo config, which --github-env leaves alone."
+        exit 1
+    fi
+    if [[ -z "${GITHUB_ENV:-}" || -z "${GITHUB_PATH:-}" ]]; then
+        err "--github-env only works in GitHub Actions (GITHUB_ENV or GITHUB_PATH is unset)."
+        exit 1
+    fi
+fi
+
 repo=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
 PREFIX="${VECTOR_STORE_CUVS_GPU_PREFIX:-/opt/vector-store-cuvs-gpu}"
-MINIFORGE_PREFIX="$PREFIX/miniforge"
+MICROMAMBA_VERSION="2.10.0-0"
+micromamba="$PREFIX/bin/micromamba"
 ENV_PREFIX="$PREFIX/env"
 
-if [[ $EUID -ne 0 ]] || [[ -z "${SUDO_USER:-}" ]]; then
-    err "run with sudo, as your normal user."
+# Root is only needed for a prefix the user cannot write to, like the default
+# one in `/opt`.
+existing=$PREFIX
+while [[ ! -e "$existing" ]]; do existing=$(dirname "$existing"); done
+if [[ ! -w "$existing" ]]; then
+    err "$PREFIX is not writable: run with sudo, as your normal user, or set VECTOR_STORE_CUVS_GPU_PREFIX."
     exit 1
 fi
 
@@ -35,7 +70,7 @@ command -v python3 &>/dev/null || { err "python3 is required (used to resolve co
 # When a non-default prefix is requested, rewrite those two lines in place to match,
 # so the build actually looks in $ENV_PREFIX instead of silently keeping the checked-in default.
 cargo_config="$repo/.cargo/config.toml"
-if ! grep -qF "CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"" "$cargo_config"; then
+if ! $github_env && ! grep -qF "CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"" "$cargo_config"; then
     log "Pointing $cargo_config at $ENV_PREFIX"
     sed -i -E "s#^CMAKE_PREFIX_PATH = \".*\"#CMAKE_PREFIX_PATH = \"$ENV_PREFIX\"#" "$cargo_config"
     sed -i -E "s#-rpath,[^\"]*/lib#-rpath,$ENV_PREFIX/lib#" "$cargo_config"
@@ -49,49 +84,40 @@ cuvs_sys_version=$(awk '/^name = "cuvs-sys"$/{getline; print; exit}' "$repo/Carg
 major_minor=$(echo "$cuvs_sys_version" | cut -d. -f1-2)
 log "cuvs-sys is resolved to version $cuvs_sys_version (need libcuvs $major_minor.x)"
 
-if [[ ! -x "$MINIFORGE_PREFIX/bin/conda" ]]; then
+if [[ "$("$micromamba" --version 2>/dev/null)" != "${MICROMAMBA_VERSION%-*}" ]]; then
     arch=$(uname -m)
     case "$arch" in
-        x86_64 | aarch64) ;;
+        x86_64)
+            platform=linux-64
+            expected_sha256=701f39c06f8e6a670a0e186c8479b9e5c0502a2f0cda6cef65d83bdd2875e8bd
+            ;;
+        aarch64)
+            platform=linux-aarch64
+            expected_sha256=3bb56786e21b9b24024f599fe9185b4a59dc3f9f59937a42311ee583adbbb23c
+            ;;
         *)
-            err "unsupported architecture: $arch (Miniforge only auto-installs for x86_64/aarch64)"
+            err "unsupported architecture: $arch (micromamba only auto-installs for x86_64/aarch64)"
             exit 1
             ;;
     esac
 
-    log "Resolving the latest Miniforge Linux/$arch release"
-    read -r installer_name installer_url checksum_url <<<"$(python3 - "$arch" <<'PY'
-import json, sys, urllib.request
-arch = sys.argv[1]
-data = json.load(urllib.request.urlopen(
-    "https://api.github.com/repos/conda-forge/miniforge/releases/latest", timeout=60))
-assets = {a["name"]: a["browser_download_url"] for a in data["assets"]}
-suffix = f"-Linux-{arch}.sh"
-name = next(n for n in assets if n.startswith("Miniforge3-") and n.endswith(suffix) and n + ".sha256" in assets)
-print(name, assets[name], assets[name + ".sha256"])
-PY
-)" || { err "could not resolve the latest Miniforge release for $arch."; exit 1; }
-
-    log "Installing Miniforge ($installer_name) into $MINIFORGE_PREFIX"
-    mkdir -p "$PREFIX"
+    url="https://github.com/mamba-org/micromamba-releases/releases/download/$MICROMAMBA_VERSION/micromamba-$platform"
+    log "Installing micromamba $MICROMAMBA_VERSION into $micromamba"
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' EXIT
-    tmp_installer="$tmp_dir/$installer_name"
-    curl -fL --progress-bar "$installer_url" -o "$tmp_installer"
-    curl -fL "$checksum_url" -o "$tmp_installer.sha256"
+    curl -fL --progress-bar "$url" -o "$tmp_dir/micromamba"
 
-    expected_sha256=$(awk '{print $1}' "$tmp_installer.sha256")
-    actual_sha256=$(sha256sum "$tmp_installer" | awk '{print $1}')
-    if [[ -z "$expected_sha256" ]] || [[ "$expected_sha256" != "$actual_sha256" ]]; then
-        err "Miniforge installer checksum mismatch (expected $expected_sha256, got $actual_sha256)"
+    actual_sha256=$(sha256sum "$tmp_dir/micromamba" | awk '{print $1}')
+    if [[ "$expected_sha256" != "$actual_sha256" ]]; then
+        err "micromamba checksum mismatch (expected $expected_sha256, got $actual_sha256)"
         exit 1
     fi
 
-    bash "$tmp_installer" -b -p "$MINIFORGE_PREFIX"
+    mkdir -p "$PREFIX/bin"
+    install -m 755 "$tmp_dir/micromamba" "$micromamba"
     rm -rf "$tmp_dir"
     trap - EXIT
 fi
-export PATH="$MINIFORGE_PREFIX/bin:$PATH"
 
 log "Resolving the latest libcuvs $major_minor.x package"
 resolved=$(python3 - "$major_minor" <<'PY'
@@ -135,20 +161,40 @@ PY
 read -r channel pkg_name pkg_version pkg_build cuda_version <<< "$resolved"
 log "Resolved: $channel::$pkg_name=$pkg_version=$pkg_build (cuda $cuda_version)"
 
-conda_action="create"
-[[ -d "$ENV_PREFIX/conda-meta" ]] && conda_action="install"
-log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) conda env at $ENV_PREFIX"
+specs=("$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" "cuda-cudart=$cuda_version.*" cmake pkg-config)
+# The stamp is written only after a complete install, so an interrupted one
+# is retried, and a change of any requested package installs again.
+stamp="$ENV_PREFIX/.setup-gpu-stamp"
+if [[ -f "$stamp" && "$(<"$stamp")" == "$channel ${specs[*]}" ]]; then
+    log "$pkg_name $pkg_version ($pkg_build) is already installed in $ENV_PREFIX"
+else
+    conda_action="create"
+    [[ -d "$ENV_PREFIX/conda-meta" ]] && conda_action="install"
+    log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) conda env at $ENV_PREFIX"
 
-conda "$conda_action" -y --solver=libmamba -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
-    "$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" \
-    "cuda-cudart=$cuda_version.*" cmake pkg-config 2>&1 | filter_conda_noise
+    "$micromamba" "$conda_action" -y -r "$PREFIX/micromamba" -p "$ENV_PREFIX" -c "$channel" -c conda-forge -c nvidia \
+        "${specs[@]}" 2>&1 | filter_conda_noise
+    echo "$channel ${specs[*]}" >"$stamp"
 
-chmod -R a+rX "$PREFIX"
+    [[ $EUID -ne 0 ]] || chmod -R a+rX "$PREFIX"
+fi
 
-if [[ "${1:-}" == "--verify" ]]; then
+if $github_env; then
+    log "Exporting the build environment to the following steps"
+    mkdir -p "$PREFIX/path"
+    ln -sf "$ENV_PREFIX/bin/cmake" "$PREFIX/path/cmake"
+    echo "$PREFIX/path" >>"$GITHUB_PATH"
+    echo "CMAKE_PREFIX_PATH=$ENV_PREFIX" >>"$GITHUB_ENV"
+    # `RUSTFLAGS` replaces the `rustflags` of `.cargo/config.toml`,
+    # so it needs the rpath to `libcuvs` as well.
+    echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$ENV_PREFIX/lib" >>"$GITHUB_ENV"
+fi
+
+if $verify; then
     log "Verifying: cargo check -p vector-store --features gpu"
-    runuser -u "$SUDO_USER" -- bash -lc "cd '$repo' && cargo check -p vector-store --features gpu" \
-        || { err "Verification failed"; exit 1; }
+    check=(bash -lc "cd '$repo' && cargo check -p vector-store --features gpu")
+    [[ -z "${SUDO_USER:-}" ]] || check=(runuser -u "$SUDO_USER" -- "${check[@]}")
+    "${check[@]}" || { err "Verification failed"; exit 1; }
     log "Verification succeeded"
 fi
 
