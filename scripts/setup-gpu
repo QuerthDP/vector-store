@@ -1,7 +1,10 @@
 #!/bin/bash
 #
 # Sets up a local conda env with `libcuvs` for building vector-store with `--features gpu`.
-# Usage: sudo ./scripts/setup-gpu [--verify]
+# Usage: [sudo] ./scripts/setup-gpu [--verify]
+#
+# `sudo` is only needed when the prefix (`VECTOR_STORE_CUVS_GPU_PREFIX`,
+# default `/opt/vector-store-cuvs-gpu`) is not writable by the current user.
 
 set -euo pipefail
 
@@ -18,8 +21,12 @@ MICROMAMBA_VERSION="2.10.0-0"
 micromamba="$PREFIX/bin/micromamba"
 ENV_PREFIX="$PREFIX/env"
 
-if [[ $EUID -ne 0 ]] || [[ -z "${SUDO_USER:-}" ]]; then
-    err "run with sudo, as your normal user."
+# Root is only needed for a prefix the user cannot write to, like the default
+# one in `/opt`.
+existing=$PREFIX
+while [[ ! -e "$existing" ]]; do existing=$(dirname "$existing"); done
+if [[ ! -w "$existing" ]]; then
+    err "$PREFIX is not writable: run with sudo, as your normal user, or set VECTOR_STORE_CUVS_GPU_PREFIX."
     exit 1
 fi
 
@@ -135,12 +142,13 @@ log "$([[ "$conda_action" == create ]] && echo Creating || echo Installing) cond
     "$pkg_name=$pkg_version=$pkg_build" "cuda-version=$cuda_version.*" \
     "cuda-cudart=$cuda_version.*" cmake pkg-config 2>&1 | filter_conda_noise
 
-chmod -R a+rX "$PREFIX"
+[[ $EUID -ne 0 ]] || chmod -R a+rX "$PREFIX"
 
 if [[ "${1:-}" == "--verify" ]]; then
     log "Verifying: cargo check -p vector-store --features gpu"
-    runuser -u "$SUDO_USER" -- bash -lc "cd '$repo' && cargo check -p vector-store --features gpu" \
-        || { err "Verification failed"; exit 1; }
+    verify=(bash -lc "cd '$repo' && cargo check -p vector-store --features gpu")
+    [[ -z "${SUDO_USER:-}" ]] || verify=(runuser -u "$SUDO_USER" -- "${verify[@]}")
+    "${verify[@]}" || { err "Verification failed"; exit 1; }
     log "Verification succeeded"
 fi
 
