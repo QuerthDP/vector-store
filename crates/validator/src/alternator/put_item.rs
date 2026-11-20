@@ -92,6 +92,19 @@ async fn put_item_with_invalid_vector_is_not_indexed(actors: Arc<TestActors>) {
         .await
         .expect("PutItem should succeed");
 
+    // Two fillers keep at least two vectors indexed until the end, as cuVS
+    // needs that many to build an index.
+    let fillers = [
+        Item::filler(pk, None, vec_attr),
+        Item::key(pk, None, "pk", "filler-2").vec(vec_attr, [-1.0, -2.0, -4.0]),
+    ];
+    for filler in &fillers {
+        ctx.put(filler)
+            .send()
+            .await
+            .expect("PutItem should succeed");
+    }
+
     let try_replace_valid =
         Item::key(pk, None, "pk", "try-replace-valid").vec(vec_attr, [1.0, 1.0, 1.0]);
     ctx.put(&try_replace_valid)
@@ -134,7 +147,7 @@ async fn put_item_with_invalid_vector_is_not_indexed(actors: Arc<TestActors>) {
         info!(?invalid_item, "expecting invalid PutItem to fail");
         alternator::assert_service_error(ctx.put(invalid_item).send().await, "ValidationException");
     }
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(3).await;
     ctx.wait_for_ann([1.0, 1.0, 1.0], std::slice::from_ref(&try_replace_valid))
         .await;
 
@@ -143,7 +156,7 @@ async fn put_item_with_invalid_vector_is_not_indexed(actors: Arc<TestActors>) {
         .send()
         .await
         .expect("PutItem should succeed");
-    ctx.wait_for_count(0).await;
+    ctx.wait_for_count(2).await;
 
     ctx.done().await;
     info!("finished");

@@ -44,9 +44,14 @@ async fn delete_item_updates_index(actors: Arc<TestActors>) {
         let b = Item::key(shape.pk(), shape.sk(), "pk", "b").vec(vec_attr, [1.0, 2.0, 4.0]);
         let c = Item::key(shape.pk(), shape.sk(), "pk", "c").vec(vec_attr, [1.0, 4.0, 8.0]);
 
-        let ctx =
-            TableContext::create_with_data(&actors, shape, &[a.clone(), b.clone(), c.clone()])
-                .await;
+        let filler = Item::filler(shape.pk(), shape.sk(), vec_attr);
+
+        let ctx = TableContext::create_with_data(
+            &actors,
+            shape,
+            &[a.clone(), b.clone(), c.clone(), filler],
+        )
+        .await;
 
         info!("Step 1: deleting item from '{}'", ctx.table_name);
         ctx_delete_item(&ctx, &a)
@@ -54,7 +59,7 @@ async fn delete_item_updates_index(actors: Arc<TestActors>) {
             .await
             .expect("DeleteItem should succeed");
 
-        ctx.wait_for_count(2).await;
+        ctx.wait_for_count(3).await;
         ctx.wait_for_ann([1.0, 1.0, 1.0], &[b.clone(), c]).await;
 
         // Conditional DeleteItem exercises the LWT/Paxos path under
@@ -70,7 +75,7 @@ async fn delete_item_updates_index(actors: Arc<TestActors>) {
             .await
             .expect("conditional DeleteItem with passing condition should succeed");
 
-        ctx.wait_for_count(1).await;
+        ctx.wait_for_count(2).await;
 
         ctx.done().await;
         info!("Shape {shape:?} passed");

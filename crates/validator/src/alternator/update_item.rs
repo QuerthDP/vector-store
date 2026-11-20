@@ -159,14 +159,15 @@ async fn update_item_with_invalid_vector_is_not_indexed(actors: Arc<TestActors>)
 
     let a = Item::key(shape.pk(), shape.sk(), "pk", "a").vec(vec_attr, [1.0, 2.0, 4.0]);
     let b = Item::key(shape.pk(), shape.sk(), "pk", "b").vec(vec_attr, [1.0, 1.0, 1.0]);
+    let filler = Item::filler(shape.pk(), shape.sk(), vec_attr);
 
-    let ctx = TableContext::create_with_data(&actors, shape, &[a.clone(), b.clone()]).await;
+    let ctx = TableContext::create_with_data(&actors, shape, &[a.clone(), b.clone(), filler]).await;
 
     update_item_expr(&ctx, &b, "REMOVE #vec", None)
         .send()
         .await
         .expect("UpdateItem should succeed");
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
     ctx.wait_for_ann([1.0, 1.0, 1.0], std::slice::from_ref(&a))
         .await;
 
@@ -257,8 +258,9 @@ async fn update_item_remove_vector_and_set_unrelated_deindexes(actors: Arc<TestA
 
     let a = Item::key(shape.pk(), shape.sk(), "pk", "a").vec(vec_attr, [1.0, 1.0, 1.0]);
     let b = Item::key(shape.pk(), shape.sk(), "pk", "b").vec(vec_attr, [4.0, 2.0, 1.0]);
+    let filler = Item::filler(shape.pk(), shape.sk(), vec_attr);
 
-    let ctx = TableContext::create_with_data(&actors, shape, &[a.clone(), b.clone()]).await;
+    let ctx = TableContext::create_with_data(&actors, shape, &[a.clone(), b.clone(), filler]).await;
     ctx.wait_for_ann([1.0, 1.0, 1.0], &[a.clone(), b.clone()])
         .await;
 
@@ -272,7 +274,7 @@ async fn update_item_remove_vector_and_set_unrelated_deindexes(actors: Arc<TestA
     .await
     .expect("UpdateItem remove vector plus unrelated set should succeed");
 
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
     ctx.wait_for_ann([1.0, 1.0, 1.0], &[b]).await;
 
     ctx.done().await;

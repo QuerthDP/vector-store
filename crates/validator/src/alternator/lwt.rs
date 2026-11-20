@@ -97,8 +97,19 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         .await
         .expect("PutItem item-b should succeed");
 
-    common::wait_for_index_count(&vs_clients, &index, 2).await;
-    info!("VS indexed 2 items via PutItem LWT path");
+    // The filler keeps at least two vectors indexed, as cuVS needs that many
+    // to build an index. It ranks second for the negative query below.
+    client
+        .put_item()
+        .table_name(&table_name)
+        .item(pk_attr, AttributeValue::S("item-filler".into()))
+        .item(vec_attr, alternator::float_list([-1.0_f32, -2.0, -4.0]))
+        .send()
+        .await
+        .expect("PutItem item-filler should succeed");
+
+    common::wait_for_index_count(&vs_clients, &index, 3).await;
+    info!("VS indexed 3 items via PutItem LWT path");
 
     info!("Deleting item-b via DeleteItem (LWT path)");
     client
@@ -109,7 +120,7 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         .await
         .expect("DeleteItem item-b should succeed");
 
-    common::wait_for_index_count(&vs_clients, &index, 1).await;
+    common::wait_for_index_count(&vs_clients, &index, 2).await;
     info!("VS correctly removed deleted item from index");
 
     // Count doesn't change, so we verify via ANN ordering.
@@ -152,10 +163,11 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         .await
         .expect("BatchWriteItem (put batch-a, batch-b) should succeed");
 
-    common::wait_for_index_count(&vs_clients, &index, 3).await;
+    common::wait_for_index_count(&vs_clients, &index, 4).await;
     info!("VS indexed BatchWriteItem puts via LWT path");
 
-    // ANN([-1,-1,-1], limit=3): batch-c first, batch-b second, item-a last.
+    // ANN([-1,-1,-1], limit=4): batch-c first, item-filler second, batch-b
+    // third, item-a last.
     let batch_c = Item::new(pk_attr, AttributeValue::S("batch-c".into()))
         .vec(vec_attr, [-1.0_f32, -1.0, -1.0]);
 
@@ -173,7 +185,7 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         .await
         .expect("BatchWriteItem (put batch-c, delete batch-a) should succeed");
 
-    common::wait_for_index_count(&vs_clients, &index, 3).await;
+    common::wait_for_index_count(&vs_clients, &index, 4).await;
 
     alternator::wait_for_ann(
         &vs_clients,
@@ -183,6 +195,7 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         [-1.0, -1.0, -1.0],
         &[
             Item::new(pk_attr, AttributeValue::S("batch-c".into())),
+            Item::new(pk_attr, AttributeValue::S("item-filler".into())),
             Item::new(pk_attr, AttributeValue::S("batch-b".into())),
             Item::new(pk_attr, AttributeValue::S("item-a".into())),
         ],
@@ -204,7 +217,7 @@ async fn alternator_with_always_use_lwt(actors: Arc<TestActors>) {
         .await
         .expect("BatchWriteItem (delete batch-b, batch-c) should succeed");
 
-    common::wait_for_index_count(&vs_clients, &index, 1).await;
+    common::wait_for_index_count(&vs_clients, &index, 2).await;
     info!("VS correctly reflects delete-only BatchWriteItem via LWT path");
 
     info!("finished");
