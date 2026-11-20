@@ -3,17 +3,41 @@
 set -e
 
 usage() {
-    echo "usage: $0 <docker-scylla-tag> <vector-store-bin-path> <vector-search-validator-bin-path>"
+    echo "usage: $0 [--gpu <cuvs-prefix>] <docker-scylla-tag> <vector-store-bin-path> <vector-search-validator-bin-path>"
     exit 1
 }
+
+# Vector Store built with the gpu feature needs the NVIDIA devices, the host
+# driver libraries and a cuVS prefix, mounted where the binary looks for it.
+gpu_args=()
+if [[ $1 == --gpu ]]; then
+    [[ -n $2 ]] || usage
+    cuvs_prefix=$(realpath "$2")
+    [[ -d $cuvs_prefix ]] || usage
+    shift 2
+
+    gpu_args+=(
+        --device /dev/nvidia0 --device /dev/nvidiactl
+        --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools
+        --volume="$cuvs_prefix:/opt/vector-store-cuvs-gpu:ro"
+        --env LD_LIBRARY_PATH=/usr/lib/nvidia-host
+        --env VECTOR_STORE_USE_GPU=true
+        --env VECTOR_STORE_CUVS_BUILD_INTERVAL
+    )
+    for lib in libcuda.so.1 libnvidia-ptxjitcompiler.so.1; do
+        path=$(ldconfig -p | awk -v lib="$lib" '$1 == lib && /x86-64/ { print $NF; exit }')
+        [[ -n $path ]] || { echo "error: $lib not found"; exit 1; }
+        gpu_args+=(--volume="$(realpath "$path"):/usr/lib/nvidia-host/$lib:ro")
+    done
+fi
 
 scylla_tag=$1
 [[ -n $scylla_tag ]] || usage
 
-vector_store=$(realpath $2)
+vector_store=$(realpath "$2")
 [[ -x $vector_store ]] || usage
 
-validator=$(realpath $3)
+validator=$(realpath "$3")
 [[ -x $validator ]] || usage
 
 shift 3
@@ -30,6 +54,7 @@ docker run --rm \
     --volume="$vector_store:/vector-store" \
     --volume="$validator:/vector-search-validator" \
     --network=none \
+    "${gpu_args[@]}" \
     --entrypoint=/vector-search-validator \
     $scylla_tag \
     run --dns-ip $dns_ip --base-ip $base_ip --scylla-default-conf /etc/scylla/scylla.yaml /usr/bin/scylla /vector-store "$@"
