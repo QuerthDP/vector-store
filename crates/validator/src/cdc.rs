@@ -1238,7 +1238,7 @@ async fn cdc_indexing_lag_metric_exported(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = cdc_direct)]
-async fn insert_and_remove(actors: Arc<TestActors>) {
+async fn insert_and_remove(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients) = prepare_connection_single_vs(&actors).await;

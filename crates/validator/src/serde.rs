@@ -107,7 +107,7 @@ async fn test_serialization_deserialization_all_types(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = serde)]
-async fn test_varint_filter(actors: Arc<TestActors>) {
+async fn test_varint_filter(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     let (session, clients) = common::prepare_connection(&actors).await;
     let keyspace = create_keyspace(&session).await;
 
@@ -341,7 +341,7 @@ async fn test_decimal_key(actors: Arc<TestActors>) {
 /// Tests PK byte-identity (pk=1.0 vs pk=1.00 are separate partitions) and CK semantic
 /// comparison (cross-scale ordering, unnormalized CK match, beyond-i64 values).
 #[e2etest::test(group = serde)]
-async fn test_decimal_filter(actors: Arc<TestActors>) {
+async fn test_decimal_filter(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     let (session, clients) = common::prepare_connection(&actors).await;
     let keyspace = create_keyspace(&session).await;
 
