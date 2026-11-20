@@ -67,7 +67,7 @@ async fn insert_vectors(session: &Session, table: &TableName, embeddings: &HashM
 
 e2etest::group!(
     name = quantization_and_rescoring,
-    fixtures = (Fixture),
+    fixtures = (CuvsUnsupported, Fixture),
     parent = crate::validator
 );
 

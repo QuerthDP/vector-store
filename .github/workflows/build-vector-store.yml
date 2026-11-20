@@ -15,6 +15,11 @@ on:
         description: 'Git reference to build from'
         required: true
         type: string
+      gpu:
+        description: 'Build and run Vector Store with cuVS on the GPU runner'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ permissions:
 jobs:
   build-vector-store:
     runs-on: ${{ inputs.os }}
+    timeout-minutes: ${{ inputs.gpu && 60 || 360 }}
     env:
       TARGETARCH: ${{ inputs.arch }}
 
@@ -30,6 +36,7 @@ jobs:
       with:
         fetch-depth: 0
         fetch-tags: true
+        clean: ${{ !inputs.gpu }}
         ref: ${{ inputs.ref }}
 
     - name: Print release toolchain rustc version
@@ -38,12 +45,25 @@ jobs:
     - name: Fetching dependencies
       run: ./scripts/run-with-release-toolchain cargo fetch
 
+    - name: Setup cuVS
+      if: inputs.gpu
+      run: scripts/setup-gpu --github-env
+      env:
+        VECTOR_STORE_CUVS_GPU_PREFIX: ${{ runner.tool_cache }}/vector-store-cuvs-gpu
+
     - name: Build vector-store
+      if: ${{ !inputs.gpu }}
       run: ./scripts/run-with-release-toolchain cargo build --release --bin vector-store -p vector-store
+
+    - name: Build vector-store with cuVS
+      if: inputs.gpu
+      run: ./scripts/run-with-release-toolchain cargo build --release --bin vector-store -p vector-store --features gpu
+      env:
+        VECTOR_STORE_CUVS_GPU_PREFIX: ${{ runner.tool_cache }}/vector-store-cuvs-gpu
 
     - name: Upload vector-store as artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: vector-store-${{inputs.arch}}
+        name: vector-store-${{inputs.arch}}${{ inputs.gpu && '-gpu' || '' }}
         path: target/${{inputs.arch}}/release/vector-store
 

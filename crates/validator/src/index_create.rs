@@ -6,6 +6,7 @@
 use crate::TestActors;
 use crate::common;
 use crate::common::CreateIndexQuery;
+use crate::common::CuvsUnsupported;
 use crate::common::TableName;
 use async_backtrace::framed;
 use httpapi::IndexInfo;
@@ -115,7 +116,7 @@ async fn global_index_without_filtering_columns(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = index_create)]
-async fn global_index_with_filtering_columns(actors: Arc<TestActors>) {
+async fn global_index_with_filtering_columns(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients, keyspace, table) = init_keyspace_table(&actors).await;
@@ -156,7 +157,7 @@ async fn global_index_with_filtering_columns(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = index_create)]
-async fn local_index_without_filtering_columns(actors: Arc<TestActors>) {
+async fn local_index_without_filtering_columns(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients, keyspace, table) = init_keyspace_table(&actors).await;
@@ -184,7 +185,7 @@ async fn local_index_without_filtering_columns(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = index_create)]
-async fn local_index_with_filtering_columns(actors: Arc<TestActors>) {
+async fn local_index_with_filtering_columns(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients, keyspace, table) = init_keyspace_table(&actors).await;
@@ -226,7 +227,7 @@ async fn local_index_with_filtering_columns(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = index_create)]
-async fn local_index_based_on_ck_columns(actors: Arc<TestActors>) {
+async fn local_index_based_on_ck_columns(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients, keyspace, table) = init_keyspace_table(&actors).await;
@@ -254,7 +255,7 @@ async fn local_index_based_on_ck_columns(actors: Arc<TestActors>) {
 }
 
 #[e2etest::test(group = index_create)]
-async fn local_index_based_on_f_columns(actors: Arc<TestActors>) {
+async fn local_index_based_on_f_columns(actors: Arc<TestActors>, _: Arc<CuvsUnsupported>) {
     info!("started");
 
     let (session, clients, keyspace, table) = init_keyspace_table(&actors).await;

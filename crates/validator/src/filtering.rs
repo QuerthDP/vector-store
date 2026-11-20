@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 e2etest::group!(
     name = filtering,
-    fixtures = (Fixture),
+    fixtures = (CuvsUnsupported, Fixture),
     parent = crate::validator
 );
 
