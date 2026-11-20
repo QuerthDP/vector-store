@@ -41,29 +41,41 @@ async fn test_serialization_deserialization_all_types(actors: Arc<TestActors>) {
     let (session, clients) = common::prepare_connection(&actors).await;
 
     let cases = vec![
-        ("ascii", "'random_text'"),
-        ("bigint", "1234"),
-        ("blob", "0xdeadbeef"),
-        ("boolean", "true"),
-        ("date", "'2023-10-01'"),
-        ("decimal", "-98765432109876543210.123456789"),
-        ("double", "3.14159"),
-        ("float", "2.71828"),
-        ("inet", "'10.0.0.1'"),
-        ("int", "42"),
-        ("smallint", "123"),
-        ("tinyint", "7"),
-        ("uuid", "841685b2-8803-11f0-8de9-0242ac120002"),
-        ("timeuuid", "841685b2-8803-11f0-8de9-0242ac120002"),
-        ("time", "'08:12:54.2137'"),
-        ("timestamp", "'2023-10-01T12:34:56.789Z'"),
-        ("text", "'some_text'"),
-        ("varint", "-98765432109876543210"),
+        ("ascii", "'random_text'", "'other_text'"),
+        ("bigint", "1234", "5678"),
+        ("blob", "0xdeadbeef", "0xcafebabe"),
+        ("boolean", "true", "false"),
+        ("date", "'2023-10-01'", "'2023-10-02'"),
+        ("decimal", "-98765432109876543210.123456789", "1.5"),
+        ("double", "3.14159", "2.5"),
+        ("float", "2.71828", "1.5"),
+        ("inet", "'10.0.0.1'", "'10.0.0.2'"),
+        ("int", "42", "43"),
+        ("smallint", "123", "124"),
+        ("tinyint", "7", "8"),
+        (
+            "uuid",
+            "841685b2-8803-11f0-8de9-0242ac120002",
+            "941685b2-8803-11f0-8de9-0242ac120002",
+        ),
+        (
+            "timeuuid",
+            "841685b2-8803-11f0-8de9-0242ac120002",
+            "941685b2-8803-11f0-8de9-0242ac120002",
+        ),
+        ("time", "'08:12:54.2137'", "'09:12:54.2137'"),
+        (
+            "timestamp",
+            "'2023-10-01T12:34:56.789Z'",
+            "'2023-10-02T12:34:56.789Z'",
+        ),
+        ("text", "'some_text'", "'other_text'"),
+        ("varint", "-98765432109876543210", "12345"),
     ];
 
     let keyspace = create_keyspace(&session).await;
 
-    for (typ, data) in &cases {
+    for (typ, data, other_data) in &cases {
         apply_schema_change(
             &session,
             format!(
@@ -71,13 +83,20 @@ async fn test_serialization_deserialization_all_types(actors: Arc<TestActors>) {
             ),
         )
         .await;
-        session
-            .query_unpaged(
-                format!("INSERT INTO tbl_{typ} (id, vec) VALUES ({data}, [1.0, 2.0, 3.0])"),
-                (),
-            )
-            .await
-            .expect("failed to insert data");
+        // The second row points away from the query, as cuVS needs at least two
+        // vectors to build an index.
+        for (id, vec) in [
+            (data, "[1.0, 2.0, 3.0]"),
+            (other_data, "[-1.0, -2.0, -3.0]"),
+        ] {
+            session
+                .query_unpaged(
+                    format!("INSERT INTO tbl_{typ} (id, vec) VALUES ({id}, {vec})"),
+                    (),
+                )
+                .await
+                .expect("failed to insert data");
+        }
 
         let index = create_index(CreateIndexQuery::new(
             &session,

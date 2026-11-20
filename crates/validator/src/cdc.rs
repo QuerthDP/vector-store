@@ -84,13 +84,17 @@ async fn cdc_insert_visible_immediately(actors: Arc<TestActors>) {
     assert_eq!(status.count, 0, "Index should start empty");
 
     // Insert after index creation - this should be picked up by the fine-grained CDC reader
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, v) VALUES (1, [1.0, 2.0, 3.0])"),
-            (),
-        )
-        .await
-        .expect("failed to insert data");
+    // The second row points away from the query, as cuVS needs at least two
+    // vectors to build an index.
+    for (pk, v) in [(1, "[1.0, 2.0, 3.0]"), (2, "[-1.0, -2.0, -3.0]")] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, v) VALUES ({pk}, {v})"),
+                (),
+            )
+            .await
+            .expect("failed to insert data");
+    }
 
     // Verify ANN query returns the inserted row
     // Should timeout only when using wide-framed CDC reader
@@ -277,13 +281,17 @@ async fn cdc_lwt_insert_visible(actors: Arc<TestActors>) {
     assert_eq!(status.count, 0, "Index should start empty");
 
     // LWT insert
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, v) VALUES (1, [1.0, 2.0, 3.0]) IF NOT EXISTS"),
-            (),
-        )
-        .await
-        .expect("failed to insert data");
+    // The second row points away from the query, as cuVS needs at least two
+    // vectors to build an index.
+    for (pk, v) in [(1, "[1.0, 2.0, 3.0]"), (2, "[-1.0, -2.0, -3.0]")] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, v) VALUES ({pk}, {v}) IF NOT EXISTS"),
+                (),
+            )
+            .await
+            .expect("failed to insert data");
+    }
 
     // Verify ANN query returns the inserted row
     let pk = wait_for_value(
@@ -1093,14 +1101,16 @@ async fn reader_retries_after_error(actors: Arc<TestActors>) {
     };
 
     info!("Insert rows with marker");
-    let pk = format!("{MARKER}-pk");
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, v) VALUES ('{pk}', [1.0, 2.0, 3.0])"),
-            (),
-        )
-        .await
-        .expect("failed to insert data");
+    // Two rows, as cuVS needs at least two vectors to build an index.
+    for pk in [format!("{MARKER}-pk-1"), format!("{MARKER}-pk-2")] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, v) VALUES ('{pk}', [1.0, 2.0, 3.0])"),
+                (),
+            )
+            .await
+            .expect("failed to insert data");
+    }
 
     for count in 1..=3 {
         log_counters().await;
@@ -1142,7 +1152,7 @@ async fn reader_retries_after_error(actors: Arc<TestActors>) {
     wait_for(
         || async {
             let status = client.index_status(&index.keyspace, &index.index).await;
-            matches!(status, Ok(s) if s.count == 1)
+            matches!(status, Ok(s) if s.count == 2)
         },
         "Waiting for all rows to be indexed after error injection is removed",
         DEFAULT_OPERATION_TIMEOUT,
@@ -1172,13 +1182,17 @@ async fn cdc_indexing_lag_metric_exported(actors: Arc<TestActors>) {
 
     // Insert after index creation - picked up by the CDC reader, which should
     // record an indexing_lag_seconds observation.
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, v) VALUES (1, [1.0, 2.0, 3.0])"),
-            (),
-        )
-        .await
-        .expect("failed to insert data");
+    // The second row points away from the query, as cuVS needs at least two
+    // vectors to build an index.
+    for (pk, v) in [(1, "[1.0, 2.0, 3.0]"), (2, "[-1.0, -2.0, -3.0]")] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, v) VALUES ({pk}, {v})"),
+                (),
+            )
+            .await
+            .expect("failed to insert data");
+    }
 
     // Wait for the vector to be indexed (proves the CDC pipeline ran).
     wait_for_value(

@@ -114,11 +114,17 @@ async fn batch_write_item_updates_index(actors: Arc<TestActors>) {
         ctx.wait_for_ann([1.0, 1.0, 1.0], &[d.clone(), b.clone(), c.clone()])
             .await;
 
+        let filler = Item::filler(ctx.shape.pk(), ctx.shape.sk(), vec_attr);
+        batch_write_items(&ctx, &[filler], &[])
+            .await
+            .expect("BatchWriteItem should succeed");
+        ctx.wait_for_count(4).await;
+
         info!("Batch writing delete requests into '{}'", ctx.table_name);
         batch_write_items(&ctx, &[], &[b, c])
             .await
             .expect("BatchWriteItem should succeed");
-        ctx.wait_for_count(1).await;
+        ctx.wait_for_count(2).await;
         ctx.wait_for_ann([1.0, 1.0, 1.0], std::slice::from_ref(&d))
             .await;
 
@@ -159,10 +165,11 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
     );
     let valid = Item::key(pk, None, "pk", "valid").vec(vec_attr, [1.0, 1.0, 1.0]);
     let no_vec = Item::key(pk, None, "pk", "no-vec");
-    batch_write_items(&ctx, &[valid.clone(), no_vec], &[])
+    let filler = Item::filler(pk, None, vec_attr);
+    batch_write_items(&ctx, &[valid.clone(), no_vec, filler], &[])
         .await
         .expect("BatchWriteItem should succeed");
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
     ctx.wait_for_ann([1.0, 1.0, 1.0], std::slice::from_ref(&valid))
         .await;
 
@@ -177,7 +184,7 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
         batch_write_items(&ctx, &[valid2, wrong_type_string], &[]).await,
         "ValidationException",
     );
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
 
     info!(
         "Scenario 3: batch put valid3 + wrong_type(mostly-float, one S) into '{}'",
@@ -190,7 +197,7 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
         batch_write_items(&ctx, &[valid3, wrong_type_mostly_float_one_s], &[]).await,
         "ValidationException",
     );
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
 
     info!(
         "Scenario 4: batch put valid4 + wrong_type(mostly-float, one NULL) into '{}'",
@@ -204,7 +211,7 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
         batch_write_items(&ctx, &[valid4, wrong_type_mostly_float_one_null], &[]).await,
         "ValidationException",
     );
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
 
     info!(
         "Scenario 5: batch put valid5 + wrong_type(too-short) into '{}'",
@@ -217,7 +224,7 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
         batch_write_items(&ctx, &[valid5, wrong_type_too_short], &[]).await,
         "ValidationException",
     );
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
 
     info!(
         "Scenario 6: batch put valid6 + wrong_type(too-long) into '{}'",
@@ -230,7 +237,7 @@ async fn batch_write_item_with_invalid_vector(actors: Arc<TestActors>) {
         batch_write_items(&ctx, &[valid6, wrong_type_too_long], &[]).await,
         "ValidationException",
     );
-    ctx.wait_for_count(1).await;
+    ctx.wait_for_count(2).await;
 
     ctx.done().await;
     info!("finished");

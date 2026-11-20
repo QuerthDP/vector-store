@@ -253,14 +253,17 @@ async fn null_vector_is_not_indexed(actors: Arc<TestActors>) {
     let keyspace = create_keyspace(&session).await;
     let table = create_table(&session, "pk INT PRIMARY KEY, v VECTOR<FLOAT, 3>", None).await;
 
-    // Insert one row with a vector and one row with a null vector
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, v) VALUES (?, ?)"),
-            (1i32, &vec![1.0f32, 1.0f32, 1.0f32]),
-        )
-        .await
-        .expect("failed to insert row with vector");
+    // Insert two rows with a vector, as cuVS needs at least two vectors
+    // to build an index, and one row with a null vector
+    for pk in [1i32, 3] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, v) VALUES (?, ?)"),
+                (pk, &vec![1.0f32, 1.0f32, 1.0f32]),
+            )
+            .await
+            .expect("failed to insert row with vector");
+    }
     session
         .query_unpaged(format!("INSERT INTO {table} (pk) VALUES (?)"), (2i32,))
         .await
@@ -276,8 +279,8 @@ async fn null_vector_is_not_indexed(actors: Arc<TestActors>) {
             "Expected index to be SERVING after full scan"
         );
         assert_eq!(
-            index_status.count, 1,
-            "Expected only 1 vector to be indexed (null vector must be skipped)"
+            index_status.count, 2,
+            "Expected only 2 vectors to be indexed (null vector must be skipped)"
         );
     }
 
@@ -311,21 +314,18 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
     let keyspace = create_keyspace(&session).await;
     let table = create_table(&session, "p INT PRIMARY KEY, v VECTOR<FLOAT, 3>", None).await;
 
-    info!("Insert two rows");
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (p, v) VALUES (?, ?)"),
-            (1i32, &vec![1.0f32, 2.0f32, 3.0f32]),
-        )
-        .await
-        .expect("failed to insert row with vector");
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (p, v) VALUES (?, ?)"),
-            (2i32, &vec![1.0f32, 2.0f32, 3.0f32]),
-        )
-        .await
-        .expect("failed to insert row with vector");
+    // A third row keeps two vectors indexed after the deletion, as cuVS needs
+    // at least two vectors to build an index
+    info!("Insert three rows");
+    for p in [1i32, 2, 3] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (p, v) VALUES (?, ?)"),
+                (p, &vec![1.0f32, 2.0f32, 3.0f32]),
+            )
+            .await
+            .expect("failed to insert row with vector");
+    }
 
     let index = create_index(CreateIndexQuery::new(&session, &clients, &table, "v")).await;
 
@@ -336,7 +336,7 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
             .index_status(&index.keyspace, &index.index)
             .await
             .expect("failed to get index status");
-        assert_eq!(index_status.count, 2);
+        assert_eq!(index_status.count, 3);
     }
 
     info!("Delete a row");
@@ -352,7 +352,7 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
                     .index_status(&index.keyspace, &index.index)
                     .await
                     .expect("failed to get index status");
-                index_status.count == 1
+                index_status.count == 2
             },
             "Waiting for index count to be updated after deletion",
             DEFAULT_OPERATION_TIMEOUT,
@@ -368,8 +368,8 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
     let rows = rows.rows::<(i32,)>().expect("failed to get rows");
     assert_eq!(
         rows.rows_remaining(),
-        1,
-        "Expected 1 rows in the result after adding the same row multiple times"
+        2,
+        "Expected 2 rows in the result after deleting a row"
     );
 
     info!("Add same row several times");
@@ -387,7 +387,7 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
     const CDC_PROCESSING_WAIT_TIME: Duration = Duration::from_secs(5);
     time::sleep(CDC_PROCESSING_WAIT_TIME).await;
 
-    info!("Run query ann and check that only 2 rows are returned");
+    info!("Run query ann and check that only 3 rows are returned");
     let rows = get_query_results(
         format!("SELECT p FROM {table} ORDER BY v ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
         &session,
@@ -396,8 +396,8 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
     let rows = rows.rows::<(i32,)>().expect("failed to get rows");
     assert_eq!(
         rows.rows_remaining(),
-        2,
-        "Expected 2 rows in the result after adding the same row multiple times"
+        3,
+        "Expected 3 rows in the result after adding the same row multiple times"
     );
 
     info!("Check index count of indexed rows");
@@ -406,10 +406,10 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
             .index_status(&index.keyspace, &index.index)
             .await
             .expect("failed to get index status");
-        assert_eq!(index_status.count, 2);
+        assert_eq!(index_status.count, 3);
     }
 
-    info!("Run query ann and check that only 2 rows are returned");
+    info!("Run query ann and check that only 3 rows are returned");
     let rows = get_query_results(
         format!("SELECT p FROM {table} ORDER BY v ANN OF [1.0, 2.0, 3.0] LIMIT 5"),
         &session,
@@ -418,8 +418,8 @@ async fn global_add_remove_multiple_add(actors: Arc<TestActors>) {
     let rows = rows.rows::<(i32,)>().expect("failed to get rows");
     assert_eq!(
         rows.rows_remaining(),
-        2,
-        "Expected 2 rows in the result after adding the same row multiple times"
+        3,
+        "Expected 3 rows in the result after adding the same row multiple times"
     );
 
     info!("Drop keyspace");

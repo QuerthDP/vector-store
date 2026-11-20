@@ -366,16 +366,17 @@ async fn search_with_projection_special_names(actors: Arc<TestActors>) {
         let data_attribute_name = "data:extra";
         let sk = shape.sk();
 
-        let dataset = [Item::new(shape.pk(), AttributeValue::S("pk-1".into()))
-            .maybe_sk(sk, AttributeValue::S("sk-1".into()))
-            .vec(
-                shape.vec().expect("NAME_PATTERNS entries always have vec"),
-                [1.0, 1.0, 1.0],
-            )
-            .attr(
-                data_attribute_name,
-                AttributeValue::S("extra-val".to_string()),
-            )];
+        let vec_attr = shape.vec().expect("NAME_PATTERNS entries always have vec");
+        let dataset = [
+            Item::new(shape.pk(), AttributeValue::S("pk-1".into()))
+                .maybe_sk(sk, AttributeValue::S("sk-1".into()))
+                .vec(vec_attr, [1.0, 1.0, 1.0])
+                .attr(
+                    data_attribute_name,
+                    AttributeValue::S("extra-val".to_string()),
+                ),
+            Item::filler(shape.pk(), sk, vec_attr),
+        ];
 
         let ctx = TableContext::create_with_data(&actors, shape, &dataset).await;
         let pk_name = ctx.shape.pk();
@@ -439,12 +440,15 @@ async fn search_with_base_read(actors: Arc<TestActors>) {
     };
     let data_attribute_name = "Data-SelAll";
 
-    let dataset = [Item::new("Pk-SelAll", AttributeValue::S("pk-a".into()))
-        .vec("Vec-SelAll", [1.0, 1.0, 1.0])
-        .attr(
-            data_attribute_name,
-            AttributeValue::S("some-data".to_string()),
-        )];
+    let dataset = [
+        Item::new("Pk-SelAll", AttributeValue::S("pk-a".into()))
+            .vec("Vec-SelAll", [1.0, 1.0, 1.0])
+            .attr(
+                data_attribute_name,
+                AttributeValue::S("some-data".to_string()),
+            ),
+        Item::filler("Pk-SelAll", None, "Vec-SelAll"),
+    ];
 
     let ctx = TableContext::create_with_data(&actors, &shape, &dataset).await;
 
@@ -579,22 +583,28 @@ async fn search_with_large_dimensions(actors: Arc<TestActors>) {
 
     let mut vector_data: Vec<f32> = vec![0.0; dimensions];
     vector_data[0] = 1.0;
+    // The second item points away from the query, as cuVS needs at least two
+    // vectors to build an index.
+    let mut filler_data: Vec<f32> = vec![0.0; dimensions];
+    filler_data[0] = -1.0;
 
-    info!("Inserting item with {dimensions}-dim vector into '{table_name}'");
-    client
-        .put_item()
-        .table_name(&table_name)
-        .item(partition_key_name, AttributeValue::S("pk-1".to_string()))
-        .item(
-            vector_attribute_name,
-            alternator::float_list(vector_data.iter().copied()),
-        )
-        .send()
-        .await
-        .expect("PutItem with large-dimension vector should succeed");
+    info!("Inserting items with {dimensions}-dim vectors into '{table_name}'");
+    for (pk, vector) in [("pk-1", &vector_data), ("pk-filler", &filler_data)] {
+        client
+            .put_item()
+            .table_name(&table_name)
+            .item(partition_key_name, AttributeValue::S(pk.to_string()))
+            .item(
+                vector_attribute_name,
+                alternator::float_list(vector.iter().copied()),
+            )
+            .send()
+            .await
+            .expect("PutItem with large-dimension vector should succeed");
+    }
 
-    info!("Waiting for VS to index the item");
-    common::wait_for_index_count(&vs_clients, &index, 1).await;
+    info!("Waiting for VS to index the items");
+    common::wait_for_index_count(&vs_clients, &index, 2).await;
 
     info!("Searching on {dimensions}-dim index");
     let items = client

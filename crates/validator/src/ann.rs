@@ -317,10 +317,10 @@ async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: Arc<
     )
     .await;
     let data: [(&'static str, &'static str, Vec<f32>); 4] = [
-        ("pk-1", "ck-1", vec![0.0, 0.0, 0.0]),
-        ("pk-1", "ck-2", vec![1.0, 1.0, 1.0]),
-        ("pk-2", "ck-1", vec![0.0, 0.0, 0.0]),
-        ("pk-2", "ck-2", vec![1.0, 1.0, 1.0]),
+        ("pk-1", "ck-1", vec![1.0, 0.0, 0.0]),
+        ("pk-1", "ck-2", vec![0.0, 1.0, 0.0]),
+        ("pk-2", "ck-1", vec![1.0, 0.0, 0.0]),
+        ("pk-2", "ck-2", vec![0.0, 1.0, 0.0]),
     ];
     for (pk, ck, v) in &data {
         session
@@ -336,7 +336,7 @@ async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: Arc<
     let result = wait_for_value(
         || async {
             let result = get_opt_query_results(
-                format!("SELECT pk, ck FROM {table} ORDER BY v ANN OF [0.0, 0.0, 0.0] LIMIT 2"),
+                format!("SELECT pk, ck FROM {table} ORDER BY v ANN OF [1.0, 0.0, 0.0] LIMIT 2"),
                 &session,
             )
             .await;
@@ -406,10 +406,10 @@ async fn ann_query_returns_rows_using_cdc(actors: Arc<TestActors>) {
 
     info!("Insert data that will be picked up by CDC");
     let data: [(&'static str, &'static str, Vec<f32>); 4] = [
-        ("pk-1", "ck-1", vec![0.0, 0.0, 0.0]),
-        ("pk-1", "ck-2", vec![1.0, 1.0, 1.0]),
-        ("pk-2", "ck-1", vec![0.0, 0.0, 0.0]),
-        ("pk-2", "ck-2", vec![1.0, 1.0, 1.0]),
+        ("pk-1", "ck-1", vec![1.0, 0.0, 0.0]),
+        ("pk-1", "ck-2", vec![0.0, 1.0, 0.0]),
+        ("pk-2", "ck-1", vec![1.0, 0.0, 0.0]),
+        ("pk-2", "ck-2", vec![0.0, 1.0, 0.0]),
     ];
     for (pk, ck, v) in &data {
         session
@@ -442,7 +442,7 @@ async fn ann_query_returns_rows_using_cdc(actors: Arc<TestActors>) {
 
     info!("Now perform the ANN query");
     let result = get_opt_query_results(
-        format!("SELECT pk, ck FROM {table} ORDER BY v ANN OF [0.0, 0.0, 0.0] LIMIT 2"),
+        format!("SELECT pk, ck FROM {table} ORDER BY v ANN OF [1.0, 0.0, 0.0] LIMIT 2"),
         &session,
     )
     .await
