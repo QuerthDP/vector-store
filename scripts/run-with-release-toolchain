@@ -37,6 +37,20 @@ if [[ -n $user_cargo_home ]] ; then
     mount_cargo="-v $user_cargo_home/git:$docker_cargo_home/git -v $user_cargo_home/registry:$docker_cargo_home/registry "
 fi
 
+# With the cuVS prefix set up by `setup-gpu`, the gpu feature builds against it.
+# The prefix is mounted where the cargo config expects it, so the binary and
+# the build cache do not depend on where a runner keeps it. Its bin directory
+# goes on the image's own PATH, as the image has no cmake.
+cuvs_args=()
+if [[ -n $VECTOR_STORE_CUVS_GPU_PREFIX ]] ; then
+    cuvs_prefix=$(realpath "$VECTOR_STORE_CUVS_GPU_PREFIX")
+    docker_path=$(docker run --rm $docker_tag sh -c 'echo $PATH')
+    cuvs_args=(
+        -v "$cuvs_prefix:/opt/vector-store-cuvs-gpu:ro"
+        -e "PATH=$docker_path:/opt/vector-store-cuvs-gpu/env/bin"
+    )
+fi
+
 version=$(git describe --dirty) || { echo "error: no annotated tag found"; exit 1; }
 
 tmp_cargo_toml=$(mktemp /tmp/Cargo_toml.XXXXXX)
@@ -49,7 +63,7 @@ cat ./Cargo.lock | sed -e "s/version = \"0.0.0-dev\"/version = \"$version\"/" > 
 
 grep -v components ./rust-toolchain.toml > $tmp_rust_toolchain
 
-docker run --rm \
+docker run --rm --init \
     --platform linux/$TARGETARCH \
     --user "$(id -u)":"$(id -g)" \
     -e CARGO_TARGET_DIR="./target/$TARGETARCH" \
@@ -58,6 +72,7 @@ docker run --rm \
     -v $tmp_cargo_lock:"$repo/Cargo.lock" \
     -v $tmp_rust_toolchain:"$repo/rust-toolchain.toml" \
     $mount_cargo \
+    "${cuvs_args[@]}" \
     -w "$repo" \
     $docker_tag \
     "$@"
