@@ -393,6 +393,13 @@ impl Item {
         self
     }
 
+    /// An item that ranks last for any query with positive components, added
+    /// where a test would otherwise leave a single vector indexed, as cuVS
+    /// needs at least two vectors to build an index.
+    fn filler(pk_attr: &str, sk_attr: Option<&str>, vec_attr: &str) -> Self {
+        Self::key(pk_attr, sk_attr, "pk", "filler").vec(vec_attr, [-1.0, -1.0, -1.0])
+    }
+
     fn vec_optimized(mut self, vec_attr: &str, v: [f32; Self::VEC_DIMS]) -> Self {
         self.0.insert(vec_attr.to_string(), float32_vector(v));
         self

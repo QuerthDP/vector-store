@@ -36,7 +36,19 @@ jobs:
       config: ${{ steps.prepare-output.outputs.config }}
     steps:
     - name: Set default map
-      run: echo 'CONFIG={"latest-scylla-nightly":false,"os":"ubuntu-24.04-arm","arch":"arm64"}' >> $GITHUB_ENV
+      run: echo 'CONFIG={"latest-scylla-nightly":false,"os":"ubuntu-24.04-arm","arch":"arm64","gpu":false}' >> $GITHUB_ENV
+
+    # The GPU runner is amd64, so the cuVS run shares the amd64 validator.
+    - name: Check if PR is to cuvs-master
+      if: github.event.pull_request.base.ref == 'cuvs-master'
+      run: echo "CONFIG=$(echo $CONFIG | jq -c '.os = "ubuntu-latest" | .arch = "amd64"')" >> $GITHUB_ENV
+
+    # The GPU runner is a self-hosted machine, so only branches of this repository
+    # may use it. It only needs an NVIDIA driver, `curl`, `python3` and Docker;
+    # the jobs set up everything else.
+    - name: Check if PR to cuvs-master may use the GPU runner
+      if: github.event.pull_request.base.ref == 'cuvs-master' && github.event.pull_request.head.repo.full_name == github.repository
+      run: echo "CONFIG=$(echo $CONFIG | jq -c '.gpu = true | ."validator-os" = "gpu"')" >> $GITHUB_ENV
 
     - name: Check if PR has label "ci-use-latest-scylla-nightly"
       if: ${{ contains(github.event.pull_request.labels.*.name, 'ci-use-latest-scylla-nightly') }}
@@ -78,7 +90,7 @@ jobs:
     needs: ["validator-config"]
     uses: $/.github/workflows/build-validator.yml
     with:
-      os: ${{ fromJSON(needs.validator-config.outputs.config).os }}
+      os: ${{ fromJSON(needs.validator-config.outputs.config).validator-os || fromJSON(needs.validator-config.outputs.config).os }}
       arch: ${{ fromJSON(needs.validator-config.outputs.config).arch }}
       ref: ${{ github.sha }}
 
@@ -89,6 +101,16 @@ jobs:
       os: ${{ fromJSON(needs.validator-config.outputs.config).os }}
       arch: ${{ fromJSON(needs.validator-config.outputs.config).arch }}
       ref: ${{ github.sha }}
+
+  validator-build-vector-store-gpu:
+    needs: ["validator-config"]
+    if: fromJSON(needs.validator-config.outputs.config).gpu
+    uses: $/.github/workflows/build-vector-store.yml
+    with:
+      os: gpu
+      arch: ${{ fromJSON(needs.validator-config.outputs.config).arch }}
+      ref: ${{ github.sha }}
+      gpu: true
 
   validator-get-validator-test-list:
     needs: ["validator-config", "validator-build-validator"]
@@ -110,8 +132,22 @@ jobs:
       matrix:
         testcase: ${{fromJSON(needs.validator-get-validator-test-list.outputs.testcases)}}
 
+  validator-run-validator-tests-gpu:
+    needs: ["validator-config", "validator-get-scylla-nightly-digest", "validator-build-vector-store-gpu", "validator-get-validator-test-list"]
+    uses: $/.github/workflows/run-validator-tests.yml
+    with:
+      os: gpu
+      arch: ${{ fromJSON(needs.validator-config.outputs.config).arch }}
+      testcase: ${{ matrix.testcase }}
+      ref: ${{ github.sha }}
+      gpu: true
+    strategy:
+      fail-fast: false
+      matrix:
+        testcase: ${{fromJSON(needs.validator-get-validator-test-list.outputs.testcases)}}
+
   validator-workflow-status:
-    needs: ["validator-config", "validator-get-scylla-nightly-digest", "validator-build-validator", "validator-build-vector-store", "validator-get-validator-test-list", "validator-run-validator-tests"]
+    needs: ["validator-config", "validator-get-scylla-nightly-digest", "validator-build-validator", "validator-build-vector-store", "validator-build-vector-store-gpu", "validator-get-validator-test-list", "validator-run-validator-tests", "validator-run-validator-tests-gpu"]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -139,6 +175,11 @@ jobs:
           return_code=1
         fi
 
+        if [[ "${{ needs.validator-build-vector-store-gpu.result }}" == "failure" ]]; then
+          echo "validator-build-vector-store-gpu job failed"
+          return_code=1
+        fi
+
         if [[ "${{ needs.validator-get-validator-test-list.result }}" == "failure" ]]; then
           echo "validator-get-validator-test-list job failed"
           return_code=1
@@ -146,6 +187,11 @@ jobs:
 
         if [[ "${{ needs.validator-run-validator-tests.result }}" == "failure" ]]; then
           echo "validator-run-validator-tests job failed"
+          return_code=1
+        fi
+
+        if [[ "${{ needs.validator-run-validator-tests-gpu.result }}" == "failure" ]]; then
+          echo "validator-run-validator-tests-gpu job failed"
           return_code=1
         fi
 

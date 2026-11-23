@@ -6,6 +6,7 @@
 use crate::TestActors;
 use crate::common;
 use crate::common::CreateIndexQuery;
+use crate::common::CuvsUnsupported;
 use crate::common::DEFAULT_OPERATION_TIMEOUT;
 use crate::common::TableName;
 use async_backtrace::framed;
@@ -20,7 +21,7 @@ use tracing::info;
 
 e2etest::group!(
     name = index_modify,
-    fixtures = (GroupFixture),
+    fixtures = (CuvsUnsupported, GroupFixture),
     parent = crate::validator
 );
 

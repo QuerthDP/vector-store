@@ -1024,3 +1024,16 @@ impl<'a> CreateIndexQuery<'a> {
         self
     }
 }
+
+/// Skips a test or group that needs a feature the cuVS backend does not support yet.
+pub struct CuvsUnsupported;
+
+impl e2etest::Fixture for CuvsUnsupported {
+    async fn setup(_: &mut impl e2etest::Setup) -> Option<Self> {
+        let cuvs_enabled =
+            std::env::var("VECTOR_STORE_USE_GPU").is_ok_and(|value| value.parse().unwrap_or(false));
+        (!cuvs_enabled).then_some(Self)
+    }
+
+    async fn teardown(self) {}
+}

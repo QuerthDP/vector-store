@@ -75,13 +75,16 @@ async fn ann_routes_to_serving_index_while_replacement_is_bootstrapping(actors: 
     )
     .await;
 
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, embedding) VALUES (0, [1.0, 2.0, 3.0])"),
-            (),
-        )
-        .await
-        .expect("failed to insert test embedding");
+    // Two rows, as cuVS needs at least two vectors to build an index.
+    for pk in [0, 1] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, embedding) VALUES ({pk}, [1.0, 2.0, 3.0])"),
+                (),
+            )
+            .await
+            .expect("failed to insert test embedding");
+    }
 
     let oldest = create_index(CreateIndexQuery::new(
         &session,
@@ -91,7 +94,7 @@ async fn ann_routes_to_serving_index_while_replacement_is_bootstrapping(actors: 
     ))
     .await;
     let oldest_status = wait_for_index(client, &oldest).await;
-    assert_eq!(oldest_status.count, 1);
+    assert_eq!(oldest_status.count, 2);
 
     actors
         .db_proxy
@@ -121,7 +124,7 @@ async fn ann_routes_to_serving_index_while_replacement_is_bootstrapping(actors: 
 
     actors.db_proxy.turn_off_rules().await;
     let replacement_status = wait_for_index(client, &replacement).await;
-    assert_eq!(replacement_status.count, 1);
+    assert_eq!(replacement_status.count, 2);
 
     session
         .query_unpaged(format!("DROP INDEX {}", oldest.index), ())
@@ -162,15 +165,18 @@ async fn ann_does_not_route_between_columns_while_requested_index_is_bootstrappi
         None,
     )
     .await;
-    session
-        .query_unpaged(
-            format!(
-                "INSERT INTO {table} (pk, embedding, embedding2) VALUES (0, [1.0, 2.0, 3.0], [1.0, 2.0, 3.0])"
-            ),
-            (),
-        )
-        .await
-        .expect("failed to insert test embedding");
+    // Two rows, as cuVS needs at least two vectors to build an index.
+    for pk in [0, 1] {
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {table} (pk, embedding, embedding2) VALUES ({pk}, [1.0, 2.0, 3.0], [1.0, 2.0, 3.0])"
+                ),
+                (),
+            )
+            .await
+            .expect("failed to insert test embedding");
+    }
 
     let source = create_index(CreateIndexQuery::new(
         &session,
@@ -180,7 +186,7 @@ async fn ann_does_not_route_between_columns_while_requested_index_is_bootstrappi
     ))
     .await;
     let source_status = wait_for_index(client, &source).await;
-    assert_eq!(source_status.count, 1);
+    assert_eq!(source_status.count, 2);
 
     actors
         .db_proxy
@@ -328,13 +334,16 @@ async fn ann_returns_not_found_after_index_is_dropped(actors: Arc<TestActors>) {
     )
     .await;
 
-    session
-        .query_unpaged(
-            format!("INSERT INTO {table} (pk, embedding) VALUES (0, [1.0, 2.0, 3.0])"),
-            (),
-        )
-        .await
-        .expect("failed to insert test embedding");
+    // Two rows, as cuVS needs at least two vectors to build an index.
+    for pk in [0, 1] {
+        session
+            .query_unpaged(
+                format!("INSERT INTO {table} (pk, embedding) VALUES ({pk}, [1.0, 2.0, 3.0])"),
+                (),
+            )
+            .await
+            .expect("failed to insert test embedding");
+    }
 
     let index = create_index(CreateIndexQuery::new(
         &session,
@@ -344,7 +353,7 @@ async fn ann_returns_not_found_after_index_is_dropped(actors: Arc<TestActors>) {
     ))
     .await;
     let index_status = wait_for_index(client, &index).await;
-    assert_eq!(index_status.count, 1);
+    assert_eq!(index_status.count, 2);
 
     get_query_results(
         format!(

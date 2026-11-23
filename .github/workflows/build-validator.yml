@@ -22,6 +22,7 @@ permissions:
 jobs:
   build-validator:
     runs-on: ${{ inputs.os }}
+    timeout-minutes: ${{ inputs.os == 'gpu' && 60 || 360 }}
     env:
       TARGETARCH: ${{ inputs.arch }}
 
@@ -30,6 +31,7 @@ jobs:
       with:
         fetch-depth: 0
         fetch-tags: true
+        clean: ${{ inputs.os != 'gpu' }}
         ref: ${{ inputs.ref }}
 
     - name: Print release toolchain rustc version
